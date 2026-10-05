@@ -1,4 +1,4 @@
-"""Prompt format and letter readout used to train basal-1.0 (do not change: the models expect exactly this format).
+"""Prompt format and letter readout the basal models were trained with (do not change: they expect exactly this format).
 
 A question becomes a chat with a fixed system prompt, the state, the question and lettered options; the assistant turn is
 prefilled with `{"answer": "` and the decision is the softmax over the next-token logits of the option letters only.

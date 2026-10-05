@@ -233,7 +233,7 @@ def gold_prob_heatmap():
     fig.savefig(HERE / "apple_gold_prob_heatmap.png")
 
 
-# Selected checkpoints (original bf16 is public; converted repos are private until release); keys of D["formats"]
+# Selected checkpoints (the original bf16 and the published conversions); keys of D["formats"]
 SELECTED = {"basal-mlx", "basal-gguf:F16", "basal-gguf:Q8_0", "basal-gguf:Q4_K_M", "mlx-q8", "mlx-oQ6e"}
 
 
@@ -253,7 +253,7 @@ def memory_vs_fidelity():
         ax.grid(alpha=0.25)
         if model == "1.5B":
             format_legend(ax, families={r["family"] for r in rows}, loc="upper right", fontsize=8)
-    fig.suptitle("Apple Silicon checkpoints (conversions private until release): lower GB and TV are better; "
+    fig.suptitle("Apple Silicon checkpoints of basal-1.0: lower GB and TV are better; "
                  "labels: ms per decision, lower is better", fontsize=11)
     fig.tight_layout()
     fig.canvas.draw()

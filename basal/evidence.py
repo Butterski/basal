@@ -1,0 +1,96 @@
+"""Evidence output: `"evidence": true` on a question returns the span(s) of the state that support the answer.
+
+A pointer head over the state's tokens, trained after the decision model on its frozen final-layer states (so it does
+not change any decision): start / end scores of a state token are bilinear in that token's state and the state at the
+answer position, so the span depends on the question. The head ships as `evidence_head.pt` next to the weights; it was
+trained on verified verbatim evidence quotes from real Polish documents. Spans are character offsets into the state
+text, so the quote is always verbatim; each comes with a probability (p_start * p_end of the span).
+
+This version reads the head on a separate pass of the question's prompt (original option order); it runs only for
+questions that ask for evidence. EvidenceHead and best_spans must stay identical to the copy used to train the head.
+"""
+import math
+import threading
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+from .prompt import render
+
+MAX_SPAN = 80
+
+
+class EvidenceHead(nn.Module):
+    def __init__(self, d, k=256):
+        super().__init__()
+        self.k = k
+        self.ws, self.us = nn.Linear(d, k, bias=False), nn.Linear(d, k, bias=False)
+        self.we, self.ue = nn.Linear(d, k, bias=False), nn.Linear(d, k, bias=False)
+        self.bs, self.be = nn.Linear(d, 1, bias=False), nn.Linear(d, 1, bias=False)
+        self.norm = nn.LayerNorm(d, elementwise_affine=False)  # final-layer states have large norms
+
+    def forward(self, h, q):
+        """h: (n, d) state token states, q: (d,) answer-position state -> start / end log-probs over the n tokens."""
+        h, q = self.norm(h), self.norm(q)
+        s = self.ws(h) @ self.us(q) / math.sqrt(self.k) + self.bs(h).squeeze(-1)
+        e = self.we(h) @ self.ue(q) / math.sqrt(self.k) + self.be(h).squeeze(-1)
+        return s.log_softmax(-1), e.log_softmax(-1)
+
+
+def best_spans(ls, le, rel, state, top=3):
+    n = ls.shape[0]
+    sc = ls[:, None] + le[None, :]
+    mask = torch.ones(n, n, dtype=torch.bool, device=ls.device).triu().logical_and(
+        ~torch.ones(n, n, dtype=torch.bool, device=ls.device).triu(MAX_SPAN))
+    sc = sc.masked_fill(~mask, -1e9)
+    out, flat = [], sc.flatten().topk(min(top * 4, n * n))
+    for v, k in zip(flat.values.tolist(), flat.indices.tolist()):
+        i, j = divmod(k, n)
+        a, b = rel[i][0], rel[j][1]
+        if any(not (b <= x["start"] or a >= x["end"]) for x in out):
+            continue  # no overlapping spans
+        out.append(dict(text=state[a:b], start=a, end=b, probability=math.exp(v)))
+        if len(out) == top:
+            break
+    return out
+
+
+class Evidence:
+    """Loads `evidence_head.pt` from the model directory (absent: evidence requests are refused)."""
+
+    def __init__(self, model_dir, model, tok):
+        p = Path(model_dir) / "evidence_head.pt"
+        self.available = p.exists()
+        self.model, self.tok, self.lock = model, tok, threading.Lock()
+        if self.available:
+            dev = next(model.parameters()).device
+            ck = torch.load(p, map_location=dev)
+            self.head = EvidenceHead(ck["d"], ck["k"]).to(dev).float().eval()
+            self.head.load_state_dict(ck["state_dict"])
+
+    @torch.no_grad()
+    def spans(self, state, question, options, lang, limit=None, top=3):
+        """Top non-overlapping spans of `state` (character offsets); spans starting at or after `limit` (e.g. in the
+        appended facts block) are dropped."""
+        prompt = render(self.tok, state, question, options, lang)
+        s0 = prompt.index("\n" + state) + 1
+        s1 = s0 + len(state)
+        enc = self.tok(prompt, add_special_tokens=False, return_offsets_mapping=True)
+        idx = [i for i, (a, b) in enumerate(enc["offset_mapping"]) if a >= s0 and b <= s1 and b > a]
+        if not idx:
+            return []
+        t0, t1 = idx[0], idx[-1] + 1
+        rel = [(max(a - s0, 0), max(b - s0, 0)) for a, b in enc["offset_mapping"][t0:t1]]
+        dev = next(self.model.parameters()).device
+        with self.lock:
+            h = self.model.model(input_ids=torch.tensor([enc["input_ids"]], device=dev),
+                                 use_cache=False).last_hidden_state[0].float()
+            ls, le = self.head(h[t0:t1], h[-1])
+            out = best_spans(ls, le, rel, state, top=top + 2)
+        if limit is not None:
+            out = [x for x in out if x["start"] < limit]
+            for x in out:
+                x["end"] = min(x["end"], limit)
+                x["text"] = state[x["start"]:x["end"]]
+        return out[:top]

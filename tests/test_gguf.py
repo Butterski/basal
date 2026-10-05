@@ -1,6 +1,7 @@
-"""GGUF backend: the shared prefix expressed as llama.cpp sequences (prefix tokens in the sequences of both option
-orders, all questions of a chunk in one llama_decode) gives the same letter probabilities as evaluating every option
-order on its own (tiny random Llama with attention and MLP biases written as GGUF)."""
+"""GGUF backend: the packed prefix trie expressed as llama.cpp sequences (every token in the sequences of all readouts
+below it, all rows of a chunk in one llama_decode) gives the same letter probabilities as evaluating every prompt on
+its own: both option orders of a question, and a whole request over one state (SOAM: nested prefixes) (tiny random
+Llama with attention and MLP biases written as GGUF)."""
 import json
 
 import pytest
@@ -17,7 +18,8 @@ V, H, F, L, NH, NKV = 64, 64, 96, 2, 4, 2
 
 class Tok:  # one character = one token, ids 3..63
     def __call__(self, text, add_special_tokens=False):
-        return type("E", (), {"input_ids": [3 + ord(c) % (V - 3) for c in text]})()
+        enc = lambda t: [3 + ord(c) % (V - 3) for c in t]  # noqa: E731
+        return type("E", (), {"input_ids": [enc(t) for t in text] if isinstance(text, list) else enc(text)})()
 
     def __len__(self):
         return V
@@ -108,3 +110,27 @@ def test_questions_in_one_decode_are_isolated(backend):
     # llama.cpp computes equal-length sequences of one batch along another kernel path: small numeric differences only
     assert np.allclose(with_b, alone, atol=5e-3)
     assert not np.allclose(with_b, backend.run_shared([group("a different state!!!")])[0], atol=5e-2)
+
+
+def test_soam_nested_prefixes_equal_separate(backend):
+    """State once, then two questions in two option orders each and a third question: every readout equals its own
+    prompt evaluated alone (the trie has three levels: state, question, option order)."""
+    state = "a shared state of a request, long enough to matter: " * 2
+    prompts = [state + q + o for q in ("q1? ", "question two? ") for o in (" A. x B. y C. z", " A. z B. y C. x")]
+    prompts.append(state + "third")
+    ids = [IDS] * len(prompts)
+    packed = backend.run_shared([(prompts, ids)])[0]
+    separate = [backend.run_shared([([p], [IDS])])[0][0] for p in prompts]
+    assert np.allclose(packed, separate, atol=5e-3)
+
+
+def test_readouts_beyond_n_seq_are_split(backend):
+    """A group with more readouts than sequences per chunk is bisected (exact: each part keeps the shared prefix)."""
+    prompts = [f"shared state; option set {k}" for k in range(10)]
+    full = backend.run_shared([(prompts, [IDS] * 10)])[0]
+    backend.N_SEQ = 4
+    try:
+        split = backend.run_shared([(prompts, [IDS] * 10)])[0]
+    finally:
+        del backend.N_SEQ  # back to the class value
+    assert np.allclose(full, split, atol=5e-3)

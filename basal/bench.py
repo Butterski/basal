@@ -1,14 +1,15 @@
 """Offline benchmark of serving modes (no HTTP): latency, throughput, agreement with the first mode, accuracy.
 
-  basal-bench --model Remek/basal-1.0-4.5B --modes eager-fp32 fast fp8              # bundled examples
-  basal-bench --model Remek/basal-1.0-4.5B --modes eager-fp32 fast --questions my_items.jsonl
+  basal-bench --model Remek/basal-1.5-4.5B --modes eager-fp32 fast fp8              # bundled examples
+  basal-bench --model Remek/basal-1.5-4.5B --modes eager-fp32 fast --questions my_items.jsonl
 
 Questions file (JSONL): {"state": ..., "question": ..., "options": [...], "gold": <index, optional>}.
 Measured per mode (same definitions as in the technical report):
   lat1_ms  median latency of one decision with ONE option order at batch size 1
   lat2_ms  median latency of one decision with BOTH option orders at batch size 1 (what the server does by default)
   dec_s    two-order decisions per second when 32 option-order passes are processed together
-  agree    share of decisions whose top option equals the first mode's (default on Apple Silicon: bf16 MPS, not fp32)
+  agree    share of decisions whose top option equals the first mode's (default reference: eager-fp32; on Apple
+           Silicon bf16 mps, not fp32)
   acc      accuracy of the averaged two-order decision (if gold is given)
 """
 import argparse
@@ -21,14 +22,16 @@ from pathlib import Path
 
 import torch
 
-from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, MLXBackend, MPSBackend, VLLMBackend,
-                     resolve)
-from .ollama import OllamaBackend
+from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
+                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
 from .prompt import letter_ids, render
 from .server import MODES, default_mode
 
+GGUF_KINDS = ("gguf", "ollama", "llamacpp")  # the engine serves GGUF weights: --model gives tokenizer and calibration
 
-def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="http://127.0.0.1:11434"):
+
+def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="http://127.0.0.1:11434",
+          llamacpp_url="http://127.0.0.1:8080"):
     if mode == "eager-fp32":
         return EagerBackend(md, "float32")
     if mode.startswith("fast-exit@"):
@@ -38,30 +41,31 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
         if not path:
             raise SystemExit("mode gguf needs --gguf <file.gguf> (or gguf@<file.gguf>)")
         return GGUFBackend(md, path)
-    if mode == "ollama":
-        if not ollama_model:
-            raise SystemExit("mode ollama needs --ollama-model <name>")
-        return OllamaBackend(md, ollama_model, ollama_url)
     kind, quant, comp = MODES[mode]
     if kind == "eager":
         return EagerBackend(md, "bfloat16")
     if kind == "vllm":
         return VLLMBackend(vllm_model or md)
+    if kind == "sglang":
+        return SGLangBackend(md)
     if kind == "mlx":
-        return MLXBackend(md, "bfloat16", quant)
+        return MLXBackend(md, quant=quant)
     if kind == "mps":
         return MPSBackend(md, "bfloat16")
+    if kind == "ollama":
+        return OllamaBackend(md, ollama_url, ollama_model)
+    if kind == "llamacpp":
+        return LlamaCppBackend(md, llamacpp_url)
     if kind == "exit":
         return ExitGraphBackend(md, "bfloat16", quant, compile=comp)
     return GraphBackend(md, "bfloat16", quant, compile=comp, shared=True)
 
 
 def default_modes():
-    """Choose a reference that fits the selected device, then the serving default."""
+    """A reference that fits the device, then the serving default: eager-fp32 on CUDA and CPU, bf16 mps on Apple
+    Silicon (the fp32 4.5B needs about 18 GB)."""
     mode = default_mode()
-    if torch.cuda.is_available():
-        return ["eager-fp32", mode]
-    if torch.backends.mps.is_available():
+    if not torch.cuda.is_available() and torch.backends.mps.is_available():
         return [mode] if mode == "mps" else ["mps", mode]
     return ["eager-fp32", mode]
 
@@ -90,7 +94,8 @@ def reset_memory():
 
 
 def memory_gb(be):
-    """Peak allocated memory (CUDA, MLX); for MPS the memory held by the Metal driver at the end of the run."""
+    """Peak allocated memory (CUDA, MLX); for MPS the memory held by the Metal driver at the end of the run; NaN for
+    backends without memory tracking (GGUF, Ollama, llama.cpp server, CPU)."""
     if isinstance(be, MLXBackend):
         return be.mx.get_peak_memory() / 2**30
     dev = getattr(be, "dev", None)
@@ -100,6 +105,8 @@ def memory_gb(be):
             return torch.cuda.max_memory_allocated() / 2**30
         if kind == "mps":
             return torch.mps.driver_allocated_memory() / 2**30
+    if hasattr(be, "llm") and torch.cuda.is_available():  # vLLM / SGLang
+        return torch.cuda.max_memory_allocated() / 2**30
     return float("nan")
 
 
@@ -156,7 +163,9 @@ def cold(be):
     that every timed call computes its prompt (the second option order may still reuse the first order's prefix, as in
     real serving)."""
     if hasattr(be, "llm"):
-        be.llm.reset_prefix_cache()
+        clear = getattr(be.llm, "reset_prefix_cache", None) or getattr(be.llm, "flush_cache", None)  # vLLM / SGLang
+        if clear is not None:
+            clear()
 
 
 def timed(fn, reps, be=None):
@@ -189,16 +198,17 @@ def measure(be, groups, lat_n):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default="Remek/basal-1.0-4.5B")
+    ap.add_argument("--model", default="Remek/basal-1.5-4.5B")
     ap.add_argument("--vllm-model", dest="vllm_model", default=None, help="checkpoint for --modes vllm (e.g. the NVFP4 repo)")
     ap.add_argument("--gguf", default=None, help="GGUF weights for --modes gguf (several files: gguf@<file> per mode)")
-    ap.add_argument("--ollama-model", default=None, help="Ollama safetensors import name for --modes ollama")
-    ap.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="Ollama API root")
+    ap.add_argument("--ollama-model", dest="ollama_model", default=None, help="Ollama model name for --modes ollama")
+    ap.add_argument("--ollama-url", dest="ollama_url", default="http://127.0.0.1:11434")
+    ap.add_argument("--llamacpp-url", dest="llamacpp_url", default="http://127.0.0.1:8080")
     ap.add_argument("--modes", nargs="+", default=None,
-                    help="default: eager-fp32 and serving mode on CUDA; bf16 MPS reference and serving mode on Apple Silicon; "
-                         "eager-fp32 and serving mode otherwise; use --modes eager-fp32 mps mlx for fp32 agreement if memory fits; "
-                         "eager-fp32, eager, fast, fast-nocompile, fp8, nvfp4, vllm, fast-exit@off|0.999|0.995|0.99|0.98, "
-                         "Apple Silicon: mlx, mlx-q8, mps; llama.cpp: gguf, gguf@<file.gguf>; Ollama: ollama")
+                    help="default: eager-fp32 and the serving default (fast on CUDA); on Apple Silicon bf16 mps and mlx "
+                         "(--modes eager-fp32 mps mlx for fp32 agreement if memory allows). Modes: eager-fp32, eager, "
+                         "fast, fast-nocompile, fp8, nvfp4, vllm, sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple "
+                         "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, ollama, llamacpp")
     ap.add_argument("--questions", nargs="+", default=DEFAULT_QUESTIONS,
                     help="JSONL file(s) with simple items (default: the bundled examples, 44 items)")
     ap.add_argument("--n", type=int, default=500)
@@ -206,14 +216,14 @@ def main():
     ap.add_argument("--out", default=None, help="write results as JSON")
     a = ap.parse_args()
     a.modes = a.modes or default_modes()
-    md = resolve(a.model)
+    md = resolve(a.model, metadata_only=all(MODES.get(m.split("@")[0], ("",))[0] in GGUF_KINDS for m in a.modes))
     vm = resolve(a.vllm_model) if a.vllm_model else None
     qs = load_questions(a.questions, a.n)
     ref, rows = None, []
     for mode in a.modes:
         reset_memory()
         t0 = time.time()
-        be = build(mode, md, vm, a.gguf, a.ollama_model, a.ollama_url)
+        be = build(mode, md, vm, a.gguf, a.ollama_model, a.ollama_url, a.llamacpp_url)
         load_s = time.time() - t0
         groups = groups_for(be.tok, qs)
         dec, r = measure(be, groups, min(a.lat_n, len(groups) - 5))

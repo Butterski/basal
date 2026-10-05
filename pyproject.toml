@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "basal"
-version = "1.0.0"
-description = "Inference engine for basal-1.0: fast, calibrated typed decisions (choice / yes-no / score) for Polish and English"
+version = "1.5.0"
+description = "Inference engine for basal: fast, calibrated typed decisions (choice / yes-no / score) for Polish and English"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
@@ -24,16 +24,16 @@ dependencies = [
 fp8 = ["torchao==0.18.0"]
 nvfp4 = ["torchao==0.18.0"]
 vllm = ["vllm>=0.11"]
-mlx = [
-  "mlx>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
-  "mlx-lm>=0.31; sys_platform == 'darwin' and platform_machine == 'arm64'",
+mlx = [  # Apple Silicon: --mode mlx / mlx-q8 (-MLX-8bit / -MLX-fp4 exports or bf16 weights); mlx-lm needs Python 3.11+
+  "mlx>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.11'",
+  "mlx-lm>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.11'",
 ]
-gguf = ["llama-cpp-python>=0.3.35"]
-gguf-export = ["gguf>=0.19"]
+gguf = ["llama-cpp-python>=0.3.35"]  # --mode gguf: a GGUF file in process (Metal, CUDA or CPU)
+gguf-export = ["gguf>=0.19"]  # basal-export-gguf: GGUF with the Hugging Face tokenization (docs/GGUF.md)
 test = [
   "pytest", "jsonschema",
-  "mlx>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
-  "mlx-lm>=0.31; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.11'",
+  "mlx-lm>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.11'",
 ]
 
 [project.scripts]

@@ -1,39 +1,216 @@
-# Low precision: FP8 and NVFP4
+# Low precision and ports: FP8, MLX, GGUF
 
-basal-1.0 can run in three precisions. All modes read the same letter probabilities; lower precision changes a small
-share of decisions, which we report as argmax agreement with the fp32 reference.
+All routes read the same answer: the probabilities of the option letters at the answer position. Lower precision and
+other runtimes change a small share of decisions, which we report as agreement of the top answer with the bf16 / fp32
+model on the same items.
 
-| precision | how | GPUs | typical agreement with fp32 |
+## What ships with basal-1.5
+
+| format | repositories | runs on | how |
 |---|---|---|---|
-| bf16 | `--mode fast` | any CUDA GPU, sm80+ | ≥ 0.99 (identical decisions up to bf16 noise) |
-| FP8 (on the fly) | `--mode fp8` (torchao dynamic FP8, per-row scales) | Hopper, Blackwell (Ada: FP8 compilation stalled on an RTX 4090) | ≈ 0.96–0.98 |
-| FP8 (checkpoint) | `--mode vllm --model Remek/basal-1.0-4.5B-FP8` | Hopper, Blackwell | not benchmarked yet (expected close to `--mode fp8`) |
-| NVFP4 (checkpoint) | `--mode vllm --model Remek/basal-1.0-4.5B-NVFP4` | Blackwell (measured on DGX Spark GB10) | 0.90 (−3 accuracy points) |
-| NVFP4 (on the fly) | `--mode nvfp4` (torchao, experimental) | Blackwell | 0.90–0.91 (−3 accuracy points) |
+| bf16 safetensors | `Remek/basal-1.5-4.5B`, `Remek/basal-1.5-max`, `Remek/basal-1.5-mini` | NVIDIA GPUs (basal engine, vLLM, SGLang), Apple Silicon (MPS) and CPU (eager) | `basal-serve --model ...` |
+| MLX 8-bit (affine, group 64) | `...-MLX-8bit` | Apple Silicon | `basal-serve --mode mlx` |
+| MLX 4-bit (`nvfp4`, group 16, FP8 scales) | `...-MLX-fp4` | Apple Silicon | `basal-serve --mode mlx` |
+| GGUF (Q8_0, Q4_K_M) | `...-GGUF` | Ollama, llama.cpp (CPU, Apple Silicon, consumer GPUs) | `basal-serve --mode ollama` / `--mode llamacpp` |
+| FP8 (NVIDIA ModelOpt) | `...-FP8` | vLLM on Hopper, Ada and Blackwell | `basal-serve --mode vllm` |
+| NVFP4 (NVIDIA ModelOpt) | `...-NVFP4` (4.5B, max) | vLLM on Blackwell | `basal-serve --mode vllm` |
+
+For vLLM, basal-1.5 also ships FP8 / NVFP4 ModelOpt checkpoints ([below](#basal-15-the-modelopt-checkpoints)). In the
+basal engine itself, the bf16 weights are quantised on the fly:
+
+| precision | how | GPUs | agreement with fp32 (basal-1.0-4.5B) | basal-1.5 |
+|---|---|---|---|---|
+| bf16 | `--mode fast` | any CUDA GPU, sm80+ | ≥ 0.99 (identical decisions up to bf16 noise) | 0.997 |
+| FP8 (on the fly) | `--mode fp8` (torchao dynamic FP8, per-row scales) | Hopper, Blackwell (Ada: FP8 compilation stalled on an RTX 4090) | ≈ 0.96–0.98 | not measured |
+| NVFP4 (on the fly) | `--mode nvfp4` (torchao, experimental) | Blackwell | 0.90–0.91 (−3 accuracy points) | not recommended |
+
+## Engines
+
+The same table as in the README: which engine serves which format, and what is verified on basal-1.5.
+
+<!-- engines -->
+| engine | `basal-serve` mode | hardware | what it is for | quick start | status (basal-1.5, 4.5B) |
+|---|---|---|---|---|---|
+| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`, `fp8`, `nvfp4`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon with `mps` (packed requests on the Mac's GPU, no CUDA graphs) or `eager`; CPU with `eager` | the primary server: packed requests (SOAM), evidence spans, `fp8` on Hopper and Blackwell | `basal-serve --model Remek/basal-1.5-4.5B --mode fast` | **verified**: served check on one H100, 13.7 ms p50 per question over HTTP, 64.4 decisions/s with 32 clients |
+| **vLLM** | `vllm` | NVIDIA GPUs | an alternative CUDA server | `basal-serve --model Remek/basal-1.5-4.5B --mode vllm` (extra `basal[vllm]`) | **verified offline** (one H100, `basal-bench`, 1,000 development decisions): agreement 0.994 with the fp32 engine, accuracy 0.928 vs 0.930, 147 decisions/s |
+| **SGLang** | `sglang` | NVIDIA GPUs | an alternative CUDA server (RadixAttention prefix sharing) | `basal-serve --model Remek/basal-1.5-4.5B --mode sglang` (own environment: `sglang[srt]==0.5.21`, then basal with `--no-deps`) | **verified offline** (one H100, `basal-bench`, 1,000 development decisions): agreement 0.995 with the fp32 engine, accuracy 0.925 vs 0.930, 104.6 decisions/s; on Werdykt the same answer as the basal engine on 98.3% of items (97.0% for states over 8k tokens) |
+| **MLX** | `mlx` (default on a Mac with `basal[mlx]`); `mlx-q8` | Apple Silicon | Macs: `-MLX-8bit` (recommended) or `-MLX-fp4` (half the memory); `mlx-q8` makes 8-bit weights from bf16 at load time | `basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx` (extra `basal[mlx]`) | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.992 (`-MLX-8bit`) / 0.970 (`-MLX-fp4`), 587 / 581 ms per question |
+| **Ollama** | `ollama` | CPU, Apple Silicon, consumer GPUs | local and desktop use with Ollama (`-GGUF`) | 1. `hf download Remek/basal-1.5-4.5B-GGUF --local-dir basal-1.5-4.5B-GGUF` 2. in that folder: `ollama create basal-1.5-4.5b:q8_0 -f Modelfile.Q8_0` 3. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode ollama --ollama-model basal-1.5-4.5b:q8_0` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 518 / 542 ms per question |
+| **llama.cpp** | `llamacpp`; `gguf` | CPU, Apple Silicon, consumer GPUs | `llama-server` with the `-GGUF` files; the engine's token ids are sent as is. `--mode gguf --gguf <file>` runs the file in process instead (extra `basal[gguf]`, [GGUF.md](GGUF.md)) | 1. `llama-server -m basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf -c 4096 --port 8080` 2. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode llamacpp` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 427 / 446 ms per question |
+
+**`basal-serve` is the decision layer in every row.** vLLM, SGLang, MLX, Ollama and llama.cpp run the weights; the typed answers (a calibrated probability for each of your options, both option orders, the state shared by several questions, `multi`, `act` and `facts`) come from `basal-serve --mode <engine>` in front of them, with the same HTTP API in every mode. A plain `ollama run` or `llama-cli` gives free text only. Evidence spans need the PyTorch engine (`fast`, `eager`); vLLM and SGLang start with a 4,096-token context (longer states are refused); raise it with `--max-len` (e.g. 32768 for long documents). Install and first request for each engine: [quick start](../README.md#quick-start).
+<!-- /engines -->
+
+## Ports: agreement and speed
+
+Apple M4 Pro, 24 GB, macOS 15.7; the uploaded files.
+
+| model | port, engine | agreement with the reference | accuracy (change) | ECE | latency, 1 / 5 questions per state | memory |
+|---|---|---|---|---|---|---|
+| basal-1.5 (4.5B) | PyTorch MPS, bf16 (reference) | – | 0.936 | 0.030 | 817 ms / 3.99 s | 9.5 GB |
+| basal-1.5 (4.5B) | MLX `-MLX-8bit` | 0.992 | 0.940 (+0.004) | 0.037 | 587 ms / 2.19 s | 5.2 GB |
+| basal-1.5 (4.5B) | MLX `-MLX-fp4` (nvfp4) | 0.970 | 0.922 (−0.014) | 0.039 | 581 ms / 2.10 s | 2.9 GB |
+| basal-1.5 (4.5B) | GGUF Q8_0, llama.cpp | 0.994 | 0.938 (+0.002) | 0.031 | 427 ms / 1.67 s | 5.1 GB |
+| basal-1.5 (4.5B) | GGUF Q8_0, Ollama | as llama.cpp | as llama.cpp | as llama.cpp | 518 ms / 1.76 s | 5.1 GB |
+| basal-1.5 (4.5B) | GGUF Q4_K_M, llama.cpp | 0.980 | 0.936 (±0.000) | 0.030 | 446 ms / 1.73 s | 2.9 GB |
+| basal-1.5 (4.5B) | GGUF Q4_K_M, Ollama | as llama.cpp | as llama.cpp | as llama.cpp | 542 ms / 1.84 s | 2.9 GB |
+| basal-1.5-max (11B) | GGUF Q8_0, llama.cpp (reference) | – | 0.948 | 0.033 | 1.16 / 3.67 s | 11.9 GB |
+| basal-1.5-max (11B) | GGUF Q8_0, Ollama | as llama.cpp | as llama.cpp | as llama.cpp | 1.10 / 3.67 s | 11.9 GB |
+| basal-1.5-max (11B) | MLX `-MLX-8bit` | 0.996 | 0.948 (±0.000) | 0.027 | 1.36 / 5.20 s | 12.1 GB |
+| basal-1.5-max (11B) | MLX `-MLX-fp4` (nvfp4) | 0.972 | 0.928 (−0.020) | 0.025 | 1.32 / 4.92 s | 6.7 GB |
+| basal-1.5-max (11B) | GGUF Q4_K_M, llama.cpp | 0.994 | 0.942 (−0.006) | 0.027 | 1.22 / 3.85 s | 6.8 GB |
+| basal-1.5-max (11B) | GGUF Q4_K_M, Ollama | as llama.cpp | as llama.cpp | as llama.cpp | 1.16 / 3.84 s | 6.8 GB |
+| basal-1.5-mini (1.5B) | PyTorch MPS, bf16 (reference) | – | 0.918 | 0.037 | 279 ms / 1.35 s | 3.2 GB |
+| basal-1.5-mini (1.5B) | MLX `-MLX-8bit` | 0.998 | 0.916 (−0.002) | 0.037 | 196 / 713 ms | 1.8 GB |
+| basal-1.5-mini (1.5B) | MLX `-MLX-fp4` (nvfp4) | 0.908 | 0.882 (−0.036) | 0.059 (0.046 with its `CALIBRATION.mlx.json`) | 197 / 728 ms | 1.0 GB |
+| basal-1.5-mini (1.5B) | GGUF Q8_0, llama.cpp | 0.998 | 0.918 (±0.000) | 0.036 | 160 / 613 ms | 1.7 GB |
+| basal-1.5-mini (1.5B) | GGUF Q8_0, Ollama | as llama.cpp | as llama.cpp | as llama.cpp | 186 / 647 ms | 1.7 GB |
+| basal-1.5-mini (1.5B) | GGUF Q4_K_M, llama.cpp | 0.964 | 0.914 (−0.004) | 0.032 | 157 / 613 ms | 1.0 GB |
+| basal-1.5-mini (1.5B) | GGUF Q4_K_M, Ollama | as llama.cpp | as llama.cpp | as llama.cpp | 196 / 641 ms | 1.0 GB |
+
+Measured on 500 held-out Polish development decisions, both option orders, calibrated; reference = the same weights in
+PyTorch bf16 on the same machine (for basal-1.5-max, which does not fit this Mac in bf16: GGUF Q8_0 with llama.cpp);
+agreement = same top option as the reference; latency = median per decision (both option orders) through the basal
+server path, with 1 and 5 questions per state.
+
+Accuracy here is on a 500-decision sample, to check that each port matches its reference; to compare model sizes, see
+the benchmark table ([README](../README.md#other-results)).
+
+4-bit ports trade accuracy for memory: on basal-1.5 the 4-bit MLX port costs about 1.4 points (4.5B), 2.0 points (max, against its GGUF Q8_0) and 3.6 points (mini); the 8-bit ports and GGUF Q8_0 stay within noise. Use 8-bit when accuracy matters.
+
+> [!WARNING]
+> **Quality warning.** The 4-bit MLX ports of basal-1.5-mini and basal-1.5-max lose accuracy, and their confidence thresholds are not certified: mini's about 3.6 points against bf16 (0.882 vs 0.918), max's about 2.0 points against its GGUF Q8_0 reference (0.928 vs 0.948). For mini, use `-MLX-8bit` or GGUF (`Q8_0` / `Q4_K_M`), whose accuracy stays within noise of bf16; for max, use `-MLX-8bit` (agreement 0.996, accuracy 0.948) or, with Ollama / llama.cpp, GGUF `Q4_K_M` (0.994, 0.942). For vLLM, the NVFP4 checkpoint of basal-1.5 (4.5B) loses about 2.8 accuracy points (0.902 vs 0.930; agreement 0.937); use `-FP8` unless memory or throughput matters more.
+
+## MLX (Apple Silicon)
+
+`basal-serve --mode mlx` runs the `-MLX-8bit` or `-MLX-fp4` ports, or a bf16 model directory, with MLX / mlx-lm on
+the GPU of an Apple Silicon Mac (install `basal[mlx]`). The state of a request is computed once into a KV cache shared
+by all its questions and option orders.
+
+- `-MLX-8bit`: affine 8-bit decoder weights (group 64, a bf16 scale and bias per group);
+- `-MLX-fp4`: MLX `nvfp4` decoder weights (4-bit floating point E2M1, group 16, FP8 scales);
+- in both, the token embeddings and the output head stay in bf16, because the decision is read from the output head's
+  logits of the option letters.
+
+**Why these two formats.** On a development 4.5B checkpoint (500 decisions, Mac M4 Pro), the agreement of the top
+answer with the bf16 model was 0.998 for affine 8-bit, 0.966 for `nvfp4`, 0.940 for MLX `mxfp8` and 0.938 for `mxfp4`:
+MLX's 8-bit floating-point format changed as many decisions as the 4-bit ones, so the 8-bit port uses affine 8-bit, and
+the 4-bit port uses `nvfp4`. Prefer `-MLX-8bit`; use `-MLX-fp4` when memory is tight. For basal-1.5-mini use `-MLX-8bit` (1.8 GB, agreement 0.998) or GGUF `Q4_K_M` (1.0 GB, 0.964); its `-MLX-fp4` port costs about 3.6 accuracy points (agreement 0.908, accuracy 0.882 vs 0.918). (`nvfp4` is
+still the best MLX 4-bit format on mini.) Mini's `-MLX-fp4` ships its own temperatures in `CALIBRATION.mlx.json`; its
+thresholds are copied from bf16 and not certified for that port.
+
+```bash
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"
+basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx --port 8000
+```
+
+## GGUF for Ollama and llama.cpp
+
+The `-GGUF` repositories hold `Q8_0` and `Q4_K_M` files, one Ollama `Modelfile.<quant>` per file, the tokenizer,
+chat template and calibration file. Two details of the export matter for decisions:
+
+- **Tokenizer fields.** The stock llama.cpp conversion writes the same score (−1000) for every token of this
+  tokenizer, so Ollama and other text clients split prompts differently from the original tokenizer (on a check of
+  400 prompts, none was identical). The export sets the scores from the BPE merge ranks and `add_space_prefix =
+  false`, and matches every added token (`<|im_start|>`, `<|im_end|>`, …) whole, as the Hugging Face tokenizer does:
+  all 400 prompts are then tokenized exactly as by the original tokenizer, and `--mode ollama` and `--mode llamacpp`
+  give the same answers.
+- **`Q4_K_M`** is quantised with an importance matrix computed on decision prompts and keeps the output head and the
+  token embeddings at Q8_0 (on a development 4.5B checkpoint the importance matrix raised agreement with bf16 from
+  0.920 to 0.978; `Q8_0`: 0.990). basal is a
+typed-decision model, not a chat model, so the basal server runs in front of the runtime: it renders basal's own prompt
+with the answer prefix, sends it raw (Ollama 0.12.11 or newer: log-probabilities) or as token ids (llama.cpp), and reads
+the option letters' log-probabilities of one generated token.
+
+```bash
+hf download Remek/basal-1.5-4.5B-GGUF --local-dir basal-1.5-4.5B-GGUF
+cd basal-1.5-4.5B-GGUF && ollama create basal-1.5-4.5b:q8_0 -f Modelfile.Q8_0 && cd ..
+basal-serve --model ./basal-1.5-4.5B-GGUF --mode ollama --ollama-model basal-1.5-4.5b:q8_0 --port 8000
+
+llama-server -m basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf -c 4096 --port 8080
+basal-serve --model ./basal-1.5-4.5B-GGUF --mode llamacpp --llamacpp-url http://127.0.0.1:8080 --port 8000
+```
+
+**Requirements.** MLX: `basal[mlx]` (mlx ≥ 0.32, mlx-lm ≥ 0.32), macOS 14 or newer on Apple Silicon (measured on
+macOS 15.7). Ollama 0.12.11 or newer (log-probabilities; measured with 0.35.0). llama.cpp: measured with 0.5.0
+(b11146). Every port supports both option orders, the calibration file, the shared state of several questions,
+`multi`, `act` and `facts`; none supports evidence spans or early exit. On basal-1.5 (4.5B) the temperatures that fit
+the ports best are 0.93–1.05 times the bf16 ones, so no per-engine calibration file is shipped; the one exception is
+mini's `-MLX-fp4` (`CALIBRATION.mlx.json`).
+
+How the ports are made and read, prefix sharing, tokens and options (`--http-parallel`, `--calibration`):
+[PORTS.md](PORTS.md).
+
+**Why through the basal server.** The basal server asks every question in two option orders, averages them and applies
+the calibrated temperature of the question type; its thresholds for 1% and 5% error are fitted on exactly that
+prediction. Calling a GGUF model directly with another prompt, one option order and raw probabilities gives different
+answers and confidences. When we tested the basal-1.0-1.5B GGUF (Q8_0) on a Mac M4 Pro with llama.cpp, the conversion
+itself was faithful (97.6% agreement with the H100 bf16 model with basal's own prompt, same accuracy), while a generic
+decision prompt instead of basal's own format cost about 3 accuracy points. Even through the basal server, the
+calibration of a quantised port is inherited, not validated: refit thresholds on your own labelled requests before
+automating decisions with it.
 
 ## When does low precision help?
 
 At batch size 1 a 4.5B model on a 400-token prompt is limited by kernel-launch overhead on server GPUs, by compute on
-workstation and consumer GPUs, and by memory bandwidth on the DGX Spark. FP8 therefore helps most where memory or
-compute is the bottleneck (DGX Spark: 92.0 → 44.6 ms, RTX PRO 6000: 18.9 → 14.9 ms, RTX 5090: 27.3 → 19.4 ms per
-decision), little on the H100 (12.5 → 11.3 ms) and not at all on the B300 (8.8 → 9.7 ms). The price is that 2–4% of
-decisions change. NVFP4 changes about 10% and costs about 3 accuracy points on the 4.5B model (about 7 on the 1.5B).
-Use bf16 when every decision counts, FP8 on workstation, consumer and desktop GPUs, and NVFP4 only when batch throughput
-matters more than accuracy.
+workstation and consumer GPUs, and by memory bandwidth on the DGX Spark. On Apple Silicon (M4 Pro) the prefill of a
+decision is compute-bound: the 8-bit and 4-bit ports take about the same time (basal-1.5: MLX 8-bit 587 ms, fp4
+581 ms; GGUF Q8_0 427 ms, Q4_K_M 446 ms) and only save memory. On NVIDIA GPUs, FP8 therefore helps most
+where memory or compute is the bottleneck (DGX Spark: 92.0 → 44.6 ms, RTX PRO 6000: 18.9 → 14.9 ms, RTX 5090: 27.3 →
+19.4 ms per decision, measured with the 4.5B architecture), little on the H100 (12.5 → 11.3 ms) and not at all on the
+B300 (8.8 → 9.7 ms). The price is that 2–4% of decisions change. 4-bit formats change more decisions (about 10% for
+NVFP4 on the 4.5B model, with −3 accuracy points; about 7 points on the 1.5B). Use bf16 when every decision counts, FP8
+on workstation, consumer and desktop GPUs, and 4-bit formats where memory or throughput matters more than the last
+points of accuracy.
 
-## The ModelOpt checkpoints
+## basal-1.5: the ModelOpt checkpoints
 
-The `-FP8` and `-NVFP4` repositories were produced with [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer)
-post-training quantisation (`NVFP4_DEFAULT_CFG` / `FP8_DEFAULT_CFG`), calibrated on 1,024 decision prompts from the
-calibration split (both option orders), with the output head kept in bf16 (the decision is read from its logits). They
-are standard ModelOpt Hugging Face exports; they load in vLLM (tested) and are also supported by SGLang and
-TensorRT-LLM (untested).
+`Remek/basal-1.5-4.5B-FP8` / `-NVFP4`, `Remek/basal-1.5-max-FP8` / `-NVFP4` and `Remek/basal-1.5-mini-FP8` were produced with [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) post-training quantisation
+(`FP8_DEFAULT_CFG` / `NVFP4_DEFAULT_CFG`), calibrated on basal-1.5 calibration decisions, with the token embeddings and
+the output head kept in bf16 (the decision is read from the output head's logits). FP8 runs on Hopper, Ada and Blackwell;
+NVFP4 needs Blackwell (B200, B300, RTX 50xx, RTX PRO 6000, DGX Spark). basal-1.5-mini has no NVFP4 checkpoint: NVFP4
+costs basal-1.5-mini about 6 accuracy points with almost no speed gain over FP8; use `-FP8`. Run them with vLLM in a separate environment:
 
 ```bash
-uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v1.0.1.tar.gz"   # separate environment: vLLM brings its own torch
+uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"
+basal-serve --model Remek/basal-1.5-4.5B-FP8 --mode vllm --port 8000
+```
+
+| model | checkpoint | GPU | agreement with the bf16 model | accuracy (change) | speed | size |
+|---|---|---|---|---|---|---|
+| basal-1.5 (4.5B) | `-FP8` | RTX PRO 6000 Blackwell | 0.983 | 0.931 (+0.001) | 17.2 ms, 143.5 dec/s | 4.9 GB |
+| basal-1.5 (4.5B) | `-NVFP4` | RTX PRO 6000 Blackwell | 0.937 | 0.902 (−0.028) | 17.4 ms, 163.4 dec/s | 2.9 GB |
+| basal-1.5-max (11B) | `-FP8` | RTX PRO 6000 Blackwell | 0.989 | 0.941 (−0.003) | 24.5 ms, 76.4 dec/s | 11.4 GB |
+| basal-1.5-max (11B) | `-NVFP4` | RTX PRO 6000 Blackwell | 0.979 | 0.943 (−0.001) | 22.0 ms, 120.8 dec/s | 6.7 GB |
+| basal-1.5-mini (1.5B) | `-FP8` | RTX PRO 6000 Blackwell | 0.979 | 0.903 (−0.013) | 8.8 ms, 337.2 dec/s | 1.7 GB |
+
+Measured on 1,000 development decisions, both option orders, with vLLM 0.30.0 on one RTX PRO 6000 Blackwell (native CUTLASS FP8 / NVFP4 kernels), 2026-10-03; reference: the bf16 weights in fp32 PyTorch on the same GPU (accuracy 0.930 / 0.944 / 0.916 for basal-1.5 / max / mini); latency = one two-order decision at batch 1 (median), decisions/s with 32 option-order passes per call; size = checkpoint size. At batch 1 FP8 and NVFP4 are equally fast on this GPU; NVFP4 gains batched throughput. On max, NVFP4 is as accurate as FP8 (0.943 vs 0.941) at 58% more throughput. `CALIBRATION.json` carries the bf16 model's temperatures and thresholds; the thresholds are not
+validated for these checkpoints, so refit them on your own labelled requests before automating decisions with them.
+
+Reproducibility: the checkpoints were quantised with nvidia-modelopt 0.47.0, which requires transformers < 5.15, so the
+quantisation environment pins transformers 5.14.1 (the basal engine pins 5.17.0); vLLM 0.30.0 serves the checkpoints
+from its own environment.
+
+## basal-1.0: the ModelOpt checkpoints
+
+The `Remek/basal-1.0-4.5B-FP8` / `-NVFP4` and `Remek/basal-1.0-1.5B-FP8` / `-NVFP4` repositories were produced with
+[NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) post-training quantisation (`NVFP4_DEFAULT_CFG` /
+`FP8_DEFAULT_CFG`), with the output head kept in bf16 (the decision is read from its logits). They are standard
+ModelOpt Hugging Face exports and load in vLLM (tested):
+
+```bash
+uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"   # separate environment: vLLM brings its own torch
 basal-serve --model Remek/basal-1.0-4.5B-NVFP4 --mode vllm --port 8000
 ```
 
 The `vllm` mode asks vLLM for one token restricted to the option letters and reads the log-probabilities computed
 *after* that restriction (`logprobs_mode="processed_logprobs"`), which is exactly the letter softmax of the other modes.
-vLLM's prefix caching shares the state between the two option orders.
+vLLM's prefix caching shares the state between the option orders and the questions of a request. The same mode serves
+the bf16 basal-1.5 weights (`--model Remek/basal-1.5-4.5B --mode vllm`), and `--mode sglang` the same way. On one
+H100, offline (`basal-bench`, 1,000 development decisions, both option orders), vLLM agrees with the engine's fp32 reference on 0.994 of decisions (accuracy 0.928 vs 0.930, 147 decisions/s) and SGLang on 0.995 (accuracy 0.925 vs 0.930, 104.6 decisions/s, 14.1 ms p50 for one question); on Werdykt, SGLang gives the same answer as the basal engine on 98.3% of items (97.0% for states over 8k tokens). Neither ships its own
+calibration file for 1.5; both use `CALIBRATION.json`.
+
+SGLang runs in its own environment. Install `sglang[srt]==0.5.21` (its kernels need a CUDA 12.9+ toolkit), then
+`uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"` and, if missing, `uv pip install starlette uvicorn httpx accelerate
+safetensors`. This is the setup the SGLang numbers were measured with; the basal engine's own modes (`fast`, `eager`)
+and vLLM use the default install.

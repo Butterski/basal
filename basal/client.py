@@ -8,14 +8,16 @@ import httpx
 
 
 class Basal:
-    def __init__(self, url="http://127.0.0.1:8000", timeout=60, early_exit=None):
-        self.url, self.early_exit = url.rstrip("/") + "/v1/systemone", early_exit
+    def __init__(self, url="http://127.0.0.1:8000", timeout=60, early_exit=None, facts=None):
+        self.url, self.early_exit, self.facts = url.rstrip("/") + "/v1/systemone", early_exit, facts
         self.http = httpx.Client(timeout=timeout)
 
     def decide(self, state, questions):
         body = {"state": state, "questions": questions}
         if self.early_exit:
             body["early_exit"] = self.early_exit
+        if self.facts:
+            body["facts"] = self.facts  # "auto": computed calendar / arithmetic facts appended to the state
         r = self.http.post(self.url, json=body)
         if r.status_code != 200:
             raise RuntimeError(r.text)

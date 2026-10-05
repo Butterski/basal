@@ -3,13 +3,18 @@ Copyright 2026 Remigiusz Kinas
 
 This product includes models fine-tuned from the following works, licensed under the Apache License, Version 2.0:
 
+  basal-1.5-4.5B  <- speakleash/Bielik-4.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-4.5B-v3.0-Instruct)
+  basal-1.5-max   <- speakleash/Bielik-PL-11B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-PL-11B-v3.0-Instruct)
+  basal-1.5-mini  <- speakleash/Bielik-1.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-1.5B-v3.0-Instruct)
   basal-1.0-4.5B  <- speakleash/Bielik-4.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-4.5B-v3.0-Instruct)
   basal-1.0-1.5B  <- speakleash/Bielik-1.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-1.5B-v3.0-Instruct)
 
 The inference engine in this repository is original work licensed under the Apache License, Version 2.0.
 
-Training data attribution:
+Training data attribution (basal-1.0 models):
   English decision items in the training data were converted from the public corpus
   avbiswas/bev-decision-150K (https://huggingface.co/datasets/avbiswas/bev-decision-150K), which aggregates questions
   derived from many upstream sources. Its maintainers ask users to check and attribute those upstream sources; row-level
   source identifiers are not available, so the upstream sources of these items are not documented individually.
+
+basal-1.5 models: released under the Apache License, Version 2.0.
