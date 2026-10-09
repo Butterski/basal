@@ -5,7 +5,7 @@ every token and with a word-boundary prefix, so llama.cpp (and Ollama, LM Studio
 splits text differently from the tokenizer the models were trained with. This tool runs the converter and then fixes
 the file as the basal-1.5 -GGUF files are fixed (docs/PORTS.md, "Tokenizer fix"). With --gguf it fixes an existing
 GGUF instead (a stock conversion, a llama-quantize output, an older basal GGUF); the model then only supplies
-tokenizer.json and CALIBRATION.json, downloaded without the weights:
+tokenizer.json, the calibration and config.json, downloaded without the weights:
 
 - tokenizer.ggml.scores: minus the rank of the first BPE merge that creates each token (the first merge scores 0), so
   llama.cpp's greedy highest-score-first merging follows the BPE merge order; the added tokens of tokenizer.json score
@@ -17,9 +17,12 @@ tokenizer.json and CALIBRATION.json, downloaded without the weights:
   Face tokenizer matches them whole; the converter reads special tokens from tokenizer_config.json only, and
   basal-1.0-4.5B's and basal-1.5-max's do not list <|im_start|>, so llama.cpp split it into characters;
 - with --ollama-decision: <arch>.decision.type = "basal" and <arch>.decision.temperature.{choice,noul,score} from
-  CALIBRATION.json (without it, such keys of the input are removed). Ollama's /v1/systemone then renders basal's own
-  prompt format, scores both option orders and calibrates. Such a file is decision-only in Ollama (/api/generate and
-  /api/chat refuse it) and needs an Ollama with the basal decision encoding; other Ollama versions reject it.
+  CALIBRATION.ollama.json when the model ships it, else CALIBRATION.json, as basal-serve --mode ollama chooses (without
+  the flag, such keys of the input are removed). A model directory with config.json must describe the GGUF's model
+  (layers, hidden size, vocabulary); the -GGUF folders have none, so the tool prints whose calibration it wrote.
+  Ollama's /v1/systemone then renders basal's own prompt format, scores both option orders and calibrates. Such a file
+  is decision-only in Ollama (/api/generate and /api/chat refuse it) and needs an Ollama with the basal decision
+  encoding; other Ollama versions reject it.
 
 Fixing a fixed file changes nothing (the basal-1.5 -GGUF files come out byte-identical). The tokenizer matches the
 Hugging Face one for text that starts with a special token (every basal prompt starts with <s>); for text without one,
@@ -37,13 +40,14 @@ from pathlib import Path
 
 DECISION_TYPES = ("choice", "noul", "score")
 ADDED_TOKEN_SCORE = -1000.0  # llama.cpp's converter scores the added tokens so; the -GGUF files keep it
+MODEL_FILES = ["tokenizer.json", "CALIBRATION.json", "CALIBRATION.ollama.json", "config.json", "basal.json"]  # --gguf
 
 
 def merge_rank_scores(tokenizer_json, tokens):
-    """Token scores as in the -GGUF files: -(rank of the first BPE merge producing the token); -1000 for the added tokens
-    of tokenizer.json, whatever the input file had; 0 for the rest (single characters, byte tokens: llama.cpp only
-    compares the scores of merge results, and basal's vocabulary has no other multi-character token). Returns (scores,
-    tokens ranked)."""
+    """Token scores as in the -GGUF files: -(rank of the first BPE merge producing the token); -1000 for the added
+    tokens of tokenizer.json, whatever the input file had; 0 for the rest (single characters, byte tokens: llama.cpp
+    only compares the scores of merge results, and basal's vocabulary has no other multi-character token). Returns
+    (scores, tokens ranked)."""
     rank = {}
     for i, m in enumerate(tokenizer_json["model"]["merges"]):
         a, b = m if isinstance(m, list) else m.split(" ", 1)
@@ -73,6 +77,27 @@ def decision_metadata(arch, calibration):
     return meta
 
 
+def calibration_file(model_dir):
+    """CALIBRATION.ollama.json when the model ships it, else CALIBRATION.json (basal-serve --mode ollama's rule)."""
+    cal = Path(model_dir) / "CALIBRATION.ollama.json"
+    return cal if cal.exists() else Path(model_dir) / "CALIBRATION.json"
+
+
+def check_config(reader, arch, n_tokens, raw, model_dir):
+    """A model directory with config.json must describe the GGUF's model (layers, hidden size, vocabulary, as
+    basal-serve --mode gguf checks), or its calibration is another model's; the -GGUF folders have no config.json."""
+    cp = Path(model_dir) / "config.json"
+    if not cp.exists():
+        return
+    cfg, f = json.loads(cp.read_text()), reader.fields
+    for name, key, actual in (("num_hidden_layers", "block_count", f[f"{arch}.block_count"].contents()),
+                              ("hidden_size", "embedding_length", f[f"{arch}.embedding_length"].contents()),
+                              ("vocab_size", "vocabulary", n_tokens)):
+        if cfg.get(name, actual) != actual:
+            raise ValueError(f"{raw}: {key} is {actual}, but the model's config.json specifies {name}={cfg[name]}; "
+                             "its calibration belongs to another model")
+
+
 def fix_gguf(raw, outfile, model_dir, ollama_decision=False):
     import gguf
     from gguf.scripts.gguf_new_metadata import MetadataDetails, copy_with_new_metadata
@@ -93,7 +118,8 @@ def fix_gguf(raw, outfile, model_dir, ollama_decision=False):
            gguf.Keys.Tokenizer.TOKEN_TYPE: MetadataDetails(gguf.GGUFValueType.ARRAY, token_types,
                                                            sub_type=gguf.GGUFValueType.INT32)}
     if ollama_decision:
-        calibration = json.loads((model_dir / "CALIBRATION.json").read_text())
+        check_config(reader, arch, len(tokens), raw, model_dir)
+        calibration = json.loads(calibration_file(model_dir).read_text())
         for key, (typ, value) in decision_metadata(arch, calibration).items():
             new[key] = MetadataDetails(types[typ], value)
     stale = [] if ollama_decision else [k for k in reader.fields if k.startswith(f"{arch}.decision.")]
@@ -103,9 +129,9 @@ def fix_gguf(raw, outfile, model_dir, ollama_decision=False):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("model", help="local directory or Hugging Face repo id (with --gguf: only its tokenizer.json and "
-                                  "CALIBRATION.json are read)")
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])  # no docstring under python -OO
+    ap.add_argument("model", help="local directory or Hugging Face repo id (with --gguf: only its tokenizer.json, "
+                                  "calibration, config.json and basal.json are read)")
     ap.add_argument("outfile")
     ap.add_argument("--gguf", default=None, help="fix this GGUF file instead of converting the model (a stock "
                                                 "conversion, a llama-quantize output, an older basal GGUF)")
@@ -131,11 +157,17 @@ def main(argv=None):
     try:
         import gguf  # noqa: F401
     except ImportError:
-        ap.error('the gguf package is missing; install it with: uv pip install -e ".[gguf-export]"')
+        ap.error('the gguf package is missing; install the gguf-export extra (from a clone: uv pip install -e '
+                 '".[gguf-export]") or uv pip install "gguf>=0.19"')
     from huggingface_hub import snapshot_download
 
     model_dir = Path(a.model) if Path(a.model).exists() else Path(snapshot_download(
-        a.model, revision=a.revision, allow_patterns=["tokenizer.json", "CALIBRATION.json"] if a.gguf else None))
+        a.model, revision=a.revision, allow_patterns=MODEL_FILES if a.gguf else None))
+    cal = calibration_file(model_dir)
+    if not (model_dir / "tokenizer.json").is_file():
+        ap.error(f"{a.model} has no tokenizer.json; pass the basal model the GGUF was converted from")
+    if a.ollama_decision and not cal.is_file():
+        ap.error(f"{a.model} has no CALIBRATION.json, which --ollama-decision needs")
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out.parent) as tmp:
         raw = Path(a.gguf or Path(tmp) / "converted.gguf")
@@ -151,6 +183,12 @@ def main(argv=None):
             sys.exit(f"basal-export-gguf: {e}")
     extra = ", decision.type=basal" if a.ollama_decision else ""
     print(f"wrote {out}: {ranked}/{total} token scores from BPE merges, add_space_prefix=false{extra}")
+    if a.ollama_decision:  # a -GGUF folder has no config.json to check: show whose calibration was written
+        info, temps = model_dir / "basal.json", json.loads(cal.read_text())["temperature_per_prim"]
+        name = info.exists() and json.loads(info.read_text()).get("name")
+        check = "config.json matches the GGUF" if (model_dir / "config.json").exists() else "no config.json to check"
+        print(f"temperatures from {cal.name} of {a.model}{f' ({name})' if name else ''}, {check}: "
+              + ", ".join(f"{t} {temps[t]:.4f}" for t in DECISION_TYPES))
 
 
 if __name__ == "__main__":
