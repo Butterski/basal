@@ -8,8 +8,9 @@ GGUF instead (a stock conversion, a llama-quantize output, an older basal GGUF);
 tokenizer.json and CALIBRATION.json, downloaded without the weights:
 
 - tokenizer.ggml.scores: minus the rank of the first BPE merge that creates each token (the first merge scores 0), so
-  llama.cpp's greedy highest-score-first merging follows the BPE merge order; the added tokens of tokenizer.json keep
-  their score, every other token (single characters, byte tokens) scores 0;
+  llama.cpp's greedy highest-score-first merging follows the BPE merge order; the added tokens of tokenizer.json score
+  -1000 (the converter's value, also in a file fixed by an earlier version of this tool), every other token (single
+  characters, byte tokens) scores 0;
 - tokenizer.ggml.add_space_prefix = false: the Hugging Face tokenizer adds no word-boundary marker after special
   tokens such as <|im_start|>;
 - tokenizer.ggml.token_type: every added token of tokenizer.json is CONTROL (special) or USER_DEFINED, as the Hugging
@@ -35,19 +36,21 @@ import tempfile
 from pathlib import Path
 
 DECISION_TYPES = ("choice", "noul", "score")
+ADDED_TOKEN_SCORE = -1000.0  # llama.cpp's converter scores the added tokens so; the -GGUF files keep it
 
 
-def merge_rank_scores(tokenizer_json, tokens, scores):
-    """Token scores as in the -GGUF files: -(rank of the first BPE merge producing the token); the added tokens of
-    tokenizer.json keep their score; 0 for the rest (single characters, byte tokens: llama.cpp only compares the scores
-    of merge results, and basal's vocabulary has no other multi-character token). Returns (scores, tokens ranked)."""
+def merge_rank_scores(tokenizer_json, tokens):
+    """Token scores as in the -GGUF files: -(rank of the first BPE merge producing the token); -1000 for the added tokens
+    of tokenizer.json, whatever the input file had; 0 for the rest (single characters, byte tokens: llama.cpp only
+    compares the scores of merge results, and basal's vocabulary has no other multi-character token). Returns (scores,
+    tokens ranked)."""
     rank = {}
     for i, m in enumerate(tokenizer_json["model"]["merges"]):
         a, b = m if isinstance(m, list) else m.split(" ", 1)
         rank.setdefault(a + b, i)
     added = {t["id"] for t in tokenizer_json.get("added_tokens", [])}
-    return ([float(s) if i in added else -float(rank[t]) if t in rank else 0.0
-             for i, (t, s) in enumerate(zip(tokens, scores))], sum(t in rank for t in tokens))
+    return ([ADDED_TOKEN_SCORE if i in added else -float(rank[t]) if t in rank else 0.0 for i, t in enumerate(tokens)],
+            sum(t in rank for t in tokens))
 
 
 def added_token_types(tokenizer_json, token_types):
@@ -80,7 +83,7 @@ def fix_gguf(raw, outfile, model_dir, ollama_decision=False):
     tokenizer_json = json.loads((model_dir / "tokenizer.json").read_text())
     if any(i >= len(tokens) or tokens[i] != t for t, i in tokenizer_json["model"]["vocab"].items()):
         raise ValueError(f"the vocabulary of {raw} differs from {model_dir / 'tokenizer.json'}")
-    scores, ranked = merge_rank_scores(tokenizer_json, tokens, reader.fields[gguf.Keys.Tokenizer.SCORES].contents())
+    scores, ranked = merge_rank_scores(tokenizer_json, tokens)
     token_types = added_token_types(tokenizer_json, reader.fields[gguf.Keys.Tokenizer.TOKEN_TYPE].contents())
     arch = reader.fields[gguf.Keys.General.ARCHITECTURE].contents()
     types = {"string": gguf.GGUFValueType.STRING, "float32": gguf.GGUFValueType.FLOAT32}

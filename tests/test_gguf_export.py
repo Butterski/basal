@@ -16,12 +16,13 @@ TOKENIZER = {"model": {"merges": [["▁", "a"], ["b", "c"], ["▁a", "bc"], ["b"
              "added_tokens": [{"id": 0, "content": "<s>", "special": True}]}
 
 
-def write_model(d, tokenizer=TOKENIZER):
+def write_model(d, tokenizer=TOKENIZER, scores=(-1000.0,) * 5):
     """A tiny stock conversion (one score for every token, no special types) and its model folder."""
+    d.mkdir(parents=True, exist_ok=True)
     w = gguf.GGUFWriter(str(d / "raw.gguf"), arch="llama")
     w.add_tokenizer_model("llama")
     w.add_token_list(TOKENS)
-    w.add_token_scores([-1000.0] * 5)
+    w.add_token_scores(list(scores))
     w.add_token_types([1] * 5)  # converter output when tokenizer_config.json lists no special tokens
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
     (d / "tokenizer.json").write_text(json.dumps(tokenizer))
@@ -35,10 +36,20 @@ def tokenizer_fields(path):
 
 
 def test_merge_rank_scores_follow_merge_order():
-    scores, ranked = merge_rank_scores(TOKENIZER, TOKENS, [-1000.0] * 5)
-    assert (scores, ranked) == ([-1000.0, 0.0, 0.0, -1.0, -2.0], 3)  # added token keeps its score, unranked "a": 0
+    scores, ranked = merge_rank_scores(TOKENIZER, TOKENS)
+    assert (scores, ranked) == ([-1000.0, 0.0, 0.0, -1.0, -2.0], 3)  # added token: the converter's -1000, "a": 0
     assert math.copysign(1, scores[2]) == -1 and math.copysign(1, scores[1]) == 1  # -0.0 / 0.0 as in the -GGUF files
-    assert merge_rank_scores({"model": {"merges": ["▁ a", "b c"]}}, ["bc", "▁a"], [0, 0]) == ([-1.0, 0.0], 2)  # "a b"
+    assert merge_rank_scores({"model": {"merges": ["▁ a", "b c"]}}, ["bc", "▁a"]) == ([-1.0, 0.0], 2)  # "a b" merges
+
+
+def test_added_tokens_score_as_in_a_fresh_conversion_whatever_the_input(tmp_path):
+    """An earlier basal-export-gguf scored every unranked token, the added ones included, -(1 + number of merges) (the
+    published basal-1.0 Ollama files); fixing such a file gives the bytes of a fixed stock conversion."""
+    old = write_model(tmp_path / "old", scores=[-5.0, -5.0, -0.0, -1.0, -2.0])
+    fix_gguf(old, tmp_path / "from-old.gguf", tmp_path / "old")
+    fix_gguf(write_model(tmp_path / "stock"), tmp_path / "from-stock.gguf", tmp_path / "stock")
+    assert gguf.GGUFReader(tmp_path / "from-old.gguf").fields["tokenizer.ggml.scores"].contents()[0] == -1000.0
+    assert (tmp_path / "from-old.gguf").read_bytes() == (tmp_path / "from-stock.gguf").read_bytes()
 
 
 def test_decision_metadata_from_calibration():
