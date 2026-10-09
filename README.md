@@ -474,7 +474,8 @@ one after another, so the prompt cache of Ollama / llama.cpp computes the state 
 `OLLAMA_NUM_PARALLEL` / `llama-server -np`) serves concurrent clients. Evidence spans are not available in these modes.
 Details: [docs/PORTS.md](docs/PORTS.md), [docs/GGUF.md](docs/GGUF.md). Other GGUF files with the same tokenizer fix
 (other quantisations, basal-1.0): `basal-export-gguf` ([docs/GGUF.md](docs/GGUF.md#convert-yourself)); Ollama's own
-decision endpoint without `basal-serve` (experimental): [docs/GGUF.md](docs/GGUF.md#ollama-v1systemone-experimental).
+decision endpoint without `basal-serve` (experimental, needs the proposed `basal` encoding):
+[docs/GGUF.md](docs/GGUF.md#ollama-v1systemone-experimental).
 
 ### CPU
 
