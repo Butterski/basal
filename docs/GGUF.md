@@ -167,10 +167,14 @@ curl -s localhost:11434/v1/systemone -d '{"model": "basal-1.5-4.5b-decision", "s
 - `choice`, `noul` and `score` questions only (the prompt contract of basal-1.0, unchanged in 1.5); `multi`, `act` and
   `facts` are not available through Ollama's API: use `basal-serve --mode ollama` for them. Evidence spans need the
   PyTorch engine (`fast`, `eager`).
-- Ollama's request schema has no `option_keys`: described choices are always shown as `key: description`
-  (`basal-serve`'s default), never in the keys-hidden training format.
-- A structured `state` (object or array) is passed as sent, with `, ` / `: ` separators; number spellings and
-  duplicate keys are not normalized as Python's `json.dumps` would.
+- Requests and answers follow Ollama's schema, not `basal-serve`'s. `choice` criteria are taken only as
+  `{key: description}`, `score` levels only as a list and `noul` descriptions only as strings (a list of keys, named
+  levels or `null` criteria return HTTP 400), and there is no `option_keys`: described choices are always shown as
+  `key: description` (`basal-serve`'s default). A structured `state` is passed as sent, with `, ` / `: ` separators
+  (number spellings, duplicate keys and U+2028 / U+2029 escapes differ from Python's `json.dumps`). In the answer,
+  `confidence` is 1 − entropy / ln(number of options), not the probability of the chosen option, and a `noul` answer
+  carries only `noul`: the thresholds of `CALIBRATION.json` apply to the largest probability (for `noul`: the larger
+  of p and 1 − p).
 
 Measured on **basal-1.0** only (1.5B and 4.5B, F16 and Q8_0 files written by `--ollama-decision`; Apple M1 Max, 50
 private triage items in Polish and English, four questions each): with the encoding, Ollama's accuracy is within 0.02 of

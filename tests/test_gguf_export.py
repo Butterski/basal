@@ -97,10 +97,12 @@ def test_fix_gguf_is_idempotent_and_drops_decision_metadata_without_the_flag(tmp
 
 
 def test_fix_gguf_rejects_another_vocabulary(tmp_path):
-    raw = write_model(tmp_path, {**TOKENIZER, "model": {**TOKENIZER["model"], "vocab": {"<s>": 0, "b": 1}}})
-    with pytest.raises(ValueError, match="vocabulary"):
-        fix_gguf(raw, tmp_path / "out.gguf", tmp_path)
-    assert not (tmp_path / "out.gguf").exists()
+    # another token at an id; a token beyond the GGUF's vocabulary
+    for vocab in ({"<s>": 0, "b": 1}, {**TOKENIZER["model"]["vocab"], "x": 5}):
+        raw = write_model(tmp_path, {**TOKENIZER, "model": {**TOKENIZER["model"], "vocab": vocab}})
+        with pytest.raises(ValueError, match="vocabulary"):
+            fix_gguf(raw, tmp_path / "out.gguf", tmp_path)
+        assert not (tmp_path / "out.gguf").exists()
 
 
 def test_cli_repairs_an_existing_gguf_without_the_converter(tmp_path, monkeypatch):
@@ -133,10 +135,11 @@ def test_ollama_decision_prefers_the_ollama_calibration(tmp_path, capsys):
 
 def test_ollama_decision_refuses_the_config_of_another_model(tmp_path):
     raw = write_model(tmp_path)
-    for change, error in (({"num_hidden_layers": 50}, "block_count is 2, but the model's config.json specifies "
+    for change, error in (({"num_hidden_layers": None}, "config.json is missing num_hidden_layers"),
+                          ({"num_hidden_layers": 50}, "block_count is 2, but the model's config.json specifies "
                                                       "num_hidden_layers=50"),
                           ({"hidden_size": 4096}, "embedding_length is 8"), ({"vocab_size": 32000}, "vocabulary is 5")):
-        (tmp_path / "config.json").write_text(json.dumps({**CONFIG, **change}))
+        (tmp_path / "config.json").write_text(json.dumps({k: v for k, v in {**CONFIG, **change}.items() if v}))
         with pytest.raises(ValueError, match=error):
             fix_gguf(raw, tmp_path / "out.gguf", tmp_path, ollama_decision=True)
         assert not (tmp_path / "out.gguf").exists()
@@ -154,7 +157,8 @@ def test_ollama_decision_names_the_calibration_and_the_model(tmp_path, capsys):
             "noul 1.3900, score 1.5400") in capsys.readouterr().out
     (tmp_path / "config.json").write_text(json.dumps(CONFIG))
     main([str(tmp_path), str(tmp_path / "b.gguf"), "--gguf", str(raw), "--ollama-decision"])
-    assert "(basal-tiny), config.json matches the GGUF: choice" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "(basal-tiny), config.json has the GGUF's shape (2 layers, 8 wide, 5 tokens): choice" in out
 
 
 def test_cli_rejects_a_model_without_tokenizer_or_calibration(tmp_path, monkeypatch, capsys):
@@ -198,6 +202,19 @@ def test_cli_refuses_to_write_over_its_input(tmp_path, capsys):
     assert raw.read_bytes() == before
 
 
+def test_cli_rejects_a_missing_input_or_a_directory_as_output_before_any_work(tmp_path, monkeypatch, capsys):
+    raw = write_model(tmp_path)
+    monkeypatch.setattr("basal.gguf_export.subprocess.run", lambda *a, **k: pytest.fail("converter run"))
+    (tmp_path / "outdir").mkdir()
+    missing = str(tmp_path / "missing.gguf")
+    for argv, error in (([str(tmp_path / "out.gguf"), "--gguf", missing], "missing.gguf not found"),
+                        ([str(tmp_path / "outdir"), "--gguf", str(raw)], "is a directory"),
+                        ([str(tmp_path / "outdir"), "--llama-cpp", str(tmp_path)], "is a directory")):
+        with pytest.raises(SystemExit) as e:
+            main([str(tmp_path), *argv])
+        assert e.value.code == 2 and error in capsys.readouterr().err
+
+
 def test_cli_rejects_missing_converter_before_download(tmp_path, capsys):
     for llama_cpp in (["--llama-cpp", str(tmp_path)], []):
         with pytest.raises(SystemExit) as e:
@@ -233,4 +250,18 @@ def test_cli_converts_a_local_model_then_fixes_it(tmp_path, monkeypatch, capsys)
     assert Path(argv[4]).parent.parent == out.parent and sorted(out.parent.iterdir()) == [out]  # temp dir removed
     f = gguf.GGUFReader(out).fields
     assert f["tokenizer.ggml.scores"].contents() == [-1000, 0, 0, -1, -2] and f["llama.decision.type"].contents()
-    assert "config.json matches the GGUF" in capsys.readouterr().out
+    assert "config.json has the GGUF's shape" in capsys.readouterr().out
+
+
+def test_cli_conversion_from_a_repo_downloads_the_whole_model(tmp_path, monkeypatch):
+    raw = write_model(tmp_path / "model")
+    llama = tmp_path / "llama.cpp"
+    llama.mkdir()
+    (llama / "convert_hf_to_gguf.py").write_text(
+        f"import shutil, sys; shutil.copy({str(raw)!r}, sys.argv[sys.argv.index('--outfile') + 1])\n")
+    calls = []
+    monkeypatch.setattr("huggingface_hub.snapshot_download",
+                        lambda r, **kw: calls.append((r, kw)) or str(tmp_path / "model"))
+    main(["Remek/basal-tiny", str(tmp_path / "out.gguf"), "--llama-cpp", str(llama)])
+    # the converter needs the weights: no allow_patterns
+    assert calls == [("Remek/basal-tiny", {"revision": None, "allow_patterns": None})]

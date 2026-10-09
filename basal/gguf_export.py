@@ -18,8 +18,9 @@ tokenizer.json, the calibration and config.json, downloaded without the weights:
   basal-1.0-4.5B's and basal-1.5-max's do not list <|im_start|>, so llama.cpp split it into characters;
 - with --ollama-decision: <arch>.decision.type = "basal" and <arch>.decision.temperature.{choice,noul,score} from
   CALIBRATION.ollama.json when the model ships it, else CALIBRATION.json, as basal-serve --mode ollama chooses (without
-  the flag, such keys of the input are removed). A model directory with config.json must describe the GGUF's model
-  (layers, hidden size, vocabulary); the -GGUF folders have none, so the tool prints whose calibration it wrote.
+  the flag, such keys of the input are removed). A model directory with config.json must have the GGUF's shape
+  (layers, hidden size, vocabulary); basal-1.0 and basal-1.5 models of one size share it and the -GGUF folders have no
+  config.json, so the tool also prints whose calibration it wrote.
   Ollama's /v1/systemone then renders basal's own prompt format, scores both option orders and calibrates. Such a file
   is decision-only in Ollama (/api/generate and /api/chat refuse it) and needs an Ollama with the basal decision
   encoding; other Ollama versions reject it.
@@ -84,8 +85,9 @@ def calibration_file(model_dir):
 
 
 def check_config(reader, arch, n_tokens, raw, model_dir):
-    """A model directory with config.json must describe the GGUF's model (layers, hidden size, vocabulary, as
-    basal-serve --mode gguf checks), or its calibration is another model's; the -GGUF folders have no config.json."""
+    """A model directory with config.json must have the GGUF's shape (layers, hidden size, vocabulary, as basal-serve
+    --mode gguf checks), or its calibration is another model's. The shape does not tell basal-1.0 and basal-1.5 models
+    of one size apart (main() prints the model's name); the -GGUF folders have no config.json."""
     cp = Path(model_dir) / "config.json"
     if not cp.exists():
         return
@@ -93,6 +95,8 @@ def check_config(reader, arch, n_tokens, raw, model_dir):
     for name, key, actual in (("num_hidden_layers", "block_count", f[f"{arch}.block_count"].contents()),
                               ("hidden_size", "embedding_length", f[f"{arch}.embedding_length"].contents()),
                               ("vocab_size", "vocabulary", n_tokens)):
+        if name != "vocab_size" and name not in cfg:
+            raise ValueError(f"{cp} is missing {name}")
         if cfg.get(name, actual) != actual:
             raise ValueError(f"{raw}: {key} is {actual}, but the model's config.json specifies {name}={cfg[name]}; "
                              "its calibration belongs to another model")
@@ -144,6 +148,8 @@ def main(argv=None):
                          "the basal decision encoding)")
     a = ap.parse_args(argv)
     out = Path(a.outfile)
+    if out.is_dir():
+        ap.error(f"{out} is a directory; give the name of the output file")
     if a.gguf:
         if not Path(a.gguf).is_file():
             ap.error(f"{a.gguf} not found")
@@ -186,7 +192,9 @@ def main(argv=None):
     if a.ollama_decision:  # a -GGUF folder has no config.json to check: show whose calibration was written
         info, temps = model_dir / "basal.json", json.loads(cal.read_text())["temperature_per_prim"]
         name = info.exists() and json.loads(info.read_text()).get("name")
-        check = "config.json matches the GGUF" if (model_dir / "config.json").exists() else "no config.json to check"
+        cfg = (model_dir / "config.json").exists() and json.loads((model_dir / "config.json").read_text())
+        check = (f"config.json has the GGUF's shape ({cfg['num_hidden_layers']} layers, {cfg['hidden_size']} wide, "
+                 f"{total} tokens)" if cfg else "no config.json to check")
         print(f"temperatures from {cal.name} of {a.model}{f' ({name})' if name else ''}, {check}: "
               + ", ".join(f"{t} {temps[t]:.4f}" for t in DECISION_TYPES))
 
