@@ -106,3 +106,63 @@ def test_mlx_q8_quantises_decoder_blocks_only(tmp_path):
         assert max(abs(x - y) for x, y in zip(r, g)) < 0.05
     with pytest.raises(ValueError, match="unknown MLX quantisation"):
         mlx_stub(tmp_path, "q4")
+
+
+def test_mlx_reads_255_format2_codes(tmp_path):
+    """Prompt format 2: up to 255 option codes, read from the head's logits at the prefill position (the code ids of the
+    255-option test vector, docs/format2_vectors.jsonl), for a SOAM group of a 255-option question in two orders and a
+    2-option question over the same state, against the PyTorch readout."""
+    pytest.importorskip("mlx.core")
+    import json
+    from pathlib import Path
+    lines = (Path(__file__).parents[1] / "docs/format2_vectors.jsonl").read_text().splitlines()
+    vec = next(v for v in map(json.loads, lines) if v["id"] == "en-choice-255")
+    codes = vec["prompts"][0]["code_ids"]
+    assert len(codes) == 255 and len(set(codes)) == 255
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=32000, hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=4,
+                      num_key_value_heads=2, head_dim=8, max_position_embeddings=1024, attention_bias=True,
+                      mlp_bias=True, tie_word_embeddings=False,
+                      rope_parameters={"rope_type": "default", "rope_theta": 1000000.0})
+    m = LlamaForCausalLM(cfg).eval()
+    with torch.no_grad():
+        for n, p in m.named_parameters():
+            if n.endswith("bias"):
+                p.normal_(0, 0.1)
+        m.lm_head.weight.mul_(20.0)  # spread the code logits, so that a wrong column or order would show
+    m.save_pretrained(tmp_path)
+    be = mlx_stub(tmp_path)
+    state = list(range(100, 400))
+    toks = [state + list(range(500, 760)) + [7], state + list(range(760, 500, -1)) + [7], state + [9, 8, 7]]
+    lids = [codes, codes, codes[:2]]
+    ref = reference(m, toks, lids)
+    got = be.run_shared([(toks, lids)])[0]
+    assert [len(g) for g in got] == [255, 255, 2]
+    for r, g in zip(ref, got):
+        assert max(abs(x - y) for x, y in zip(r, g)) < 2e-4
+        assert abs(sum(g) - 1) < 1e-5
+
+
+def test_mlx_code_logits_in_fp32(tmp_path):
+    """bf16 weights: the code logits are the fp32 product of the hidden state and the head's code rows (as the PyTorch
+    backends since the fp32 readout), not the bf16 head output, whose logits of magnitude 16-32 step by 0.125."""
+    pytest.importorskip("mlx.core")
+    import mlx.core as mx
+    import numpy as np
+    m = tiny_llama(tmp_path)
+    with torch.no_grad():
+        m.lm_head.weight.mul_(40.0)
+    m.to(torch.bfloat16).save_pretrained(tmp_path)
+    be = mlx_stub(tmp_path)
+    assert be.model.lm_head.weight.dtype == mx.bfloat16
+    h = mx.array(np.random.default_rng(0).normal(size=(3, 64)).astype(np.float32)).astype(mx.bfloat16)
+    lids = [[10, 11], [10, 11, 12], [13, 14, 15, 16]]
+    got = be._letters(h, lids)
+    W = np.array(be.model.lm_head.weight.astype(mx.float32))
+    hf = np.array(h.astype(mx.float32))
+    for g, ids, x in zip(got, lids, hf):
+        z = W[ids] @ x
+        ref = np.exp(z - z.max()) / np.exp(z - z.max()).sum()
+        assert max(abs(a - b) for a, b in zip(g, ref)) < 1e-5
+    z16 = np.array(be.model.lm_head(h).astype(mx.float32))
+    assert np.abs(z16[0, [10, 11]] - W[[10, 11]] @ hf[0]).max() > 1e-3  # the bf16 head output is coarser

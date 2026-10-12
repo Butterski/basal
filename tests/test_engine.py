@@ -76,16 +76,22 @@ def test_soam_many_branches_equal_separate():
     toks.append(list(toks[0]))  # a duplicate prompt reads out at the same position
     lids = [[7, 8, 9] if q % 2 else [7, 8] for q in range(5) for o in range(2)] + [[7, 8]]
     ref = separate(m, toks, lids)
-    for lens in ([64], [24]):  # 24 < packed length: the group is bisected into smaller rows
+    for lens in ([64], [24]):  # 24 < packed length: the two passes over the root's KV cache
         be.LENS = lens
         units = be._units([(toks, lids)])
-        assert (len(units) > 1) == (lens == [24])
-        probs = []
-        for pk, ul, k, a in units:
-            probs.append(be._eager_shared(pk, ul))
+        assert len(units) == 1
+        probs = [be._eager_shared(pk, ul) if lens == [64] else be._long(pk, ul) for pk, ul, k, a in units]
         res = GraphBackend._assemble([(toks, lids)], units, probs)[0]
         for r, e in zip(res, ref):
             assert torch.allclose(torch.tensor(r), e, atol=1e-5)
+    # prompts without a common first token have no root to share: a long group is bisected
+    be.LENS = [24]
+    other = [[2] + t[1:] for t in toks[:4]]
+    units = be._units([(toks[:4] + other, lids[:4] * 2)])
+    assert len(units) > 1 and all(pk[4].count(-1) == 1 or len(pk[0]) <= 24 for pk, *_ in units)
+    res = GraphBackend._assemble([(toks[:4] + other, lids[:4] * 2)], units, [be._long(pk, ul) for pk, ul, *_ in units])[0]
+    for r, e in zip(res, separate(m, toks[:4] + other, lids[:4] * 2)):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-5)
 
 
 def test_row_only_readout_equals_full_softmax():

@@ -31,11 +31,26 @@ letters.
 3. **Readout.** The engine reads the hidden state at the answer position of every leaf and projects it onto the
    option-letter rows of the output layer only (the full vocabulary is never computed). Both option orders are mapped
    back to the canonical order, averaged, and calibrated per question type.
-4. **Long requests.** A packed row longer than the largest compiled shape is split into smaller rows, each with the
-   shared prefix again; this is still exact. Many small requests are batched together as usual.
+4. **Two passes.** The fast engine runs the packed row in two passes. Pass 1 computes the root of the tree (the
+   system prompt and the state, whatever all prompts of the request share) with plain causal attention, in the same
+   CUDA graphs as single prompts, and keeps every layer's keys and values. Pass 2 computes everything below the root,
+   all branches of the request as one short row, attending to those keys and values and, through the tree mask, to
+   their own ancestors only. The state is computed once however long it is, and the long part runs with the fast
+   causal attention kernel; only the short branch row needs a mask.
+5. **Batching across requests.** The rows of all requests that wait at the same time are sorted by length and run
+   together, at most 12,288 padded tokens per forward pass, and every request is answered as soon as its passes are
+   read out.
 
-Because every answer depends only on its own prefix, **the answer of a question does not depend on the other
-questions in the request**, their order or their number.
+### Which kernel runs
+
+| unit | pass 1 | pass 2 |
+|---|---|---|
+| a single prompt (one question asked in one order) | plain CUDA graph up to 8,192 tokens (a forward without a graph beyond), causal attention without a mask | – |
+| several branches over one root (option orders, questions, `multi` labels) | the root in the same plain graphs, keys and values kept | the branches, one row per request, over them with the tree mask: a compiled CUDA graph for up to 8 requests of up to 256 branch tokens over roots up to 3,072 tokens, a normal forward otherwise |
+
+A single prompt needs no mask: the padding sits after its last token, so causal attention cannot see it. On an H100 a
+1,792-token forward of the 4.5B model takes 35.8 ms in a plain graph and 44.8 ms with a materialised mask (the masked
+graphs of earlier releases), so pass 1 is where the time goes and pass 2 adds only the branch tokens.
 
 ## Identity guarantee
 
@@ -54,6 +69,25 @@ request, 4.5B model, one H100):
   a second run on the same weights).
 - The basal test suite checks the prefix tree (nested sharing, duplicate prompts, splitting of long rows), the
   row-only readout and the equality of answers with SOAM on and off.
+
+### The paths of this engine
+
+`basal-bench --identity` runs single prompts, both option orders of a question and five-question requests over one
+state, alone and batched across requests, and long states, through the engine, and compares every readout with an
+eager forward of the same prompt (1,200 readouts per path, synthetic states plus development items):
+
+| comparison | agreement of the top answer | max \|Δp\| |
+|---|---|---|
+| fp32, every path (single prompts, batched, both orders, SOAM, long states), basal-1.5 | **1.000** | 6.4 × 10⁻⁵ |
+| fp32, the same, basal-1.5-mini | **1.000** | 3.3 × 10⁻⁵ |
+| bf16, every path against the same prompts computed alone in the engine, basal-1.5 | 0.982–1.000 (decisions 0.995–0.998) | 0.10 |
+| bf16, the same, basal-1.5-mini | 0.983–1.000 (decisions 0.992–0.998) | 0.12 |
+
+In fp32 every path gives the answers of separate prompts. In bf16 the batched single prompts already differ from the
+same prompts run alone by as much as the shared-state paths do: a change of tensor shapes changes the rounding, and
+the disagreements are close calls (the top two options within a few points). The same holds for the `-FP8`
+checkpoints. `--deterministic` removes the dependence on other requests: every request then runs in its own forward
+passes.
 
 ## Measured speed
 
@@ -82,15 +116,17 @@ states, median 336 tokens), p50 / p95:
   so it is not a per-question comparison; the gain of SOAM is for requests with several questions.
 
 **Why not more?** At 12 questions the 24 branches (12 questions × 2 option orders) are most of the packed tokens, and
-they cannot be shared because each one holds its own options. Asking with one option order would halve them, but it
-costs accuracy, so two orders stay the default (`--orders 1` is available). The exact cost of a request is roughly
-one state plus, per question, its text once and its options twice.
+they cannot be shared because each one holds its own options. Asking with one option order halves them: the default
+for prompt-format-2 models, which are trained with random option orders; the basal-1.5 models keep two orders by
+default (`--orders 1` and `--orders auto` are available, see [FORMATS.md](FORMATS.md#option-orders)). The exact cost of
+a request is roughly one state plus, per question, its text once and its options once per order.
 
 ## How to use it
 
-Nothing to change: SOAM is on by default (`--soam on`). The packed row is used by the compiled CUDA modes (`fast`,
-`fast-nocompile`, `fp8`, `nvfp4`, `fast-exit`) with the default two option orders; the `eager` reference path computes
-every prompt separately (same answers, no speed-up). Put all questions about one state into one request:
+Nothing to change: SOAM is on by default (`--soam on`). The two passes are used by the compiled CUDA modes (`fast`,
+`fast-nocompile`, `fp8`, `nvfp4`), `fast-exit`, `mps`, `mlx` and `gguf` share the state their own way, and the `eager`
+reference path computes every prompt separately (same answers, no speed-up). Put all questions about one state into
+one request:
 
 ```bash
 curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{

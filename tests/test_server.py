@@ -36,6 +36,8 @@ class FakeServer(Server):
     def __init__(self, pos_probs, soam=True, cal=None):
         self.name, self.temps, self.tok, self.letters, self.pos_probs = "basal-test", {}, Tok(), {}, pos_probs
         self.orders, self.soam, self.log, self.cal = 2, soam, None, cal or {}
+        self.fmt, self.max_options = 1, 10
+        self.tau, self.band = 0.6, (0.2, 0.8)
         self.entries = 0
         self.backend = type("B", (), {"policies": {}})()
 
@@ -44,7 +46,7 @@ class FakeServer(Server):
 
         async def worker():
             while True:
-                prompts, ids, fut, _ = await self.queue.get()
+                prompts, ids, fut, *_ = await self.queue.get()
                 self.entries += 1
                 fut.set_result([self.probs_for(p, i) for p, i in zip(prompts, ids)])
         w = asyncio.get_running_loop().create_task(worker())
@@ -125,6 +127,13 @@ def test_gguf_mode_needs_a_file_before_model_loading(monkeypatch):
         server_module.main()
 
 
+def test_missing_calibration_file_fails_before_model_loading(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["basal-serve", "--mode", "eager", "--calibration", str(tmp_path / "typo.json")])
+    monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
+    with pytest.raises(SystemExit, match="no such file"):
+        server_module.main()
+
+
 def test_named_options_show_keys_by_default():
     assert named_options({"returns": "Returns", "it": "IT"}) == (["returns", "it"], ["returns: Returns", "it: IT"])
     assert named_options({"x": None, "y": "why"})[1] == ["x", "y: why"]
@@ -145,6 +154,37 @@ def test_structured_choices_give_distinct_prompts():
     assert len(set(q["options"])) == 2 and q["options"][1].startswith("reject")
 
 
+def test_force_lang_reaches_yes_no_words_and_branches():
+    """The request's "lang" sets the yes/no words and multi branch text too, not only the template (a state that is
+    only media, a Polish question without diacritics)."""
+    qs = {"cat": {"type": "noul", "instructions": "Czy to kot?"},
+          "tags": {"type": "multi", "instructions": "Co widać?", "criteria": {"k": "kot", "p": "pies"}}}
+    noul, multi = to_items("", qs, force_lang="pl")
+    assert noul["lang"] == multi["lang"] == "pl"
+    assert noul["options"] == ["Tak", "Nie"] and noul["branches"] == [("Czy to kot?", ["Tak", "Nie"])]
+    assert multi["branches"] == [("Co widać?\nCzy dotyczy: „kot”?", ["Tak", "Nie"]),
+                                 ("Co widać?\nCzy dotyczy: „pies”?", ["Tak", "Nie"])]
+
+
+def test_without_force_lang_the_language_is_detected():
+    noul = to_items("", {"cat": {"type": "noul", "instructions": "Czy to kot?"}})[0]   # no diacritics: English
+    assert noul["lang"] == "en" and noul["branches"] == [("Czy to kot?", ["Yes", "No"])]
+    multi = to_items("", {"t": {"type": "multi", "instructions": "Co widać?", "criteria": {"k": "kot"}}})[0]
+    assert multi["lang"] == "pl" and multi["branches"] == [("Co widać?\nCzy dotyczy: „kot”?", ["Tak", "Nie"])]
+    qs = {"cat": {"type": "noul", "instructions": "Is it a cat?"}}
+    assert to_items("Kot śpi.", qs) == to_items("Kot śpi.", qs, force_lang=None)
+
+
+def test_request_lang_reaches_the_prompt():
+    seen = []
+    srv = FakeServer(lambda p, ids: seen.append("".join(map(chr, p))) or [0.5] * len(ids))  # Tok: one id per char
+    body = {"state": "", "lang": "pl", "questions": {"cat": {"type": "noul", "instructions": "Czy to kot?"}}}
+    asyncio.run(srv._run(body))
+    assert seen and all("Tak" in p and "Nie" in p and "Yes" not in p for p in seen)
+    with pytest.raises(ValueError, match="lang must be"):
+        asyncio.run(srv._run(dict(body, lang="de")))
+
+
 @pytest.mark.parametrize("q", [
     {"type": "choice", "instructions": "Dept?", "criteria": {"returns": "Returns", "it": "IT"}},
     {"type": "noul", "instructions": "Damaged?"},
@@ -159,6 +199,9 @@ def test_response_conforms_to_official_schema(q):
 
 def test_model_list_conforms_to_official_schema():
     jsonschema.validate(models_payload("basal-1.5-4.5B", "fast", {"0.99": None}), schema("ModelMetadataList"))
+    m = models_payload("basal-1.5-4.5B", "mlx", {}, {"noul": 1.56})["models"][0]   # basal-calibrate checks it
+    assert m["temperature_per_prim"] == {"noul": 1.56}
+    assert models_payload("basal-1.5-4.5B", "mlx", {})["models"][0]["temperature_per_prim"] == {}
 
 
 def swapped_prompts_differ(crit_a, crit_b, t="choice"):
@@ -203,6 +246,42 @@ def test_act_minimum_expected_cost_and_defer():
                      cal={"temperature_per_prim": {"noul": 1.0}, "thresholds": {"0.01": {"confidence": 0.999}}})
     ans = asyncio.run(srv._run({"state": "Zamówienie", "questions": {"r": dict(q, max_error=0.01)}}))["answers"]["r"]
     assert ans["refused"] == "approve" and ans["action"] == "human" and ans["calibration"] == "validated"
+
+
+def test_act_defers_when_no_threshold_is_certified():
+    """max_error without a certified threshold for its type and target (no calibration, a null threshold, another
+    target, a per-type file without the type) never acts automatically: the defer action is returned, the automatic
+    one is named in `refused`, and `deferred` is true."""
+    q = {"type": "act", "instructions": "Czy zwrot przysługuje?", "criteria": {"true": "Przysługuje", "false": "Nie"},
+         "costs": {"approve": {"true": 0, "false": 1240}, "reject": {"true": 300, "false": 0},
+                   "human": {"true": 15, "false": 15}}}
+    probs = lambda p, ids: [0.995, 0.005] if "A. Przysługuje" in "".join(map(chr, p)) else [0.005, 0.995]
+    cal = {"temperature_per_prim": {"noul": 1.0},
+           "thresholds": {"0.01": {"confidence": 0.99}, "0.05": {"confidence": None}}}
+
+    def ask(cal, **kw):
+        body = {"state": "Zamówienie", "questions": {"r": dict(q, **kw)}}
+        return asyncio.run(FakeServer(probs, cal=cal)._run(body))["answers"]["r"]
+    ans = ask(cal, max_error=0.01)                                   # P = 0.995 >= 0.99: automatic, as before
+    assert ans["action"] == "approve" and ans["deferred"] is False
+    assert ask({})["action"] == "approve"                            # without max_error nothing changes
+    for c, target in (({}, 0.01), (cal, 0.05), (cal, 0.02)):
+        ans = ask(c, max_error=target)
+        assert ans["action"] == "human" and ans["refused"] == "approve" and ans["deferred"] is True
+        assert ans["max_error"] == "no certified threshold for this type at this max_error"
+    cheap_human = dict(q["costs"], human={"true": 1, "false": 1})    # deferring is already the cheapest action
+    ans = ask({}, max_error=0.01, costs=cheap_human)
+    assert ans["action"] == "human" and "refused" not in ans and ans["max_error"].startswith("no certified")
+    assert ans["deferred"] is True
+    # per-type thresholds: the yes/no act uses the noul one only; without it, it defers whatever the pooled one says
+    per = {"temperature_per_prim": {"noul": 1.0},
+           "thresholds": {"0.01": {"confidence": 0.5, "per_type": {"choice": {"confidence": 0.5}}}}}
+    ans = ask(per, max_error=0.01)
+    assert ans["action"] == "human" and ans["refused"] == "approve" and ans["deferred"] is True
+    per["thresholds"]["0.01"]["per_type"]["noul"] = {"confidence": 0.99}
+    assert ask(per, max_error=0.01)["action"] == "approve"
+    with pytest.raises(ValueError, match="defer action"):
+        ask({}, max_error=0.01, costs={"approve": {"true": 0, "false": 9}, "reject": {"true": 9, "false": 0}})
 
 
 def test_act_short_form():

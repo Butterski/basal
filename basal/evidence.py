@@ -59,10 +59,10 @@ def best_spans(ls, le, rel, state, top=3):
 class Evidence:
     """Loads `evidence_head.pt` from the model directory (absent: evidence requests are refused)."""
 
-    def __init__(self, model_dir, model, tok):
+    def __init__(self, model_dir, model, tok, fmt=1):
         p = Path(model_dir) / "evidence_head.pt"
         self.available = p.exists()
-        self.model, self.tok, self.lock = model, tok, threading.Lock()
+        self.model, self.tok, self.fmt, self.lock = model, tok, fmt, threading.Lock()
         if self.available:
             dev = next(model.parameters()).device
             ck = torch.load(p, map_location=dev)
@@ -73,7 +73,7 @@ class Evidence:
     def spans(self, state, question, options, lang, limit=None, top=3):
         """Top non-overlapping spans of `state` (character offsets); spans starting at or after `limit` (e.g. in the
         appended facts block) are dropped."""
-        prompt = render(self.tok, state, question, options, lang)
+        prompt = render(self.tok, state, question, options, lang, self.fmt)
         s0 = prompt.index("\n" + state) + 1
         s1 = s0 + len(state)
         enc = self.tok(prompt, add_special_tokens=False, return_offsets_mapping=True)

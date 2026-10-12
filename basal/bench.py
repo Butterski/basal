@@ -2,6 +2,7 @@
 
   basal-bench --model Remek/basal-1.5-4.5B --modes eager-fp32 fast fp8              # bundled examples
   basal-bench --model Remek/basal-1.5-4.5B --modes eager-fp32 fast --questions my_items.jsonl
+  basal-bench --identity --model Remek/basal-1.5-4.5B       # identity gate of the fast path (basal/identity.py)
 
 Questions file (JSONL): {"state": ..., "question": ..., "options": [...], "gold": <index, optional>}.
 Measured per mode (same definitions as in the technical report):
@@ -24,14 +25,14 @@ import torch
 
 from .engine import (EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
                      MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve)
-from .prompt import letter_ids, render
+from .prompt import letter_ids, max_options, model_format, render
 from .server import MODES, default_mode
 
 GGUF_KINDS = ("gguf", "ollama", "llamacpp")  # the engine serves GGUF weights: --model gives tokenizer and calibration
 
 
 def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="http://127.0.0.1:11434",
-          llamacpp_url="http://127.0.0.1:8080"):
+          llamacpp_url="http://127.0.0.1:8080", fmt=1):
     if mode == "eager-fp32":
         return EagerBackend(md, "float32")
     if mode.startswith("fast-exit@"):
@@ -45,7 +46,7 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
     if kind == "eager":
         return EagerBackend(md, "bfloat16")
     if kind == "vllm":
-        return VLLMBackend(vllm_model or md)
+        return VLLMBackend(vllm_model or md, max_options=max_options(fmt))
     if kind == "sglang":
         return SGLangBackend(md)
     if kind == "mlx":
@@ -135,13 +136,13 @@ def load_questions(paths, n, seed=0):
     return qs[:n]
 
 
-def groups_for(tok, qs):
+def groups_for(tok, qs, fmt=1):
     out = []
     for q in qs:
         k = len(q["options"])
         perms = [list(range(k)), list(range(k))[::-1]]
-        prompts = [render(tok, q["state"], q["question"], [q["options"][c] for c in p]) for p in perms]
-        ids = letter_ids(tok, prompts[0], k)
+        prompts = [render(tok, q["state"], q["question"], [q["options"][c] for c in p], fmt=fmt) for p in perms]
+        ids = letter_ids(tok, prompts[0], k, fmt)
         if ids:
             out.append((q, perms, prompts, [ids, ids]))
     return out
@@ -197,6 +198,11 @@ def measure(be, groups, lat_n):
 
 
 def main():
+    import sys
+    if "--identity" in sys.argv[1:]:  # the identity gate of the fast path (basal/identity.py)
+        from .identity import main as identity
+        rows = identity([x for x in sys.argv[1:] if x != "--identity"])
+        return 0 if all(r["gate"] == "pass" for r in rows) else 1  # the exit status of basal-bench --identity
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="Remek/basal-1.5-4.5B")
     ap.add_argument("--vllm-model", dest="vllm_model", default=None, help="checkpoint for --modes vllm (e.g. the NVFP4 repo)")
@@ -219,13 +225,14 @@ def main():
     md = resolve(a.model, metadata_only=all(MODES.get(m.split("@")[0], ("",))[0] in GGUF_KINDS for m in a.modes))
     vm = resolve(a.vllm_model) if a.vllm_model else None
     qs = load_questions(a.questions, a.n)
+    fmt = model_format(md)
     ref, rows = None, []
     for mode in a.modes:
         reset_memory()
         t0 = time.time()
-        be = build(mode, md, vm, a.gguf, a.ollama_model, a.ollama_url, a.llamacpp_url)
+        be = build(mode, md, vm, a.gguf, a.ollama_model, a.ollama_url, a.llamacpp_url, fmt)
         load_s = time.time() - t0
-        groups = groups_for(be.tok, qs)
+        groups = groups_for(be.tok, qs, fmt)
         dec, r = measure(be, groups, min(a.lat_n, len(groups) - 5))
         top = [max(range(len(d)), key=d.__getitem__) for d in dec]
         r = dict(mode=mode, reference_mode=a.modes[0], gpu=device_name(), n=len(groups), load_s=round(load_s, 1),
