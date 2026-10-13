@@ -1,0 +1,77 @@
+# Results against basal-1.5
+
+Measured once on the frozen release weights and published as measured, including where basal-2.0 is not better. Each
+basal-2.0 model is compared with the basal-1.5 model of the same size. Full tables per model, with intervals and notes,
+are on the model cards.
+
+## Werdykt: hidden Polish–English decision benchmark
+
+[Werdykt](https://basal.si5.pl/benchmark/) has 10 categories in Polish and English (5,000 decisions), one call per
+item and one protocol for every model; its items are not published. Macro accuracy over the 20 cells:
+
+| | basal-1.5-mini | **basal-2.0-mini** | basal-1.5 (4.5B) | **basal-2.0 (4.5B)** | basal-1.5-max | **basal-2.0-max** |
+|---|---|---|---|---|---|---|
+| macro [95% CI] | 0.607 [0.594, 0.619] | **0.618** [0.605, 0.631] | 0.721 [0.710, 0.733] | **0.729** [0.717, 0.739] | 0.773 [0.762, 0.783] | **0.784** [0.774, 0.795] |
+| 2.0 − 1.5 | | +1.2 pt | | +0.7 pt | | +1.1 pt |
+| PL / EN | 0.619 / 0.594 | 0.628 / 0.609 | 0.724 / 0.718 | 0.729 / 0.728 | 0.777 / 0.769 | 0.787 / 0.781 |
+| calibration error (ECE, lower is better) | 0.086 | **0.035** | 0.068 | **0.060** | 0.074 | **0.044** |
+| automated at 5% target error | 21.9% (4.33% err.) | 25.4% (5.12%) | 50.1% (5.04%) | 51.3% (5.08%) | 65.6% (4.99%) | 65.6% (4.51%) |
+| automated at 1% target error | 11.9% (1.66% err.) | 15.2% (1.82%) | 22.5% (1.23%) | 11.9% (0.66%) | 42.5% (0.93%) | 35.3% (1.34%) |
+| decisions/s at 16 clients, bf16, one H100 | 20.5 | **106.4** (×5.2) | 23.0 (SGLang) | **32.2** (×1.4) | 10.2 (SGLang) | **16.2** (×1.6) |
+| latency at one client (p50) | 14 ms | 16 ms | 34 ms (SGLang) | 25 ms | 67 ms (SGLang) | 37 ms |
+
+basal-1.5 rows are the public board's rows: basal-1.5 (4.5B) and basal-1.5-max served on SGLang (their fastest
+configuration), basal-1.5-mini in basal-serve's default mode; basal-2.0 is served by basal-serve v2.0.0 in its default
+mode. With both in basal-serve's default mode the 4.5B and max speed-ups are ×4.0 and ×3.5. Each release uses its own
+calibration file; accuracy with `--deterministic`. *Automated at X% target error*: a confidence threshold chosen on one
+half of the items for that error, applied to the other half (share automated, observed error in brackets). At the 1%
+target basal-2.0 (4.5B) and max automate fewer decisions than basal-1.5.
+
+**Where basal-2.0 stands.** On the public board hosted API models and larger open decision systems score above
+basal-2.0; the [board](https://basal.si5.pl/benchmark/) lists every tested system with its accuracy, latency and cost.
+
+## Other benchmarks
+
+Both models served by engine v2.0.0 on the same items; differences in points, paired, with 95% bootstrap intervals on
+the model cards (* = the interval excludes 0).
+
+| benchmark | mini: 1.5 → 2.0 | 4.5B: 1.5 → 2.0 | max: 1.5 → 2.0 |
+|---|---|---|---|
+| Decision Index (JDI 0.2.1) | 16.41 → 26.69 | 27.65 → 39.86 | – → 44.07 (no 1.5 index) |
+| JDI requests left unanswered | 17.2% → 0.02% | 17.2% → 0.00% | – → 0.00% |
+| LEK, Polish medical licensing exam, PL / EN (% correct) | 47.7 / 48.4 → 47.7 / 49.2 | 60.5 / 59.7 → 62.0 / 63.0 | 70.0 / 67.6 → 75.6 / 74.1 |
+| PL-Holdout (4,000 items) | −0.8 | +0.6 | −0.6 |
+| Polish decisions (7,081 items) | −1.4* | +0.1 | −0.2 |
+| PL-Real-300, doc-clean subset (158 items) | 0.0 | 0.0 | +1.3 |
+| PL-Real-300, all 300 items | −2.0 | −2.0 | 0.0 |
+| English panel (10 public tasks, mean accuracy) | −2.1* | −3.6* | −1.8* |
+| Polish general (3,079 items; development) | +2.2* | +1.6* | +1.4* |
+| English corpus test (1,479 items; development) | +1.1 | +0.1 | +1.2 |
+
+basal-1.5 answers questions with at most 10 options, so it leaves 17.2% of JDI requests unanswered. Polish general and
+the English corpus test were used to choose between training runs, so their numbers are development numbers; the other
+benchmarks were not used to select basal-2.0. LEK questions: NASK-PIB Reassess, 2008–2026 sessions (CC BY-NC-SA 4.0),
+shown for the basal models only. The PL-Real primary figure is the subset whose source documents no basal training row
+came from.
+
+## Speed
+
+One decision = one question, one option order; bf16 unless noted.
+
+| | mini | 4.5B | max |
+|---|---|---|---|
+| bf16, one H100, Werdykt speed pass: decisions/s at 16 clients; p50 at one client | 106.4; 16 ms | 32.2; 25 ms | 16.2; 37 ms |
+| `-FP8`, one H100, port check: decisions/s at 16 clients; p50 at one client | 103.5; 14 ms | 38.6; 29 ms | 19.9; 50 ms |
+| `-MLX-8bit`, Apple M4 Pro 24 GB: one question / five questions over one state (p50) | 93 ms / 223 ms | 278 ms / 698 ms | 622 ms / 1,506 ms |
+
+The bf16 and FP8 rows come from different workloads (the Werdykt items and the port check's development items), so
+compare within a row, not across them.
+
+Engine v2.0.0 items, each left out in turn (one H100, bf16): compact batching +19% decisions/s at 16 clients, +17% at
+32, +8% at one client; the prompt-template cache +20% at 8 clients (mini and max; off for the 4.5B model, see the quick
+start). In a mixed load at 32 clients the scheduler answers short requests in 0.81 s instead of 1.38 s (p50) while long
+requests take about 7% longer (1.96 s instead of 1.83 s); `--scheduler off` serves in arrival order.
+
+basal-1.5 also shipped FP8 checkpoints served by vLLM, which on long, repeated documents under mixed traffic were much
+faster than basal-1.5 in bf16 (model cards, "basal-1.5's other configuration"). basal-2.0 was not measured on that
+workload: for such traffic, measure both on your own load before you switch.

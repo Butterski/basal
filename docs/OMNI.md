@@ -15,7 +15,7 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 - **Option orders:** like every prompt-format-2 model, it asks one option order by default and loads
   `CALIBRATION.json`. `--orders 2` averages both orders and loads `CALIBRATION.o2.json`.
 - **Memory:** about 16 GB of GPU memory for mini and 24 GB for max (bf16); long states need more for attention.
-- **API:** the requests and responses are the same as for every basal model ([README](../README.md#api)).
+- **API:** the requests and responses are the same as for every basal model ([API.md](API.md)).
 
 ## What the engine does differently for Gemma 4
 
