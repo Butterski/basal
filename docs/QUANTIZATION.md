@@ -38,7 +38,7 @@ The same table as in the README: which engine serves which format, and what is v
 | **Ollama** | `ollama` | CPU, Apple Silicon, consumer GPUs | local and desktop use with Ollama (`-GGUF`) | 1. `hf download Remek/basal-1.5-4.5B-GGUF --local-dir basal-1.5-4.5B-GGUF` 2. in that folder: `ollama create basal-1.5-4.5b:q8_0 -f Modelfile.Q8_0` 3. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode ollama --ollama-model basal-1.5-4.5b:q8_0` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 518 / 542 ms per question |
 | **llama.cpp** | `llamacpp`; `gguf` | CPU, Apple Silicon, consumer GPUs | `llama-server` with the `-GGUF` files; the engine's token ids are sent as is. `--mode gguf --gguf <file>` runs the file in process instead (extra `basal[gguf]`, [GGUF.md](GGUF.md)) | 1. `llama-server -m basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf -c 4096 --port 8080` 2. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode llamacpp` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 427 / 446 ms per question |
 
-**`basal-serve` is the decision layer in every row.** vLLM, SGLang, MLX, Ollama and llama.cpp run the weights; the typed answers (a calibrated probability for each of your options, both option orders, the state shared by several questions, `multi`, `act` and `facts`) come from `basal-serve --mode <engine>` in front of them, with the same HTTP API in every mode. A plain `ollama run` or `llama-cli` gives free text only. Evidence spans need the PyTorch engine (`fast`, `eager`); vLLM and SGLang start with a 4,096-token context (longer states are refused); raise it with `--max-len` (e.g. 32768 for long documents). Install and first request for each engine: [quick start](../README.md#quick-start).
+**`basal-serve` is the decision layer in every row.** vLLM, SGLang, MLX, Ollama and llama.cpp run the weights; the typed answers (a calibrated probability for each of your options, both option orders, the state shared by several questions, `multi`, `act` and `facts`) come from `basal-serve --mode <engine>` in front of them, with the same HTTP API in every mode. A plain `ollama run` or `llama-cli` gives free text only. Evidence spans need the PyTorch engine (`fast`, `eager`); vLLM and SGLang start with a 4,096-token context (longer states are refused); raise it with `--max-len` (e.g. 32768 for long documents). Install and first request for each engine: [install and run](INSTALL.md).
 <!-- /engines -->
 
 ## Ports: agreement and speed
@@ -74,7 +74,7 @@ agreement = same top option as the reference; latency = median per decision (bot
 server path, with 1 and 5 questions per state.
 
 Accuracy here is on a 500-decision sample, to check that each port matches its reference; to compare model sizes, see
-the benchmark table ([README](../README.md#other-results)).
+the basal-1.5 benchmark table ([v1.5.0 README](https://github.com/rkinas/basal/tree/v1.5.0#other-results)).
 
 4-bit ports trade accuracy for memory: on basal-1.5 the 4-bit MLX port costs about 1.4 points (4.5B), 2.0 points (max, against its GGUF Q8_0) and 3.6 points (mini); the 8-bit ports and GGUF Q8_0 stay within noise. Use 8-bit when accuracy matters.
 
@@ -100,7 +100,7 @@ still the best MLX 4-bit format on mini.) Mini's `-MLX-fp4` ships its own temper
 thresholds are copied from bf16 and not certified for that port.
 
 ```bash
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"
 basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -163,6 +163,31 @@ NVFP4 on the 4.5B model, with −3 accuracy points; about 7 points on the 1.5B).
 on workstation, consumer and desktop GPUs, and 4-bit formats where memory or throughput matters more than the last
 points of accuracy.
 
+## Prompt-format-2 models: the FP8 export
+
+The `-FP8` checkpoints of the prompt-format-2 models are made with the same
+[NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) post-training quantisation (`FP8_DEFAULT_CFG`,
+calibrated on 2,048 prompts of the model's calibration decisions, nvidia-modelopt 0.47.0), with more of the model
+kept in bf16:
+
+- the token embeddings and the output head (the decision is read from its logits);
+- **the first two and the last two decoder layers** (layers 0, 1, 30, 31 of the 1.5B model; 0, 1, 58, 59 of the 4.5B;
+  0, 1, 48, 49 of the 11B). Of the exports compared on the 4.5B model, this one had the best accuracy and calibration
+  at 40 decisions/s or more: a fully quantised decoder agrees with bf16 as often (0.950) and is 4% faster, but loses
+  0.2 points more accuracy; keeping every `down_proj` in bf16 as well agrees more often (0.957) but costs 13% of the
+  speed.
+
+The basal engine serves them natively in the `fast` mode (`FP8Linear` on `torch._scaled_mm`), with the projections
+**unmerged** (`--merge auto` keeps FP8 checkpoints unmerged): re-quantising a merged weight per tensor moves decisions
+as much as the quantisation itself.
+
+How an export is accepted: on development decisions with 2–10 options, the items basal-1.5's own `-FP8` checkpoint
+answers too, its decisions must agree with the bf16 model's at least as often as basal-1.5's FP8 does with its bf16
+(within 0.5 points), both overall and where the bf16 model's top two options differ by at least 0.2; accuracy within
+1 point and ECE within 0.01 of the bf16 model. Agreement on questions with 11–255 options, which basal-1.5 cannot
+answer, is reported separately. The 4.5B export: agreement 0.950 overall and 0.991 at a margin of at least 0.2
+(basal-1.5 FP8: 0.947 / 0.991), accuracy −0.2 points, ECE 0.054 against 0.061; on 11–255 options agreement 0.90.
+
 ## basal-1.5: the ModelOpt checkpoints
 
 `Remek/basal-1.5-4.5B-FP8` / `-NVFP4`, `Remek/basal-1.5-max-FP8` / `-NVFP4` and `Remek/basal-1.5-mini-FP8` were produced with [NVIDIA Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) post-training quantisation
@@ -172,7 +197,7 @@ NVFP4 needs Blackwell (B200, B300, RTX 50xx, RTX PRO 6000, DGX Spark). basal-1.5
 costs basal-1.5-mini about 6 accuracy points with almost no speed gain over FP8; use `-FP8`. Run them with vLLM in a separate environment:
 
 ```bash
-uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"
+uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"
 basal-serve --model Remek/basal-1.5-4.5B-FP8 --mode vllm --port 8000
 ```
 
@@ -199,7 +224,7 @@ The `Remek/basal-1.0-4.5B-FP8` / `-NVFP4` and `Remek/basal-1.0-1.5B-FP8` / `-NVF
 ModelOpt Hugging Face exports and load in vLLM (tested):
 
 ```bash
-uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"   # separate environment: vLLM brings its own torch
+uv pip install "basal[vllm] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"   # separate environment: vLLM brings its own torch
 basal-serve --model Remek/basal-1.0-4.5B-NVFP4 --mode vllm --port 8000
 ```
 
@@ -210,7 +235,7 @@ the bf16 basal-1.5 weights (`--model Remek/basal-1.5-4.5B --mode vllm`), and `--
 H100, offline (`basal-bench`, 1,000 development decisions, both option orders), vLLM agrees with the engine's fp32 reference on 0.994 of decisions (accuracy 0.928 vs 0.930, 147 decisions/s) and SGLang on 0.995 (accuracy 0.925 vs 0.930, 104.6 decisions/s, 14.1 ms p50 for one question); on Werdykt, SGLang gives the same answer as the basal engine on 98.3% of items (97.0% for states over 8k tokens). Neither ships its own
 calibration file for 1.5; both use `CALIBRATION.json`.
 
-SGLang runs in its own environment. Install `sglang[srt]==0.5.21` (its kernels need a CUDA 12.9+ toolkit), then
-`uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"` and, if missing, `uv pip install starlette uvicorn httpx accelerate
+SGLang runs in its own environment. Install it with `uv pip install --prerelease=allow "sglang[srt]==0.5.21"` (its kernels need a CUDA 12.9+ toolkit), then
+`uv pip install --no-deps "basal @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"` and, if missing, `uv pip install starlette uvicorn httpx accelerate
 safetensors`. This is the setup the SGLang numbers were measured with; the basal engine's own modes (`fast`, `eager`)
 and vLLM use the default install.

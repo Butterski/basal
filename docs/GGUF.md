@@ -41,7 +41,7 @@ matches the GGUF file. In this mode `--model` is downloaded without its weights.
 # llama-cpp-python builds with Metal on macOS arm64; on Linux the default build runs on the CPU. For CUDA, build it
 # first, without uv's cache (a cached CPU build would be reused silently; checked on an RTX 4090: --mode gguf on the GPU):
 #   CMAKE_ARGS="-DGGML_CUDA=on" uv pip install --no-cache llama-cpp-python --no-binary llama-cpp-python
-uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/v1.5.0.tar.gz"
+uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"
 basal-bench --model ./basal-1.5-4.5B-GGUF --modes gguf@basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf \
             gguf@basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q4_K_M.gguf
 ```
@@ -89,41 +89,23 @@ Per-item deviations of every variant and of other engines:
 
 ## Convert yourself
 
-`basal-export-gguf` runs llama.cpp's converter and then applies the tokenizer fix of the `-GGUF` repositories
-([PORTS.md](PORTS.md#how-the-ports-are-made)), so llama.cpp and Ollama tokenize basal prompts exactly like the Hugging
-Face tokenizer. The converter lives in llama.cpp and needs transformers 5 to read the basal tokenizer config. Its
-current `requirements-convert_hf_to_gguf.txt` pins transformers 4, so install the needed converter packages directly,
-and basal from a clone with the `gguf-export` extra in the same environment (the tool is not in a release yet; it runs
-the converter with its own Python):
+The converter lives in llama.cpp and needs transformers 5 to read the basal tokenizer config. Its current
+`requirements-convert_hf_to_gguf.txt` pins transformers 4, so install the needed converter packages directly:
 
 ```bash
 git clone --depth 1 https://github.com/ggml-org/llama.cpp ~/llama.cpp
-git clone https://github.com/rkinas/basal ~/basal
-uv venv --python 3.12 ~/gguf-env
+uv venv --python 3.12 --allow-existing ~/gguf-env
 uv pip install --python ~/gguf-env 'numpy~=2.2.6' 'sentencepiece>=0.1.98,<0.3.0' 'protobuf>=4.21,<5' gguf 'transformers==5.17.0' 'torch==2.11.0'
-uv pip install --python ~/gguf-env -e "$HOME/basal[gguf-export]"
 hf download Remek/basal-1.0-4.5B --local-dir basal-1.0-4.5B
-~/gguf-env/bin/basal-export-gguf basal-1.0-4.5B basal-1.0-4.5B-F16.gguf  --outtype f16  --llama-cpp ~/llama.cpp
-~/gguf-env/bin/basal-export-gguf basal-1.0-4.5B basal-1.0-4.5B-Q8_0.gguf --outtype q8_0 --llama-cpp ~/llama.cpp
+~/gguf-env/bin/python ~/llama.cpp/convert_hf_to_gguf.py basal-1.0-4.5B --outtype f16  --outfile basal-1.0-4.5B-F16.gguf
+~/gguf-env/bin/python ~/llama.cpp/convert_hf_to_gguf.py basal-1.0-4.5B --outtype q8_0 --outfile basal-1.0-4.5B-Q8_0.gguf
 # other llama.cpp quantisations from the F16 file (llama-quantize: brew install llama.cpp, or build llama.cpp)
 llama-quantize basal-1.0-4.5B-F16.gguf basal-1.0-4.5B-Q4_K_M.gguf Q4_K_M
 ```
 
-`llama-quantize` keeps the fixed tokenizer fields. `--gguf` fixes an existing file instead of converting the model: a
-stock conversion, a `llama-quantize` output, or the basal-1.0 files of [Files](#files), which carry the stock
-tokenizer. The model then only supplies `tokenizer.json`, the calibration and `config.json`, downloaded without the
-weights; `--llama-cpp` is not needed and the output must be a new file:
-
-```bash
-~/gguf-env/bin/basal-export-gguf Remek/basal-1.0-4.5B fixed/basal-1.0-4.5B-F16.gguf --gguf basal-1.0-4.5B-F16.gguf
-```
-
 The attention and MLP biases of basal are converted and used by llama.cpp's Llama architecture. A stock conversion
 keeps llama.cpp's own tokenization of text (below): fine for `--mode gguf` and `--mode llamacpp`, which send token
-ids, not for Ollama, which takes text. With the fix, `llama-tokenize` splits the 44 bundled examples in both option
-orders (88 prompts) exactly like the Hugging Face tokenizer for the three basal-1.5 models and basal-1.0-1.5B / 4.5B
-(stock conversions: none of the 88). The fixed tokenizer fields of a stock conversion equal those of the `-GGUF` files
-for all three basal-1.5 models, and fixing a `-GGUF` file leaves it unchanged, byte for byte (all six files).
+ids, not for Ollama, which takes text; for Ollama use the `-GGUF` repositories.
 
 ## Other llama.cpp front ends: send token ids
 
@@ -134,50 +116,8 @@ merges inside Polish words, e.g. `wybierają|c` instead of `wybiera|jąc`). Fron
 probabilities. On the basal-1.0-1.5B F16 file, `llama-server` with text prompts: mean total-variation distance to fp32
 0.061 (max 0.35), with the Hugging Face token ids: 0.0005 (max 0.002). Ollama (GGUF import) and LM Studio, which accept
 only text, show the same shift (0.049 / 0.31 on the 1.5B, 0.061 / 0.63 for LM Studio on the 4.5B). The basal-1.5
-`-GGUF` files carry the tokenizer fix, so text and token ids give the same tokens there, as do files written by
-`basal-export-gguf` ([Convert yourself](#convert-yourself)).
+`-GGUF` files carry the tokenizer fix, so text and token ids give the same tokens there.
 
 `--mode gguf` and `--mode llamacpp` always pass token ids. If you call `llama-server` yourself, tokenize with the
 Hugging Face tokenizer, send `"prompt": [ids...]` to `/completion` with `n_predict: 1`, `n_probs: 20` and read the
 letter ids from `completion_probabilities[0].top_logprobs`.
-
-## Ollama `/v1/systemone` (experimental)
-
-Ollama serves decision models on `/v1/systemone` (since Ollama 0.35). For basal it needs the `basal` decision encoding,
-proposed in [ollama/ollama#18760](https://github.com/ollama/ollama/issues/18760) (branch
-[pdurlej/ollama@decision-basal-encoding](https://github.com/pdurlej/ollama/tree/decision-basal-encoding); not in an
-Ollama release): such a build renders each question in basal's own prompt format, scores both option orders, averages
-them and applies the temperature of the question type, like `basal-serve`. It reads `<arch>.decision.type = "basal"`
-and the temperatures (`<arch>.decision.temperature.{choice,noul,score}`) from the GGUF file. `--ollama-decision` writes
-them, here into a copy of a `-GGUF` file, from `CALIBRATION.ollama.json` when the model ships it, else
-`CALIBRATION.json` (the file `basal-serve --mode ollama` reads). No Modelfile template or system prompt is needed.
-
-```bash
-hf download Remek/basal-1.5-4.5B-GGUF --local-dir basal-1.5-4.5B-GGUF
-~/gguf-env/bin/basal-export-gguf ./basal-1.5-4.5B-GGUF basal-1.5-4.5B-Q8_0-decision.gguf --gguf basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf --ollama-decision
-echo 'FROM ./basal-1.5-4.5B-Q8_0-decision.gguf' > Modelfile.decision
-ollama create basal-1.5-4.5b-decision -f Modelfile.decision
-curl -s localhost:11434/v1/systemone -d '{"model": "basal-1.5-4.5b-decision", "state": "Klient: od wczoraj nie mogę zalogować się do bankowości internetowej.", "questions": {"dept": {"type": "choice", "instructions": "Do którego działu skierować zgłoszenie?", "criteria": {"cards": "Reklamacje kart", "online": "Wsparcie bankowości elektronicznej"}}}}'
-```
-
-- Ollama releases do not have the encoding: 0.40.2 answers such a file with `unsupported decision encoding "basal"`.
-  With a release, serve basal through `basal-serve --mode ollama` and the `-GGUF` files as shipped
-  ([README](../README.md#ollama-gguf)). The file is also **decision-only** in Ollama (`/api/generate` and `/api/chat`
-  refuse it), so `--mode ollama` cannot use it.
-- `choice`, `noul` and `score` questions only (the prompt contract of basal-1.0, unchanged in 1.5); `multi`, `act` and
-  `facts` are not available through Ollama's API: use `basal-serve --mode ollama` for them. Evidence spans need the
-  PyTorch engine (`fast`, `eager`).
-- Requests and answers follow Ollama's schema, not `basal-serve`'s. `choice` criteria are taken only as
-  `{key: description}`, `score` levels only as a list and `noul` descriptions only as strings (a list of keys, named
-  levels or `null` criteria return HTTP 400), and there is no `option_keys`: described choices are always shown as
-  `key: description` (`basal-serve`'s default). A structured `state` is passed as sent, with `, ` / `: ` separators
-  (number spellings, duplicate keys and U+2028 / U+2029 escapes differ from Python's `json.dumps`). In the answer,
-  `confidence` is 1 − entropy / ln(number of options), not the probability of the chosen option, and a `noul` answer
-  carries only `noul`: the thresholds of `CALIBRATION.json` apply to the largest probability (for `noul`: the larger
-  of p and 1 − p).
-
-Measured on **basal-1.0** only (1.5B and 4.5B, F16 and Q8_0 files written by `--ollama-decision`; Apple M1 Max, 50
-private triage items in Polish and English, four questions each): with the encoding, Ollama's accuracy is within 0.02 of
-`basal-serve --mode eager` on each of the four questions, at a mean total-variation distance of 0.008–0.010 to its
-probabilities. Without it, Ollama's generic decision prompt (a JSON schema, one option order, no calibration) costs
-basal-1.0-1.5B up to 0.24 accuracy on the same items: the models are trained on one prompt format.

@@ -3,11 +3,16 @@ Copyright 2026 Remigiusz Kinas
 
 This product includes models fine-tuned from the following works, licensed under the Apache License, Version 2.0:
 
+  basal-2.0-4.5B  <- speakleash/Bielik-4.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-4.5B-v3.0-Instruct)
+  basal-2.0-max   <- speakleash/Bielik-PL-11B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-PL-11B-v3.0-Instruct)
+  basal-2.0-mini  <- speakleash/Bielik-1.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-1.5B-v3.0-Instruct)
   basal-1.5-4.5B  <- speakleash/Bielik-4.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-4.5B-v3.0-Instruct)
   basal-1.5-max   <- speakleash/Bielik-PL-11B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-PL-11B-v3.0-Instruct)
   basal-1.5-mini  <- speakleash/Bielik-1.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-1.5B-v3.0-Instruct)
   basal-1.0-4.5B  <- speakleash/Bielik-4.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-4.5B-v3.0-Instruct)
   basal-1.0-1.5B  <- speakleash/Bielik-1.5B-v3.0-Instruct  (https://huggingface.co/speakleash/Bielik-1.5B-v3.0-Instruct)
+  basal-omni-1.0-max   <- google/gemma-4-12B-it  (https://huggingface.co/google/gemma-4-12B-it)
+  basal-omni-1.0-mini  <- google/gemma-4-E4B-it  (https://huggingface.co/google/gemma-4-E4B-it)
 
 The inference engine in this repository is original work licensed under the Apache License, Version 2.0.
 
@@ -18,3 +23,5 @@ Training data attribution (basal-1.0 models):
   source identifiers are not available, so the upstream sources of these items are not documented individually.
 
 basal-1.5 models: released under the Apache License, Version 2.0.
+basal-2.0 models: released under the Apache License, Version 2.0.
+basal-omni-1.0 models: released under the Apache License, Version 2.0.

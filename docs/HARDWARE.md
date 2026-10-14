@@ -5,7 +5,7 @@
 (each pair is fine-tuned from the same Bielik base model), so the tables show what each GPU does with these model
 sizes and which mode to choose; they are not measurements of the 1.5 models. The *accuracy* and *agreement* columns are
 those of the basal-1.0 weights on our speed sample; for the accuracy of the 1.5 models see the
-[README](../README.md#performance). basal-1.5-max (11B) and Apple Silicon have their own sections below.
+[v1.5.0 README](https://github.com/rkinas/basal/tree/v1.5.0#performance). basal-1.5-max (11B) and Apple Silicon have their own sections below.
 
 **basal-1.5 release check** (one H100, `basal-serve --mode fast`, bf16, HTTP load test): one question 13.7 ms p50 /
 23.8 ms p95, 64.4 decisions/s with 32 concurrent clients (basal-1.0 was not re-measured on that machine).
@@ -33,7 +33,7 @@ measurements):
 | **Ollama** | `ollama` | CPU, Apple Silicon, consumer GPUs | local and desktop use with Ollama (`-GGUF`) | 1. `hf download Remek/basal-1.5-4.5B-GGUF --local-dir basal-1.5-4.5B-GGUF` 2. in that folder: `ollama create basal-1.5-4.5b:q8_0 -f Modelfile.Q8_0` 3. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode ollama --ollama-model basal-1.5-4.5b:q8_0` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 518 / 542 ms per question |
 | **llama.cpp** | `llamacpp`; `gguf` | CPU, Apple Silicon, consumer GPUs | `llama-server` with the `-GGUF` files; the engine's token ids are sent as is. `--mode gguf --gguf <file>` runs the file in process instead (extra `basal[gguf]`, [GGUF.md](GGUF.md)) | 1. `llama-server -m basal-1.5-4.5B-GGUF/basal-1.5-4.5B-Q8_0.gguf -c 4096 --port 8080` 2. `basal-serve --model ./basal-1.5-4.5B-GGUF --mode llamacpp` | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.994 (`Q8_0`) / 0.980 (`Q4_K_M`), 427 / 446 ms per question |
 
-**`basal-serve` is the decision layer in every row.** vLLM, SGLang, MLX, Ollama and llama.cpp run the weights; the typed answers (a calibrated probability for each of your options, both option orders, the state shared by several questions, `multi`, `act` and `facts`) come from `basal-serve --mode <engine>` in front of them, with the same HTTP API in every mode. A plain `ollama run` or `llama-cli` gives free text only. Evidence spans need the PyTorch engine (`fast`, `eager`); vLLM and SGLang start with a 4,096-token context (longer states are refused); raise it with `--max-len` (e.g. 32768 for long documents). Install and first request for each engine: [quick start](../README.md#quick-start).
+**`basal-serve` is the decision layer in every row.** vLLM, SGLang, MLX, Ollama and llama.cpp run the weights; the typed answers (a calibrated probability for each of your options, both option orders, the state shared by several questions, `multi`, `act` and `facts`) come from `basal-serve --mode <engine>` in front of them, with the same HTTP API in every mode. A plain `ollama run` or `llama-cli` gives free text only. Evidence spans need the PyTorch engine (`fast`, `eager`); vLLM and SGLang start with a 4,096-token context (longer states are refused); raise it with `--max-len` (e.g. 32768 for long documents). Install and first request for each engine: [install and run](INSTALL.md).
 <!-- /engines -->
 
 ## Recommendation
@@ -114,6 +114,84 @@ difference 1.5e-5). The HTTP and engine numbers are not comparable with each oth
 for the bf16 weights alone, plus activations and CUDA graphs: on 24 GB cards use the 4.5B model (`--mode fp8` may fit,
 but it was not measured for max). On Apple Silicon, see the ports below.
 
+## Long states under load (one H100)
+
+Requests with one choice question over states of about 1,500 tokens (generated PL / EN case logs, `basal-loadtest
+--synthetic 1500`; prompts of 1,640 tokens on average with the basal-1.5 prompt format), HTTP, latency p50 of single
+requests and decisions/s with 16 concurrent clients. "earlier engine" is the basal-1.5 release engine on the same
+machine; `o1` / `o2` = one option order or both (`--orders`).
+
+| model | engine | weights | orders | p50 (ms) | decisions/s (16 clients) |
+|---|---|---|---|---|---|
+| basal-1.5-mini | earlier engine `fast` | bf16 | o2 (its default) | 23.0 | 48.9 |
+| | this engine `fast` | bf16 | o1 | 16.7 | 76.9 |
+| | this engine `fast` | bf16 | o2 | 26.6 | 57.5 |
+| | this engine `fast` | `-FP8` checkpoint | o1 | 14.9 | 107.9 |
+| basal-1.5 (4.5B) | earlier engine `fast` | bf16 | o2 (its default) | 51.7 | 18.1 |
+| | earlier engine `fp8` (torchao) | FP8 | o1 | 43.9 | 21.9 |
+| | this engine `fast` | bf16 | o1 | 38.8 | 26.1 |
+| | this engine `fast` | bf16 | o2 | 56.3 | 21.3 |
+| | this engine `fast` | `-FP8` checkpoint | o1 | 28.7 | 39.6 |
+| | this engine `fast` | `-FP8` checkpoint | o2 | 50.1 | 26.5 |
+| | vLLM 0.31 (`--mode vllm`) | bf16 | o2 | 41.8 | 32.8 |
+| | vLLM 0.31 | `-FP8` checkpoint | o2 | 37.9 | 42.0 |
+| | SGLang 0.5.21 (`--mode sglang`) | bf16 | o2 | 62.4 | 18.3 |
+
+- **A long tail** (the same, with 10% of the states 3,000–10,000 tokens long; 2,270 tokens on average): basal-1.5 o2
+  52.4 ms / 9.4 decisions/s with the earlier engine, 57.5 ms / 15.9 with this one (o1: 40.0 ms / 18.8; `-FP8` o1:
+  29.9 ms / 23.6). The earlier engine computed a long state once per option order.
+- **Five questions per request** over one state (SOAM), basal-1.5: 70 questions/s with the earlier engine (o2), 86
+  (o2) and 98 (o1) with this one.
+- **Two option orders at one client** cost a few ms more than in the earlier engine (mini 26.6 against 23.0 ms; `-FP8`
+  basal-1.5 50.1 ms against 28.7 for one order): the branches run in a second, short forward pass (pass 2 in
+  [SOAM.md](SOAM.md#which-kernel-runs)). Under load the two passes are faster (57.5 against 48.9 decisions/s).
+- **The `-FP8` checkpoints** run natively in the `fast` mode (the ModelOpt FP8 weights with their static scales, the
+  same arithmetic as vLLM): 1.5× the bf16 throughput. Their decisions agree with the bf16 model's on 0.98 (basal-1.5)
+  and 0.97 (mini) of development decisions. torchao's on-the-fly FP8 (`--mode fp8` on bf16 weights) gains only 10–20%.
+  As in bf16, FP8 answers are not bit-identical under load: batching with other requests changes the tensor shapes and
+  the rounding, and a near-tie can flip. Use `--deterministic` when the same request must always get the same answer.
+- `--deterministic` costs 4% with one option order (mini: 73.1 instead of 76.2 decisions/s) and 21% with two (45.2
+  instead of 57.5); its answers were bit-identical alone and under load (100 of 100 requests).
+- FP8 GEMMs use cuBLAS's fast accumulation, whose rounding depends on the kernel picked for the batch shape: a 4.5B
+  format-2 FP8 checkpoint scored 0.6969 on a 10.6k-decision dev set batched, 0.6978 one request at a time and 0.6915
+  with deterministic kernels, and 541 decisions differed between batched and deterministic. `--deterministic` therefore
+  runs FP8 GEMMs with full accumulation: 0.6958, the same decisions batched and alone (max |dp| 0.1), 39.6 instead of
+  41.2 decisions/s at 16 clients (H100).
+
+## Kernels of the CUDA graph engine (one H100)
+
+The engine options of the kernel study, measured served over HTTP. The model is a 4.5B development checkpoint of
+basal-2.0 (prompt format 2, one option order unless noted), synthetic states of about 1.6k tokens, single runs:
+
+| configuration | bf16, 1 client | bf16, 16 clients | FP8, 1 client | FP8, 16 clients | start-up (bf16 / FP8) |
+|---|---|---|---|---|---|
+| FlashAttention 2 (torch SDPA), separate projections | 38.0 ms | 27.2 dec/s | 31.6 ms | 34.7 dec/s | 253 s / 536 s |
+| `--attn fa3` | 35.0 ms | 28.4 dec/s | 28.7 ms | 36.2 dec/s | – |
+| `--attn fa3 --merge on` (the bf16 default on Hopper with FA3 installed) | 34.6 ms | 29.6 dec/s | 27.8 ms | 37.7 dec/s | 253 s / 536 s |
+| + `--lean on` | 35.0 ms | 27.4 dec/s | 29.2 ms | 33.7 dec/s | **106 s / 158 s** |
+
+- **FA3 and merged projections** change no bf16 decision with a clear answer: on 10,606 development decisions, all
+  decisions whose top two options differ by at least 0.2 are the same as with FA2. Accuracy moves by −0.02 / +0.01
+  points. Two option orders agree with each prompt run alone on 0.995 of decisions (0.985 with FA2).
+- **FP8 checkpoints** stay unmerged by default. Re-quantising a merged weight per tensor moves FP8 decisions as much as
+  the quantisation itself.
+- **The FP8 export** of the prompt-format-2 models keeps the first two and the last two decoder layers in bf16
+  ([QUANTIZATION.md](QUANTIZATION.md#prompt-format-2-models-the-fp8-export)). On FA3, unmerged: 40.95 decisions/s at
+  16 clients and 26.2 ms at one client (median of three servers, one H100 with no other job), 1.4× the bf16 model in
+  the same comparison. Keeping every `down_proj` in bf16 too agrees slightly more often (0.957 against 0.950 on 2–10
+  options) at 35.75 decisions/s.
+- **The lean layer** (`--lean on`, off by default) is one layer function compiled once for every shape instead of the
+  whole model per shape. Start-up is 2.4–3.4× faster, and two option orders agree with single prompts on 1.000 of
+  decisions. Under load it is 7–8% slower than the compiled transformers forward, so it is an option for fast
+  restarts, not the default. `--lean pass2` uses it for the branch pass only.
+- **`--tree flex`** (with `--lean pass2`, opt-in): the branches of a request attend through a FlexAttention mask
+  instead of a dense mask over repeated KV heads, only inside the graphs captured at start-up (other shapes run the
+  dense mask, so no request compiles). Not bit-identical to the dense mask (near-tie decisions change); faster on
+  multi-question loads alone (five questions per state: +3% bf16 / +22% FP8 on a development checkpoint), not on the
+  basal-2.0 release models' mixed load, so it stays opt-in in v2.0.0.
+- Two option orders: FA3 + merged 51.9 ms at one client and 24.3 decisions/s at 16 clients. Five questions per state:
+  106.8 questions/s at 16 clients.
+
 ## Apple Silicon
 
 Three routes: the **MLX** ports (`-MLX-8bit`, `-MLX-fp4`) with `--mode mlx` (the default on a Mac with
@@ -147,7 +225,7 @@ reference is the bf16 model in PyTorch; for basal-1.5-max, which does not fit a 
 | Apple M4 Pro, 24 GB | basal-1.5-mini (1.5B) | Ollama GGUF Q4_K_M | 196 ms | as llama.cpp | 1.0 GB |
 
 Agreement here is on a 500-decision sample, to check that each port matches its reference; to compare model sizes, see
-the benchmark table ([README](../README.md#other-results)). For basal-1.5-mini use `-MLX-8bit` (1.8 GB, agreement 0.998) or GGUF `Q4_K_M` (1.0 GB, 0.964); its `-MLX-fp4` port costs about 3.6 accuracy points (agreement 0.908, accuracy 0.882 vs 0.918).
+the basal-1.5 benchmark table ([v1.5.0 README](https://github.com/rkinas/basal/tree/v1.5.0#other-results)). For basal-1.5-mini use `-MLX-8bit` (1.8 GB, agreement 0.998) or GGUF `Q4_K_M` (1.0 GB, 0.964); its `-MLX-fp4` port costs about 3.6 accuracy points (agreement 0.908, accuracy 0.882 vs 0.918).
 
 Serve with `basal-serve --model Remek/<model>-MLX-8bit --mode mlx` ([QUANTIZATION.md](QUANTIZATION.md#mlx-apple-silicon)). On Apple Silicon a decision is compute-bound (prefill): every MLX format takes about the same time, so the formats differ in memory, not speed; llama.cpp is about 25% faster than MLX on the M4 Pro and Ollama about 10% (basal-1.5). Five questions over one state take 2.1–2.2 s with MLX and 1.7–1.8 s with llama.cpp / Ollama, not five times one question, because the state is computed once.
 
