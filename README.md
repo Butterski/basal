@@ -277,6 +277,18 @@ by Paweł Kiszczak ([#4](https://github.com/rkinas/basal/pull/4)).
 }
 ```
 
+basal-omni-1.0 (text, images and audio):
+
+```bibtex
+@software{kinas2026basalomni10,
+  title   = {basal-omni-1.0: typed-decision models for text, images and audio in Polish and English},
+  author  = {Kinas, Remigiusz},
+  year    = {2026},
+  version = {1.0},
+  url     = {https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f}
+}
+```
+
 ## License
 
 Apache-2.0. The models are derivatives of Apache-2.0 base models (Bielik v3, SpeakLeash and ACK Cyfronet AGH, for
