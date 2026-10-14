@@ -39,8 +39,8 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 - **Werdykt**, the hidden Polish–English decision benchmark: every tier is above its basal-1.5 counterpart, with a
   lower calibration error, and faster. Not everything improved: on a panel of 10 public English decision tasks all
   three are below basal-1.5 ([results](#results)).
-- **basal-omni-1.0** (*experimental*): two Gemma 4 models that answer the same questions and also read images and
-  audio.
+- **basal-omni-1.0** (*experimental*): **basal-omni-1.0-mini** (4B) and **basal-omni-1.0-max** (12B), basal models built
+  on Google Gemma 4 that answer the same questions and also read images and audio.
 - **Engine v2.0.0**: compact batching and FlashAttention 3 on Hopper, native FP8 checkpoints, the `tool` question
   type for agents, an MCP server, `basal-calibrate` and `--deterministic` serving.
 - **Thinking mode** (4.5B, *experimental*, off by default): it lowered accuracy on Werdykt; we recommend leaving it
@@ -61,7 +61,7 @@ Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the [release notes](https:
   port is checked against its bf16 model; its card has the numbers. Files in detail:
   [docs/INSTALL.md](docs/INSTALL.md#what-the-model-repositories-contain).
 
-**basal-omni-1.0** (experimental, Google Gemma 4; text, images and audio):
+**basal-omni-1.0** (experimental; text, images and audio; built on Google Gemma 4):
 
 | model | params | use | Hugging Face |
 |---|---|---|---|

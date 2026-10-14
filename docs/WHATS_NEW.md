@@ -31,7 +31,7 @@
 - **Faster serving on one GPU**: compact batching (single prompts packed into one row with FlashAttention 3 varlen),
   the prompt template computed once at start-up, a scheduler that keeps long requests from delaying short ones,
   merged projections and FlashAttention 3 on Hopper, native ModelOpt FP8 checkpoints in `--mode fp8`.
-- **One engine for text and media**: the eager backend serves Gemma 4 models (basal-omni) and, with `--media on` and
+- **One engine for text and media**: the eager backend serves the basal-omni models (Gemma 4 architecture) and, with `--media on` and
   the `basal[media]` extra, requests with images and audio (`"media"`, `"detail"`, `"lang"`). In every model it now
   reads option codes in fp32, reads left-padded prompts at their own positions and prefills long prompts in
   2,048-token chunks.
