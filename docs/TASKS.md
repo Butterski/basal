@@ -83,6 +83,8 @@ written into the prompt as compact JSON (this has been true for every question t
   `min_keep` (default 1). `compressed` is a drop-in replacement for the state in a call to another model.
 - At most 600 units per request; split longer documents or use a larger unit. The models were trained on states of up
   to about 6,000 tokens.
+- Cost grows with the number of units: every unit is a question that repeats its text. A 5,000-word paper split into
+  paragraphs took about 27 s on one H100 (eager, bf16); prefer `paragraph` or `line` units for long documents.
 
 ## extract
 
@@ -138,8 +140,8 @@ Measured with basal-omni-1.0-max (Gemma 4 12B), basal-serve eager bf16, on sets 
 | classify | BANKING77, test, 77 labels (CC BY 4.0) | 1,000 | accuracy 74.6% |
 | verify | VitaminC, real revisions, 3-way (MIT) | 1,000 | accuracy 80.3%, macro-F1 0.77 |
 | verify | RAGTruth, response vs source, binary (MIT) | 1,000 | accuracy 80.3%, F1 of "not supported" 0.65 |
-| compress | QASPER, paragraphs, keep 30% of characters (CC BY 4.0) | 250 | (pending) |
-| extract | synthetic PL / EN invoices, 12 fields (ours) | 400 | (pending) |
+| compress | QASPER, paragraphs, keep 30% of characters (CC BY 4.0) | 248 | needed paragraphs kept: 90.1% (all of them for 84.3% of questions); at 10% / 20% / 50% of the text: 77.2% / 86.3% / 96.3% |
+| extract | synthetic PL / EN invoices, 12 fields (ours) | 400 | fields correct: 90.1% (invoice number 96%, tax id 100%, amounts 96.5–99.5%, dates 86–94%, seller / buyer name 81% / 86%, IBAN 81%, currency 62%, payment method 100%) |
 
 The `automated` flag uses thresholds certified on the models' own decision tasks. On these new label sets they do
 not hold (at a 1% target, the automated answers were wrong 2–9% of the time): so task answers report `automated` only with
