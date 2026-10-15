@@ -129,7 +129,7 @@ if __name__ == "__main__":
     ap.add_argument("--url", required=True)
     ap.add_argument("--label", required=True)
     ap.add_argument("--out", default="results/matrix")
-    ap.add_argument("--tokenizer", default="Remek/basal-1.5-4.5B", help="tokenizer of the served model (any basal-1.5 folder or repo)")
+    ap.add_argument("--tokenizer", default="Remek/basal-1.5-4.5B", help="tokenizer of the served model (any basal-1.5 or basal-2.0 folder or repo: they share it)")
     ap.add_argument("--passes", type=int, default=2)
     ap.add_argument("--conc", type=int, nargs="*", default=[1, 4, 8, 16, 32, 64])
     ap.add_argument("--only", nargs="*", default=None, help="case names (XL-q2) or prefixes ending in - (S-)")

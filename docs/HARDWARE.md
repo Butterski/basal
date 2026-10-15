@@ -441,6 +441,10 @@ Request matrix over HTTP, p50 (details, profile and method: [benchmarks/STRIX_HA
 - Long states gain less (1.5× at 6,000 tokens): the matmuls hit the ~35–40 TFLOPS this GPU sustains, and the package
   runs at its power limit (~160 W, then ~140 W) with the GPU at 2.15–2.33 GHz.
 - For `gguf` here, build llama-cpp-python with Vulkan (`CMAKE_ARGS="-DGGML_VULKAN=on"`); the host's Mesa matters.
+- **basal-2.0** (4.5B, same architecture; both servers up, requests interleaved, median of 5 rounds): `gguf` → `strix`
+  136 → 144 ms for one question over a ≈100-token state, 1.27 s → **714 ms** at ≈2,000 tokens, 4.16 → **2.41 s** at
+  ≈6,000 tokens (5.25 → **2.90 s** with 20 questions), 11.5 → **19.0/s** with 32 clients. Both agree with fp32 on 142 of
+  144 decisions; the other two are one question that fp32 puts at 0.502 / 0.498.
 
 ## Notes per platform
 
