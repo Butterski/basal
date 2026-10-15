@@ -70,7 +70,12 @@ def test_classify_single_and_multi():
     c = a["answers"]["intent"]
     assert c["label"] == "refund" and c["top_label"] == "refund" and set(c["scores"]) == {"refund", "track", "none"}
     assert abs(c["scores"]["refund"] - 0.8) < 1e-6 and c["experimental"] and "other" in a["answers"]
-    assert c["automated"] == {"0.01": None, "0.05": None}  # no calibration file: no certificate
+    assert c["automated"] == {"0.01": None, "0.05": None}  # no task threshold: no certificate
+    srv = FakeServer(by_text(lambda s, o: 8 if "refund" in o else 1),
+                     cal={"thresholds": {"0.01": {"per_type": {"choice": {"confidence": 0.5}}}},
+                          "task_thresholds": {"classify": {"0.05": 0.75}}})
+    c = run(srv, {"state": "Money back please.", "questions": {"i": {"type": "classify", "labels": ["refund", "track"]}}})
+    assert c["answers"]["i"]["automated"] == {"0.01": None, "0.05": True}  # the decision type's threshold is not used
     assert a["usage"]["questions"] == 2
     srv = FakeServer(by_text(lambda s, o: (9 if "refund" in s.split("Does this apply")[-1] else 1) if o == "Yes" else 3))
     c = run(srv, {"state": "Refund the kettle.", "questions": {

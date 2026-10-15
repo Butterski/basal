@@ -390,12 +390,16 @@ def expand(body, max_options=255):
 
 # --- assembly -------------------------------------------------------------------------------------------------------
 
-def _automated(cal, q_type, conf, risks):
-    from .server import certified
+def _automated(cal, task, conf, risks):
+    """Whether a task answer may be used without review at each max_error: only with a threshold certified for that task
+    (calibration file: "task_thresholds": {task: {"0.01": confidence, ...}}, fitted on the user's own labelled
+    decisions); the thresholds of the decision types do not hold on task label sets (measured 2026-10-15), so without
+    one the answer is null."""
+    own = (cal.get("task_thresholds") or {}).get(task) or {}
     out = {}
     for r in risks:
-        thr = certified(cal, r, q_type)
-        out[str(r)] = None if thr is None else bool(conf >= thr)
+        thr = own.get(str(float(r)))
+        out[str(r)] = None if thr is None else bool(conf >= float(thr))
     return out
 
 
@@ -414,7 +418,7 @@ def finish(out, body, plans, cal, second=None):
             else:
                 res = {"type": "classify", "label": a["choice"], "top_label": a["choice"],
                        "scores": a["probabilities"], "confidence": a["confidence"],
-                       "automated": _automated(cal, "choice", a["confidence"], p["risks"])}
+                       "automated": _automated(cal, "classify", a["confidence"], p["risks"])}
         elif t == "verify":
             claims, flagged = {}, []
             for k in p["keys"]:
@@ -422,12 +426,11 @@ def finish(out, body, plans, cal, second=None):
                 if p["binary"]:
                     pr = {"supported": a["noul"], "not_supported": 1 - a["noul"]}
                     verdict = "supported" if a["noul"] >= 0.5 else "not_supported"
-                    q_type = "noul"
                 else:
-                    pr, verdict, q_type = a["probabilities"], a["choice"], "choice"
+                    pr, verdict = a["probabilities"], a["choice"]
                 conf = max(pr.values())
                 claims[k] = {"verdict": verdict, "probabilities": pr, "confidence": conf,
-                             "automated": _automated(cal, q_type, conf, p["risks"])}
+                             "automated": _automated(cal, "verify", conf, p["risks"])}
                 if verdict != "supported":
                     flagged.append(k)
             res = {"type": "verify", "claims": claims, "all_supported": not flagged, "not_supported": flagged}
