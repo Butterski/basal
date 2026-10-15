@@ -4,10 +4,9 @@ import asyncio
 import re
 
 import pytest
-import torch
 
 from basal import tasks
-from basal.tasks import Copier, join_units, leaves, parse_number, units
+from basal.tasks import join_units, leaves, parse_number, span_candidates, units
 
 from test_server import FakeServer
 
@@ -107,7 +106,7 @@ def test_compress_threshold_and_keep_ratio():
     assert len(c["kept"]) == 1
 
 
-def test_extract_choice_fields_and_refused_copy():
+def test_extract_choice_fields():
     schema = {"type": "object", "properties": {"method": {"enum": ["transfer", "card"]}, "paid": {"type": "boolean"},
                                                "number": {"type": "string", "description": "invoice number"}}}
 
@@ -117,72 +116,44 @@ def test_extract_choice_fields_and_refused_copy():
             return 9 if o.startswith("transfer") else 1
         if "paid" in q:
             return 9 if o == "No" else 1
-        return 9 if o == "No" else 1  # number: not present
+        return 9 if o.startswith("Not stated") else 1  # number: not in the document
     srv = FakeServer(by_text(pref))
     e = run(srv, {"state": "Invoice. Pay by transfer.", "questions": {"x": {"type": "extract", "schema": schema}}})
     x = e["answers"]["x"]
     assert x["data"] == {"method": "transfer", "paid": False, "number": None}
     assert x["fields"]["number"]["present_probability"] < 0.5 and x["fields"]["method"]["source"] == "choice"
-    srv = FakeServer(by_text(lambda s, o: 9 if o == "Yes" else 1))
-    with pytest.raises(ValueError, match="eager backend"):
-        run(srv, {"state": "Invoice FV/1.", "questions": {"x": {"type": "extract", "schema": {
-            "type": "object", "properties": {"number": {"type": "string"}}}}}})
 
 
-class CharTok:
-    """Character-level tokenizer: one token per character (id = code point), offsets included."""
-    eos_token_id, unk_token_id = 1, 0
-
-    def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
-        out = {"input_ids": [ord(c) for c in text]}
-        if return_offsets_mapping:
-            out["offset_mapping"] = [(i, i + 1) for i in range(len(text))]
-        return type("E", (dict,), {"input_ids": property(lambda self: self["input_ids"])})(out)
-
-    def encode(self, s, add_special_tokens=False):
-        return [ord(c) for c in s]
-
-    def convert_tokens_to_ids(self, t):
-        return 0
-
-    def apply_chat_template(self, msgs, **_):
-        return "".join(f"<{m['role']}>{m['content']}" for m in msgs) + "<model>"
+def test_span_candidates():
+    t = "Seller: ACME Sp. z o.o., NIP 525-123-45-67 | Total: 1 230,00 PLN"
+    c = [t[a:b] for a, b in span_candidates(t, 0, len(t))]
+    for want in ("ACME Sp. z o.o.", "NIP 525-123-45-67", "525-123-45-67", "1 230,00 PLN", "1 230,00", "PLN"):
+        assert want in c
+    assert len(c) == len(set(c)) and all(x == x.strip(" ,:|") for x in c)
+    assert len(span_candidates(" ".join(["w%d" % i for i in range(400)]), 0, 2289, cap=50)) == 50
 
 
-class Wants:
-    """Stand-in backend whose model wants to write `target` and then close the quote."""
-    lock = __import__("threading").Lock()
-    CHUNK = 7
+def test_extract_text_fields_line_then_span():
+    state = "Invoice no: FV/12\nSeller: ACME Ltd\nTotal: 120.50 EUR"
+    want = {"number": ("FV/12", "FV/12"), "seller": ("ACME", "ACME Ltd"), "total": ("120.50", "120.50"),
+            "iban": (None, None)}
 
-    def __init__(self, target):
-        self.tok, self.dev, self.target, self.written, self._head_in = CharTok(), "cpu", target, "", torch.zeros(1, 1, 1)
-        self.prefilled = False
-
-    def model(self, input_ids, position_ids, past_key_values, use_cache, logits_to_keep):
-        if self.prefilled:
-            self.written += chr(int(input_ids[0, -1]))
-        if position_ids[0, -1] + 1 >= len(self.full):
-            self.prefilled = True
-        return type("O", (), {"past_key_values": past_key_values})()
-
-    def _codes(self, h, ids_list):
-        want = self.target[len(self.written)] if len(self.written) < len(self.target) else '"'
-        w = [9.0 if chr(i) == want else 1.0 for i in ids_list[0]]
-        return [[x / sum(w) for x in w]]
-
-
-def test_copy_decoding_is_exact_and_located():
-    state = "Seller: ACME. Invoice no. FV/12/2026 of 3 Oct. Order FV/12/2025."
-    b = Wants("FV/12/2026")
-    cp = Copier(b)
-    b.full = b.tok(cp.prompt(state, "Copy the invoice number."), add_special_tokens=False).input_ids
-    out = cp(state, "Copy the invoice number.")
-    assert out["text"] == "FV/12/2026" and state[out["start"]:out["end"]] == "FV/12/2026"
-    assert 0 < out["probability"] < 1 and "truncated" not in out
-    b = Wants("FV/99")  # the model wants text that is not in the state: the copy can only follow the state
-    b.full = b.tok(cp.prompt(state, "x"), add_special_tokens=False).input_ids
-    out = Copier(b)(state, "x")
-    assert out["text"] in state and state[out["start"]:out["end"]] == out["text"]
+    def pref(s, o):
+        q = s.split("<user>")[-1]
+        field = re.search(r"field: (\w+)", q).group(1)
+        line_kw, value = want[field]
+        if "Which line" in q:
+            return 9 if (line_kw and line_kw in o) or (line_kw is None and o.startswith("Not stated")) else 1
+        return 9 if o == value else 1
+    srv = FakeServer(by_text(pref))
+    schema = {"type": "object", "properties": {"number": {"type": "string"}, "seller": {"type": "string"},
+                                               "total": {"type": "number"}, "iban": {"type": "string"}}}
+    x = run(srv, {"state": state, "questions": {"x": {"type": "extract", "schema": schema}}})["answers"]["x"]
+    assert x["data"] == {"number": "FV/12", "seller": "ACME Ltd", "total": 120.5, "iban": None}
+    f = x["fields"]["seller"]
+    assert state[f["start"]:f["end"]] == "ACME Ltd" and f["source"] == "span"
+    assert abs(f["confidence"] - f["line_probability"] * f["span_probability"]) < 1e-9
+    assert x["fields"]["iban"]["present_probability"] < 0.5
 
 
 def test_task_name_separator_refused():

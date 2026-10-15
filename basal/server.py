@@ -976,7 +976,7 @@ class Server:
         t0 = time.perf_counter()
         orig, plans = body, None
         if any(tasks.is_task(q) for q in body["questions"].values()):  # classify / verify / compress / extract
-            body, plans = tasks.expand(body)
+            body, plans = tasks.expand(body, self.max_options)
         pol = body.get("early_exit")
         if pol is not None:
             pol = str(pol)
@@ -1022,9 +1022,14 @@ class Server:
                 for j, b2, o in zip(redo, second, o2):
                     branches[j][2].extend(b2[2]); outs[j] = outs[j] + o
         out = await self.assemble(body, qs, branches, outs, m, n_tok, n_media, longest, second, truncation, lane, t0)
-        if plans:  # the task answers from their decision answers; extract's text fields copied from the state
-            copy = tasks.Copier(self.backend) if type(self.backend) is EagerBackend else None
-            out = await asyncio.get_running_loop().run_in_executor(None, tasks.finish, out, orig, plans, self.cal, copy)
+        if plans:  # the task answers from their decision answers; extract's spans need a second round of decisions
+            r2, a2 = tasks.second_round(out, orig, plans, self.max_options), None
+            if r2 is not None:
+                out2 = await self.decide(r2)
+                a2 = out2["answers"]
+                for k in ("input_tokens", "branches"):
+                    out["usage"][k] = out["usage"].get(k, 0) + out2["usage"].get(k, 0)
+            out = tasks.finish(out, orig, plans, self.cal, a2)
             out["usage"]["latency_ms"] = round((time.perf_counter() - t0) * 1000, 2)
         return out
 

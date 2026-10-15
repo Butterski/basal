@@ -2,8 +2,8 @@
 
 A task question is expanded into the decision types (choice, noul, multi) over the request's state, so it shares the
 state (SOAM) with the request's other questions and uses their calibration; its answer is assembled from theirs. Text
-fields of `extract` are then copied from the state by copy-only decoding (eager backend): the model may only continue a
-run of the state's own tokens, so a value is always exact source text, with its character offsets.
+fields of `extract` are two decisions: which line of the state holds the value, then which of that line's candidate
+spans is the value (second_round), so a value is always exact source text, with its character offsets.
 
   classify  {"labels": {key: rubric} | [keys], "multi_label": false, "none": false, "max_error": [0.01, 0.05]}
   verify    {"claims": {key: claim} | [claims], "binary": false}
@@ -13,8 +13,6 @@ run of the state's own tokens, so a value is always exact source text, with its 
 import json
 import math
 import re
-
-import torch
 
 from .prompt import lang_of
 
@@ -32,9 +30,10 @@ W = {
         verify_binary="Twierdzenie: {claim}\nCzy źródło potwierdza to twierdzenie?",
         compress="Fragment: „{unit}”\nCzy ten fragment zawiera informację potrzebną do odpowiedzi na pytanie: {q}",
         compress_generic="Fragment: „{unit}”\nCzy ten fragment zawiera ważną informację z dokumentu?",
-        present="Czy dokument podaje wartość pola: {field}?", enum="Jaka jest wartość pola: {field}?",
+        line="W której linii dokumentu jest wartość pola: {field}?", enum="Jaka jest wartość pola: {field}?",
+        span="Linia: „{line}”\nKtóry fragment tej linii to dokładnie wartość pola: {field}?",
         enum_multi="Które wartości ma pole: {field}?", missing="Nie podano w dokumencie", yes="Tak", no="Nie",
-        copy="Przepisz z dokumentu dokładnie, znak po znaku, wartość pola: {field}. Odpowiedz w formacie JSON."),
+),
     "en": dict(
         classify="Which label best describes this text?", none="None of the labels above",
         classify_multi="Which labels describe this text?",
@@ -43,10 +42,11 @@ W = {
         verify_binary="Claim: {claim}\nDoes the source support this claim?",
         compress="Passage: \"{unit}\"\nDoes this passage hold information needed to answer this question: {q}",
         compress_generic="Passage: \"{unit}\"\nDoes this passage hold important information of the document?",
-        present="Does the document give the value of the field: {field}?", enum="What is the value of the field: {field}?",
+        line="Which line of the document gives the value of the field: {field}?",
+        enum="What is the value of the field: {field}?",
+        span="Line: \"{line}\"\nWhich part of this line is exactly the value of the field: {field}?",
         enum_multi="Which values does the field have: {field}?", missing="Not stated in the document", yes="Yes",
-        no="No", copy="Copy from the document, exactly and character by character, the value of the field: {field}. "
-                      "Answer in JSON."),
+        no="No"),
 }
 
 
@@ -168,6 +168,90 @@ def leaves(schema, path=""):
         raise ValueError(f"extract: field {path!r}: type {t!r} is not supported")
 
 
+MAX_CODES = 254  # option codes left for candidates (one is "not stated")
+TRIM = " \t,;:()[]{}\"'„”«»|*"
+
+
+def _shown(t, limit=400):
+    t = " ".join(t.split())
+    return t if len(t) <= limit else t[:limit] + " …"
+
+
+def line_regions(text, cap=None):
+    """The text's non-empty lines as (start, end); more than `cap` lines are grouped into consecutive blocks."""
+    cap = cap or MAX_CODES
+    lines = units(text, "line")
+    if len(lines) <= cap:
+        return lines
+    k = -(-len(lines) // cap)
+    return [(lines[i][0], lines[min(i + k, len(lines)) - 1][1]) for i in range(0, len(lines), k)]
+
+
+def _trim(text, a, b):
+    while a < b and text[a] in TRIM:
+        a += 1
+    while b > a and text[b - 1] in TRIM:
+        b -= 1
+    return a, b
+
+
+def span_candidates(text, a, b, cap=None):
+    """Candidate values inside text[a:b] as (start, end): the parts between separators (, ; | tab, and after a colon),
+    then runs of up to L words (L as large as the cap allows, at most 8), each trimmed of punctuation, deduplicated."""
+    cap = cap or MAX_CODES
+    out, seen = [], set()
+
+    def add(s, e):
+        s, e = _trim(text, s, e)
+        if e > s and text[s:e] not in seen and len(out) < cap:
+            seen.add(text[s:e])
+            out.append((s, e))
+    for m in re.finditer(r"[^,;|\t\n]+", text[a:b]):
+        s, e = a + m.start(), a + m.end()
+        add(s, e)
+        c = text.find(":", s, e)
+        if c >= 0:
+            add(c + 1, e)
+    words = [(a + m.start(), a + m.end()) for m in re.finditer(r"\S+", text[a:b])]
+    L = max(1, min(8, cap // max(1, len(words))))
+    for i in range(len(words)):
+        for j in range(i, min(len(words), i + L)):
+            add(words[i][0], words[j][1])
+    return out
+
+
+def second_round(out, body, plans, max_options=255):
+    """Extract's text fields after the line decisions -> the request of span decisions (one choice per field over
+    the candidates of its chosen line), or None. The candidates are kept in the plans for finish()."""
+    state = body.get("state") if isinstance(body.get("state"), str) else ""
+    qs = {}
+    for name, p in plans.items():
+        if p["type"] != "extract":
+            continue
+        w = W[p["lang"]]
+        p["cands"] = {}
+        for path, kind, spec in p["fields"]:
+            if kind not in ("string", "number", "integer"):
+                continue
+            c = out["answers"][f"{name}{SEP}f{SEP}{path}"]["choice"]
+            if c == "__missing__":
+                continue
+            a, b = p["regions"][int(c[1:])]
+            cands = span_candidates(state, a, b, max_options - 1)
+            if len(cands) == 1:
+                p["cands"][path] = cands
+                continue
+            p["cands"][path] = cands
+            crit = {f"S{j}": state[s:e] for j, (s, e) in enumerate(cands)}
+            crit["__missing__"] = w["missing"]
+            qs[f"{name}{SEP}s{SEP}{path}"] = {"type": "choice", "criteria": crit, "option_keys": "hide",
+                                              "instructions": p["pre"] + w["span"].format(
+                                                  line=_shown(state[a:b]), field=_field_text(path, spec))}
+    if not qs:
+        return None
+    return {k: v for k, v in body.items() if k in ("state", "lang", "facts")} | {"questions": qs}
+
+
 def _field_text(path, spec):
     name = path.replace("_", " ").replace(".", " / ")
     d = spec.get("description") or spec.get("title")
@@ -207,7 +291,7 @@ def parse_number(text, integer=False):
 
 # --- expansion ------------------------------------------------------------------------------------------------------
 
-def expand(body):
+def expand(body, max_options=255):
     """A request with task questions -> (the request with only decision questions, plans to assemble the answers)."""
     state = body.get("state")
     text = state if isinstance(state, str) else ""
@@ -271,7 +355,7 @@ def expand(body):
             plans[name] = dict(type=t, spans=spans, unit=unit, keep_ratio=keep_ratio, threshold=thr,
                                min_keep=int(q.get("min_keep", 1)))
         elif t == "extract":
-            fields = list(leaves(q.get("schema") or {}))
+            fields, regions = list(leaves(q.get("schema") or {})), None
             pre = (str(q["instructions"]) + "\n") if q.get("instructions") else ""
             for path, kind, spec in fields:
                 f = _field_text(path, spec)
@@ -291,10 +375,14 @@ def expand(body):
                                             "option_keys": "hide"}
                 else:
                     if not text:
-                        raise ValueError(f"question {name!r}: field {path!r} is copied from the state, which has no text "
-                                         "(fields from media: enum and boolean only)")
-                    sub[f"f{SEP}{path}"] = {"type": "noul", "instructions": pre + w["present"].format(field=f)}
-            plans[name] = dict(type=t, fields=fields, lang=lang, pre=pre)
+                        raise ValueError(f"question {name!r}: field {path!r} is taken from the state's text, which is "
+                                         "empty (fields from media: enum and boolean only)")
+                    regions = regions or line_regions(text, max_options - 1)
+                    crit = {f"L{i}": _shown(text[a:b]) for i, (a, b) in enumerate(regions)}
+                    crit["__missing__"] = w["missing"]
+                    sub[f"f{SEP}{path}"] = {"type": "choice", "criteria": crit, "option_keys": "hide",
+                                            "instructions": pre + w["line"].format(field=f)}
+            plans[name] = dict(type=t, fields=fields, lang=lang, pre=pre, regions=regions)
         for k, v in sub.items():
             questions[f"{name}{SEP}{k}"] = v
     return dict(body, questions=questions), plans
@@ -311,9 +399,8 @@ def _automated(cal, q_type, conf, risks):
     return out
 
 
-def finish(out, body, plans, cal, copy=None):
-    """The expanded answers of a response -> one answer per task question. copy(state, field_text, lang) -> span dict,
-    for extract's text fields (None: the server cannot decode, and those fields are refused)."""
+def finish(out, body, plans, cal, second=None):
+    """The expanded answers of a response (and of second_round's request, `second`) -> one answer per task question."""
     ans = out["answers"]
     state = body.get("state") if isinstance(body.get("state"), str) else ""
     for name, p in plans.items():
@@ -383,25 +470,34 @@ def finish(out, body, plans, cal, copy=None):
                     f = {"value": None if c == "__missing__" else c == "true", "probabilities": a["probabilities"],
                          "confidence": a["confidence"], "source": "choice"}
                 else:
-                    present = a["noul"]
-                    f = {"value": None, "present_probability": present, "source": "copy"}
-                    if present >= 0.5:
-                        if copy is None:
-                            raise ValueError("extract: text fields need the eager backend (basal-serve --mode eager)")
-                        sp = copy(state, p["pre"] + W[p["lang"]]["copy"].format(field=_field_text(path, spec)), p["lang"])
-                        f.update(text=sp["text"], start=sp["start"], end=sp["end"],
-                                 confidence=present * sp["probability"], copy_probability=sp["probability"])
-                        if sp.get("truncated"):
-                            f["truncated"] = True
-                        if kind in ("number", "integer"):
-                            f["value"] = parse_number(sp["text"], kind == "integer")
-                            if f["value"] is None:
-                                f["error"] = f"not a {kind}"
-                        else:
-                            f["value"] = sp["text"]
+                    pl = a["probabilities"]
+                    p_line = 1 - pl["__missing__"]
+                    f = {"value": None, "present_probability": p_line, "source": "span"}
+                    cands = (p.get("cands") or {}).get(path)
+                    if a["choice"] == "__missing__" or not cands:
+                        f["confidence"] = pl["__missing__"]
                     else:
-                        f["confidence"] = 1 - present
-                f["calibration"] = "validated" if f["source"] == "choice" else "unvalidated"
+                        b2 = (second or {}).get(f"{name}{SEP}s{SEP}{path}")
+                        if b2 is None:  # one candidate: the line itself
+                            j, p_span = 0, 1.0
+                        elif b2["choice"] == "__missing__":
+                            j, p_span = None, b2["probabilities"]["__missing__"]
+                        else:
+                            j, p_span = int(b2["choice"][1:]), b2["confidence"]
+                        if j is None:
+                            f["confidence"] = p_span
+                        else:
+                            s0, e0 = cands[j]
+                            txt = state[s0:e0]
+                            f.update(text=txt, start=s0, end=e0, line_probability=a["confidence"],
+                                     span_probability=p_span, confidence=a["confidence"] * p_span)
+                            if kind in ("number", "integer"):
+                                f["value"] = parse_number(txt, kind == "integer")
+                                if f["value"] is None:
+                                    f["error"] = f"not a {kind}"
+                            else:
+                                f["value"] = txt
+                f["calibration"] = "validated" if f["source"] == "choice" else "per decision"
                 fields[path] = f
                 _set_path(data, path, f["value"])
             res = {"type": "extract", "data": data, "fields": fields}
@@ -409,80 +505,3 @@ def finish(out, body, plans, cal, copy=None):
         ans[name] = res
     out["usage"]["questions"] = len(body["questions"])
     return out
-
-
-# --- copy-only decoding ---------------------------------------------------------------------------------------------
-
-class Copier:
-    """Greedy decoding constrained to copy a contiguous run of the state's tokens (eager backend, one at a time).
-
-    The prompt is the chat template over the state and the field instruction, with the assistant prefill
-    {"value": " ; each next token must continue an occurrence of the copied run in the state's own tokenization, or
-    close the value with a quote token (not before the first token). Probabilities are fp32 softmaxes over the allowed
-    tokens; the span's probability is their product."""
-
-    PREFILL = '{"value": "'
-
-    def __init__(self, backend, max_tokens=64):
-        self.b, self.max_tokens = backend, max_tokens
-        tok = backend.tok
-        stop = set()
-        for s in ('"', '",', '"}', '" }', '"\n', '"}\n'):
-            ids = tok.encode(s, add_special_tokens=False)
-            if len(ids) == 1:
-                stop.add(ids[0])
-        for t in (tok.eos_token_id, tok.convert_tokens_to_ids("<end_of_turn>")):
-            if isinstance(t, int) and t >= 0 and t != tok.unk_token_id:
-                stop.add(t)
-        self.stop = sorted(stop)
-
-    def prompt(self, state, instruction):
-        msgs = [{"role": "user", "content": f"{state}\n\n{instruction}"}]
-        return self.b.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) + self.PREFILL
-
-    @torch.no_grad()
-    def __call__(self, state, instruction, lang=None):
-        from transformers import DynamicCache
-        b, tok = self.b, self.b.tok
-        enc = tok(state, add_special_tokens=False, return_offsets_mapping=True)
-        src, offs = enc["input_ids"], enc["offset_mapping"]
-        ids = tok(self.prompt(state, instruction), add_special_tokens=False).input_ids
-        chunk = getattr(b, "CHUNK", 4096)
-        with b.lock:
-            cache, n = DynamicCache(), 0
-            for s0 in range(0, len(ids), chunk):
-                part = torch.tensor([ids[s0:s0 + chunk]], device=b.dev)
-                pos = torch.arange(s0, s0 + part.shape[1], device=b.dev)[None]
-                cache = b.model(input_ids=part, position_ids=pos, past_key_values=cache, use_cache=True,
-                                logits_to_keep=1).past_key_values
-                n = s0 + part.shape[1]
-            run, starts, logp, truncated = [], list(range(len(src))), 0.0, True
-            for _ in range(self.max_tokens):
-                nxt = sorted({src[p + len(run)] for p in starts if p + len(run) < len(src)})
-                allowed = nxt + (self.stop if run else [])
-                if not allowed:
-                    truncated = False
-                    break
-                pr = b._codes(b._head_in[:, -1, :].float(), [allowed])[0]
-                j = max(range(len(allowed)), key=pr.__getitem__)
-                t = allowed[j]
-                logp += math.log(max(pr[j], 1e-30))
-                if t in self.stop and t not in nxt:
-                    truncated = False
-                    break
-                run.append(t)
-                starts = [p for p in starts if p + len(run) <= len(src) and src[p + len(run) - 1] == t]
-                cache = b.model(input_ids=torch.tensor([[t]], device=b.dev),
-                                position_ids=torch.tensor([[n]], device=b.dev), past_key_values=cache, use_cache=True,
-                                logits_to_keep=1).past_key_values
-                n += 1
-        p0 = starts[0]
-        a, e = offs[p0][0], offs[p0 + len(run) - 1][1]
-        while a < e and state[a].isspace():
-            a += 1
-        while e > a and state[e - 1].isspace():
-            e -= 1
-        out = {"text": state[a:e], "start": a, "end": e, "probability": math.exp(logp)}
-        if truncated:
-            out["truncated"] = True
-        return out
