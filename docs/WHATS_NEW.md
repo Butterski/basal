@@ -1,3 +1,16 @@
+# What is new in basal 2.1
+
+**Engine v2.1.0: task types (experimental)**
+- Four task types on the same API, for the basal models you already serve (no new model): **`classify`** (labels with
+  a rubric each), **`verify`** (is each statement supported, contradicted or not stated by the state), **`compress`**
+  (the sentences, lines or paragraphs needed for a question, as shorter text for another model) and **`extract`** (a
+  JSON schema filled with values taken exactly from the document, with character offsets).
+- Each task is expanded into the decision types over the shared state, so it costs about as much as the decisions it
+  asks: no text is generated, and `extract` values are always exact text of the document.
+- Measured on public sets the models were not trained on, with basal-omni-1.0-max: see
+  [TASKS.md](TASKS.md#results). Experimental: the API may change, and the `automated` flag of a task answer needs
+  thresholds fitted for that task.
+
 # What is new in basal-2.0
 
 
