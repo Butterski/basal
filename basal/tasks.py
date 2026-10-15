@@ -203,7 +203,7 @@ def span_candidates(text, a, b, cap=None):
 
     def add(s, e):
         s, e = _trim(text, s, e)
-        if e > s and text[s:e] not in seen and len(out) < cap:
+        if e > s and text[s:e] not in seen and len(out) < cap and any(ch.isalnum() for ch in text[s:e]):
             seen.add(text[s:e])
             out.append((s, e))
     for m in re.finditer(r"[^,;|\t\n]+", text[a:b]):
@@ -238,10 +238,9 @@ def second_round(out, body, plans, max_options=255):
                 continue
             a, b = p["regions"][int(c[1:])]
             cands = span_candidates(state, a, b, max_options - 1)
-            if len(cands) == 1:
-                p["cands"][path] = cands
-                continue
             p["cands"][path] = cands
+            if len(cands) <= 1:  # nothing to choose: the one candidate is the value, none means "not stated"
+                continue
             crit = {f"S{j}": state[s:e] for j, (s, e) in enumerate(cands)}
             crit["__missing__"] = w["missing"]
             qs[f"{name}{SEP}s{SEP}{path}"] = {"type": "choice", "criteria": crit, "option_keys": "hide",
@@ -361,10 +360,10 @@ def expand(body, max_options=255):
                 f = _field_text(path, spec)
                 if kind in ("enum", "enum_list"):
                     vals = _consts(spec if kind == "enum" else spec["items"])
-                    crit = {str(v): d for v, d in vals}
+                    crit = {str(v): f"{v} ({d})" if d else str(v) for v, d in vals}  # shown: the value (+ its description)
                     if kind == "enum":
                         crit["__missing__"] = w["missing"]
-                        sub[f"f{SEP}{path}"] = {"type": "choice", "criteria": crit,
+                        sub[f"f{SEP}{path}"] = {"type": "choice", "criteria": crit, "option_keys": "hide",
                                                 "instructions": pre + w["enum"].format(field=f)}
                     else:
                         sub[f"f{SEP}{path}"] = {"type": "multi", "criteria": crit,

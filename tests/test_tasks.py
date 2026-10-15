@@ -118,6 +118,7 @@ def test_extract_choice_fields():
     def pref(s, o):
         q = s.split("<user>")[-1]
         if "method" in q:
+            assert "__missing__" not in s
             return 9 if o.startswith("transfer") else 1
         if "paid" in q:
             return 9 if o == "No" else 1
@@ -159,6 +160,17 @@ def test_extract_text_fields_line_then_span():
     assert state[f["start"]:f["end"]] == "ACME Ltd" and f["source"] == "span"
     assert abs(f["confidence"] - f["line_probability"] * f["span_probability"]) < 1e-9
     assert x["fields"]["iban"]["present_probability"] < 0.5
+
+
+def test_extract_line_without_candidates_is_not_stated():
+    state = "Invoice no: FV/12\n---\nTotal: 5"
+    schema = {"type": "object", "properties": {"number": {"type": "string"}}}
+
+    def pref(s, o):
+        q = s.split("<user>")[-1]
+        return 9 if "Which line" in q and o == "---" else 1
+    x = run(FakeServer(by_text(pref)), {"state": state, "questions": {"x": {"type": "extract", "schema": schema}}})
+    assert x["answers"]["x"]["data"] == {"number": None}
 
 
 def test_task_name_separator_refused():
