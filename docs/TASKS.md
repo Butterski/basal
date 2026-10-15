@@ -116,6 +116,18 @@ written into the prompt as compact JSON (this has been true for every question t
 - Not supported yet: arrays of strings or objects (line items), text fields from images (enum and boolean fields work
   with media).
 
+## Summaries with another model
+
+basal does not write text. For summaries, put `compress` in front of a generative model (for example Bielik or Gemma on
+vLLM or Ollama) and `verify` behind it:
+
+1. `compress` the document with the reader's question (or none, for "the important parts"), `keep_ratio` 0.3–0.5.
+2. Send `compressed` to the generative model with your summary prompt.
+3. Split the summary into sentences and send them as `claims` of one `verify` question over the **original** document;
+   sentences that are `contradicted` or `not_stated` are flagged for review or removed.
+
+Steps 1 and 3 are one request each to basal-serve, whatever the number of sentences.
+
 ## Results
 
 Measured with basal-omni-1.0-max (Gemma 4 12B), basal-serve eager bf16, on sets not used in training:
