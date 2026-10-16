@@ -167,6 +167,29 @@ label set and fallback and no `fallback_threshold` of its own. An explicit value
 A label set with fewer than `--min-per-set` FIT questions is reported, not written. `multi` questions do not enter
 the temperatures: to calibrate the labels themselves, ask each one as a `noul` question with its gold.
 
+## Example: a new domain, measured
+
+basal-omni-1.0-mini (`--mode eager`, bf16, one option order) on
+[LocalLLaMA/typed-decisions](https://huggingface.co/datasets/LocalLLaMA/typed-decisions) (Apache-2.0: synthetic
+decisions over JSON records in four workflows, gold labels from a teacher model), a domain the model was not trained or
+calibrated on. Calibrated on the train split (3,958 labelled decisions in 800 requests, plus 596 `classify` and 1,600
+`verify` task decisions), measured on the CERT part of the test split (172 choice, 184 yes/no and 237 score decisions),
+engine 2.2, 16 Oct 2026:
+
+| on the test split | shipped `CALIBRATION.json` | fitted on the train split |
+|---|---|---|
+| ECE, choice / yes-no / score | 0.268 / 0.106 / 0.104 | **0.083 / 0.073 / 0.052** |
+| `max_error: 0.01`: automated, and its error | 12.6%, **8.0% wrong** | 0% (nothing certifiable) |
+| `max_error: 0.05`: automated, and its error | 54.3%, **21.4% wrong** | 3.7%, 0.0% wrong |
+| `verify` claims at `max_error: 0.01` | no task threshold | 56.0% automated, 0.4% wrong |
+
+The shipped file's certificate holds on our calibration data, not on this domain: here its 1% setting would automate one
+decision in eight at 8% error. Fitted on the user's labels, the temperatures about double (the model is overconfident
+on these records), the calibration error falls two to three times, and the thresholds certify only what the model gets
+right here (accuracy 0.57 / 0.80 / 0.67, against noisy teacher labels): almost nothing is automated, which is the right
+answer for a model this inaccurate on this data. On `verify`, where it is 95% accurate, the 1% threshold automates over
+half of the claims. A hosted decision API offers no such step: its confidence is what it is on your data.
+
 ## Tasks: classify, verify, extract
 
 A task answer reports `automated[max_error]` only with a threshold certified for that task (`task_thresholds` in the

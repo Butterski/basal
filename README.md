@@ -37,7 +37,9 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 - **Calibrate the model on your own data**, for every basal and basal-omni model: label a few hundred of your own
   requests, run `basal-calibrate`, and serve the file it writes. The probabilities, and the `max_error` thresholds
   that decide what may be automated, are then certified on your data, not ours. A hosted decision API cannot be
-  recalibrated on your data; a basal model can.
+  recalibrated on your data; a basal model can. Measured on a domain the model never saw, the shipped file's "1% error"
+  setting would have been wrong 8% of the time; after calibration the calibration error fell two to three times and
+  nothing was automated above its target ([the example](docs/CALIBRATION.md#example-a-new-domain-measured)).
   ```bash
   basal-calibrate my_labelled.jsonl --model Remek/basal-omni-1.0-max --mode eager    # writes CALIBRATION.custom.json
   basal-serve --model Remek/basal-omni-1.0-max --mode eager --calibration CALIBRATION.custom.json

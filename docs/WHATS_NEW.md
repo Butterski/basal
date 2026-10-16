@@ -15,6 +15,10 @@
 - **A file knows its model.** `fitted_on` records the model and its Hugging Face revision; `basal-serve --calibration`
   warns when a file was fitted on another model or revision (and reports it in `GET /v1/models`), and
   `--strict-calibration` refuses it.
+- **Measured on a new domain** (basal-omni-1.0-mini on typed-decisions, test split): the shipped file's 1% setting
+  would automate 12.6% of decisions at 8.0% error there; calibrated on the train split, the calibration error falls
+  from 0.268 / 0.106 / 0.104 to 0.083 / 0.073 / 0.052 (choice / yes-no / score) and nothing is automated above its
+  target. [The example](CALIBRATION.md#example-a-new-domain-measured)
 - Every other request takes the same code path as in v2.1.0.
 
 # What is new in basal 2.1
