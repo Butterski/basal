@@ -526,8 +526,8 @@ def load_calibration(md, kind, path, quant, orders, off=False):
     """The calibration basal-serve applies -> (calibration dict, its file, None or why it is unvalidated). A file
     fitted on other option orders than the served ones gives wrong temperatures and thresholds: the file for the
     served orders, CALIBRATION[.<engine>].o<orders>.json, is used when the model ships one; otherwise the file is kept
-    for its temperatures without its thresholds and fitted fallback thresholds (max_error defers), and the answers
-    are marked unvalidated. An explicit --calibration file is not replaced."""
+    for its temperatures without its thresholds, fitted fallback thresholds and task thresholds (max_error defers,
+    tasks report automated: null), and the answers are marked unvalidated. An explicit --calibration file is not replaced."""
     cal = calibration_file(md, kind, path, quant)
     data = {} if off or not cal.exists() else json.loads(cal.read_text())
     fitted = calibration_orders(data)
@@ -538,7 +538,7 @@ def load_calibration(md, kind, path, quant, orders, off=False):
     if fitted is None or fitted == orders:
         return data, cal, None
     why = f"{cal.name} was fitted on {fitted} option order(s), served with {orders}"
-    return {k: v for k, v in data.items() if k not in ("thresholds", "multi")}, cal, why
+    return {k: v for k, v in data.items() if k not in ("thresholds", "multi", "task_thresholds")}, cal, why
 
 
 def calibration_file(md, kind, path=None, quant=None):

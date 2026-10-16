@@ -8,7 +8,7 @@ import pytest
 
 import basal.server as server_module
 from basal.calibrate import field_correct, fit, fit_tasks, is_cert, main, read, served, task_rows, task_units
-from basal.server import Server, calibration_mismatch, model_identity, parser, temper
+from basal.server import Server, calibration_mismatch, load_calibration, model_identity, parser, temper
 from tests.test_calibrate import StubBackend, synthetic
 from tests.test_server import FakeServer
 
@@ -244,3 +244,27 @@ def test_the_compared_file_is_measured_as_served():
     got = report["compared"]["0.05"]
     assert abs(got["coverage"] - len(want) / len(cert)) < 1e-12           # noul has no threshold of its own: deferred
     assert abs(got["error"] - (len(want) - sum(want)) / len(want)) < 1e-12
+
+
+def test_other_option_orders_drop_task_thresholds_too(tmp_path):
+    """A file fitted on other option orders keeps its temperatures only: no decision, fallback or task thresholds."""
+    md = tmp_path / "m"
+    md.mkdir()
+    (md / "CALIBRATION.json").write_text(json.dumps(dict(SHIPPED, orders=1)))
+    data, f, why = load_calibration(md, "eager", None, None, 2)
+    assert why and "task_thresholds" not in data and "thresholds" not in data and data["temperature_per_prim"]
+    (md / "CALIBRATION.o2.json").write_text(json.dumps(dict(SHIPPED, orders=2)))
+    data, f, why = load_calibration(md, "eager", None, None, 2)
+    assert why is None and f.name == "CALIBRATION.o2.json" and data["task_thresholds"]
+
+
+def test_calibrate_compares_the_file_basal_serve_loads_for_its_orders(tmp_path, engine, capsys):
+    (engine / "CALIBRATION.json").write_text(json.dumps(dict(SHIPPED, orders=1)))
+    o2 = dict(SHIPPED, orders=2, task_thresholds={"verify": {"0.05": 0.95}})
+    (engine / "CALIBRATION.o2.json").write_text(json.dumps(o2))
+    write(tmp_path / "t.jsonl", classify_lines(n=200))
+    out = tmp_path / "C.json"
+    main([str(tmp_path / "t.jsonl"), "--mode", "eager", "--model", "stub", "--orders", "2", "--out", str(out)])
+    cal = json.loads(out.read_text())
+    assert cal["baseline"] == "stub/CALIBRATION.o2.json" and cal["task_thresholds"]["verify"] == {"0.05": 0.95}
+    assert cal["fitted_on"]["orders"] == 2

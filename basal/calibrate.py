@@ -85,8 +85,8 @@ from . import __version__
 from . import tasks as task_types
 from .engine import resolve
 from .prompt import max_options, model_format
-from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, certified,
-                     default_mode, model_identity, temper, temperature, to_items)
+from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, calibration_orders,
+                     certified, default_mode, load_calibration, model_identity, temper, temperature, to_items)
 from .sets import label_set_id
 from .sets import select as select_set
 
@@ -817,6 +817,21 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
     return dict(temperature_per_prim=temps, temperature_source=source, thresholds=thresholds, **extra), report
 
 
+def compared(md, kind, path, quant, orders, off):
+    """The calibration to compare with and keep, as basal-serve would apply it with these option orders
+    (server.load_calibration: the model's file for those orders when it ships one; a file fitted on other orders
+    without its thresholds) -> (calibration, its file or None)."""
+    if off or (md is None and not path):
+        return {}, None
+    if orders is None:  # a server that does not report its orders: the file as it is
+        f = calibration_file(md, kind, path, quant)
+        return (json.loads(f.read_text()) if f.exists() else {}), f
+    data, f, why = load_calibration(md, kind, path, quant, orders)
+    if why:
+        print(f"warning: {why}: its thresholds are not compared or kept (as in basal-serve)", file=sys.stderr)
+    return data, f if f.exists() else None
+
+
 def task_rows(units, responses):
     """Labelled task decisions + the served task answers -> (rows {task, group, c: confidence, ok}, failed requests).
     An extract number that does not parse is left out: basal-serve never automates it."""
@@ -1057,6 +1072,11 @@ def refit(a, targets, reference, reference_name):
     rows = [json.loads(x) for x in lines[1:] if x.strip()]
     base_file = Path(a.calibration) if a.calibration else (Path(head["baseline"]) if head.get("baseline") else None)
     baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
+    fo = calibration_orders(baseline)
+    if baseline and fo is not None and head.get("orders") is not None and fo != head["orders"]:  # as basal-serve
+        print(f"warning: {base_file.name} was fitted on {fo} option order(s), the rows on {head['orders']}: its "
+              "thresholds are not compared or kept (as in basal-serve)", file=sys.stderr)
+        baseline = {k: v for k, v in baseline.items() if k not in ("thresholds", "multi", "task_thresholds")}
     cal, report = fit(rows, baseline, targets, a.min_per_type, head["fmt"], a.min_family, reference, a.min_per_set,
                       a.min_blend)
     cal["gates"]["ece_reference"] = reference_name
@@ -1187,13 +1207,7 @@ def main(argv=None):
         md = resolve(a.model, a.revision, metadata_only=True) if a.model else None
         revision = model_identity(a.model, md)[1] if md is not None else None
         fmt = entry.get("prompt_format") or (model_format(md) if md is not None else 1)
-        if a.no_calibration:
-            base_file = None
-        elif a.calibration:
-            base_file = Path(a.calibration)
-        else:
-            base_file = calibration_file(md, kind, None, quant)
-        baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
+        baseline, base_file = compared(md, kind, a.calibration, quant, orders, a.no_calibration)
         settle(asyncio.run(over_http(base + "/v1/systemone", bodies, a.concurrency)) if bodies else [])
         task_responses = []
     else:
@@ -1202,8 +1216,7 @@ def main(argv=None):
         srv = Server(argparse.Namespace(**{**vars(a), "mode": mode, "name": None, "calibration": None,
                                            "no_calibration": True, "log_decisions": None}))
         kind, quant, fmt, orders = srv.kind, a.quant or MODES[mode][1], srv.fmt, srv.orders
-        base_file = None if a.no_calibration else calibration_file(srv.md, srv.kind, a.calibration, quant)
-        baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
+        baseline, base_file = compared(srv.md, srv.kind, a.calibration, quant, orders, a.no_calibration)
         model, revision = a.model, model_identity(a.model, srv.md)[1]
         engine = mode + (f" --quant {a.quant}" if a.quant else "") + (f" --gguf {Path(a.gguf).name}" if a.gguf else "")
         _, task_responses = asyncio.run(two_passes(srv, bodies, task_bodies, a.concurrency, settle))
