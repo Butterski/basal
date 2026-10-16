@@ -115,10 +115,13 @@ def test_fit_tasks_certifies_per_task():
     for i in range(3000):
         c = rng.uniform(0.5, 1.0)
         rows.append(dict(task="classify", group=f"g{i}", c=c, ok=bool(rng.random() < c)))
-    thr, rep = fit_tasks(rows + [dict(task="verify", group="v", c=0.99, ok=True)], [0.05])
+    thr, rep = fit_tasks(rows + [dict(task="verify", group="v", c=0.99, ok=True)], [0.05],
+                         shipped={"classify": {"0.05": 0.6}})
     assert set(thr) == {"classify"} and 0.9 < thr["classify"]["0.05"] < 1.0
     x = rep["classify"]["targets"]["0.05"]
     assert x["fit_upper95"] <= 0.05 and x["cert_error"] < 0.08 and rep["verify"]["targets"]["0.05"]["confidence"] is None
+    old = rep["classify"]["shipped"]["0.05"]["cert"]        # a too low threshold, measured on your CERT decisions
+    assert old["coverage"] > x["cert_coverage"] and old["error"] > 0.05
 
 
 def test_task_only_input_keeps_the_decision_calibration(tmp_path, engine, capsys):

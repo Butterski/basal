@@ -38,7 +38,8 @@ Input (JSONL): one /v1/systemone request per line, every question with its corre
 Method (the one the shipped files were fitted with):
   * the decisions are split by a hash of their group into FIT (70%) and CERT (30%);
   * one temperature per type (choice / noul / score; act counts as its base type) minimises the NLL of the served
-    prediction on FIT; a type with fewer than --min-per-type FIT decisions keeps the shipped temperature;
+    prediction on FIT; a type with fewer than --min-per-type FIT decisions but at least --min-blend (10) gets it
+    blended in log space with the shipped one in proportion n / --min-per-type; with fewer it keeps the shipped one;
   * prompt-format-2 models (basal.json "prompt": 2): the file is calibration file 2 ("prompt": 2), and choice questions
     also get a temperature per option-count bucket (2-10, 11-26, 27-255) fitted the same way where FIT has at least
     --min-per-type decisions in the bucket (otherwise the shipped bucket temperature, else the type temperature);
@@ -93,6 +94,7 @@ PRIMS = ("choice", "noul", "score")
 BUCKETS = (("2-10", 2, 10), ("11-26", 11, 26), ("27-255", 27, 255))  # option-count buckets of calibration file 2
 ALPHA = 0.05        # one-sided 95% bounds
 MIN_ACCEPTED = 50   # a threshold must accept at least this many FIT decisions
+MIN_BLEND = 10      # from this many FIT decisions (below --min-per-type) a temperature is blended, not kept
 RECOMMENDED = 200   # fewer labelled decisions: loose bounds
 T_GRID = (0.25, 8.0)  # temperatures searched (as for the shipped files)
 METHOD = "bound-controlled (one-sided 95% Clopper-Pearson on FIT)"
@@ -564,14 +566,26 @@ def gate(cs, thr):
                 error=e / len(acc) if acc else None, upper95=cp_upper(e, len(acc)) if acc else None)
 
 
-def fit_temps(fit_rows, shipped_T, shipped_B, min_per_type, fmt):
+def blend(T_fit, T_old, n, min_per_type):
+    """A temperature fitted on n < min_per_type decisions, blended in log space with the one it replaces in proportion
+    n / min_per_type (so the full fit takes over continuously at min_per_type) -> (temperature, weight of the fit)."""
+    w = n / min_per_type
+    return float(math.exp(w * math.log(T_fit) + (1 - w) * math.log(T_old))), w
+
+
+def fit_temps(fit_rows, shipped_T, shipped_B, min_per_type, fmt, min_blend=MIN_BLEND):
     """Temperatures per type (and per choice bucket for format 2) fitted on FIT rows where there are enough decisions,
-    else the shipped ones -> (temps, source, buckets, bucket source)."""
+    blended with the shipped ones from min_blend decisions (0: never), else the shipped ones -> (temps, source,
+    buckets, bucket source)."""
     temps, source = {}, {}
     for t in PRIMS:
         rs = [r for r in fit_rows if r["prim"] == t]
         if len(rs) >= min_per_type:
             temps[t], source[t] = fit_temperature(rs), f"fitted on {len(rs)} FIT decisions"
+        elif min_blend and len(rs) >= min_blend:
+            temps[t], w = blend(fit_temperature(rs), shipped_T.get(t, 1.0), len(rs), min_per_type)
+            source[t] = (f"blended: {w:.0%} fitted on {len(rs)} FIT decisions, {1 - w:.0%} "
+                         + ("shipped" if t in shipped_T else "default 1.0"))
         elif t in shipped_T:
             temps[t] = shipped_T[t]
             source[t] = f"shipped ({len(rs)} FIT decisions < {min_per_type})" if rs else "shipped (no decisions)"
@@ -583,6 +597,11 @@ def fit_temps(fit_rows, shipped_T, shipped_B, min_per_type, fmt):
             if len(rs) >= min_per_type:
                 buckets.setdefault("choice", {})[name] = fit_temperature(rs)
                 bsource[name] = f"fitted on {len(rs)} FIT decisions"
+            elif min_blend and len(rs) >= min_blend:
+                buckets.setdefault("choice", {})[name], w = blend(
+                    fit_temperature(rs), old if old is not None else temps.get("choice", 1.0), len(rs), min_per_type)
+                bsource[name] = (f"blended: {w:.0%} fitted on {len(rs)} FIT decisions, {1 - w:.0%} "
+                                 + ("shipped bucket" if old is not None else "type temperature"))
             elif old is not None:
                 buckets.setdefault("choice", {})[name] = old
                 bsource[name] = f"shipped ({len(rs)} FIT decisions < {min_per_type})"
@@ -591,7 +610,8 @@ def fit_temps(fit_rows, shipped_T, shipped_B, min_per_type, fmt):
     return temps, source, buckets, bsource
 
 
-def lofo(fit_rows, cert_rows, shipped_T, shipped_B, min_per_type, fmt, min_family=30, reference=None, draws=50, seed=0):
+def lofo(fit_rows, cert_rows, shipped_T, shipped_B, min_per_type, fmt, min_family=30, reference=None, draws=50, seed=0,
+         min_blend=MIN_BLEND):
     """Leave-one-family-out ECE per type: for every family the temperatures are fitted on the FIT decisions of the
     other families and applied to its CERT decisions. mean / max over the families with >= min_family CERT decisions of
     the type, mean_floor (the mean a perfectly calibrated predictor with the same confidences would show, `draws`
@@ -608,7 +628,7 @@ def lofo(fit_rows, cert_rows, shipped_T, shipped_B, min_per_type, fmt, min_famil
         if not held:
             continue
         temps, _, buckets, _ = fit_temps([r for r in fit_rows if fam(r) != f], shipped_T, shipped_B,
-                                         min_per_type, fmt)
+                                         min_per_type, fmt, min_blend)
         for t in types:
             cs = served([r for r in held if r["prim"] == t], temps, buckets)
             pooled[t] += cs
@@ -712,7 +732,8 @@ def type_threshold(entry, q_type):
     return ((((entry or {}).get("per_type") or {}).get(q_type)) or {}).get("confidence")
 
 
-def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, reference=None, min_per_set=30):
+def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, reference=None, min_per_set=30,
+        min_blend=MIN_BLEND):
     """Rows with uncalibrated probabilities -> (calibration dict, report for the table). fmt 2: calibration file 2,
     with the choice temperatures per option-count bucket. Multi rows fit the fallback_threshold of their label set."""
     sets = [r for r in rows if r["prim"] == "multi"]
@@ -721,7 +742,7 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
     cert_rows = [r for r in rows if is_cert(r["group"])]
     shipped_T = baseline.get("temperature_per_prim", {})
     shipped_B = baseline.get("temperature_per_bucket", {}) if fmt == 2 else {}
-    temps, source, buckets, bsource = fit_temps(fit_rows, shipped_T, shipped_B, min_per_type, fmt)
+    temps, source, buckets, bsource = fit_temps(fit_rows, shipped_T, shipped_B, min_per_type, fmt, min_blend)
     cs_fit, cs_cert = served(fit_rows, temps, buckets), served(cert_rows, temps, buckets)
     shipped_cert = served(cert_rows, shipped_T, shipped_B)
     thresholds, report = {}, dict(types={}, targets={}, n_fit=len(fit_rows), n_cert=len(cert_rows))
@@ -754,7 +775,8 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
                                   accuracy=float(np.mean([ok for _, ok in served(rs, {})])),
                                   T_shipped=shipped_T.get(t), T=temps.get(t), source=source.get(t, "default 1.0"),
                                   ece_shipped=ece(served(cert, shipped_T)), ece=ece(served(cert, temps)))
-    gates = dict(ece_lofo=lofo(fit_rows, cert_rows, shipped_T, shipped_B, min_per_type, fmt, min_family, reference),
+    gates = dict(ece_lofo=lofo(fit_rows, cert_rows, shipped_T, shipped_B, min_per_type, fmt, min_family, reference,
+                               min_blend=min_blend),
                  automated_at=automated, automated_error=automated_error, automated_at_pooled=automated_pooled,
                  min_family=min_family)
     report["gates"] = gates
@@ -805,9 +827,10 @@ def task_rows(units, responses):
     return rows, list(failed.values())
 
 
-def fit_tasks(rows, targets):
+def fit_tasks(rows, targets, shipped=None):
     """Task rows -> ({task: {target: threshold}} for the certified ones, report {task: ...}): the bound of the decision
-    types on each task's FIT decisions, with coverage, error and bound on its CERT decisions."""
+    types on each task's FIT decisions, with coverage, error and bound on its CERT decisions; `shipped` (the task
+    thresholds of the compared file, when the answers were served with its temperatures) is measured on CERT too."""
     thresholds, report = {}, {}
     for t in TASKS:
         rs = [r for r in rows if r["task"] == t]
@@ -818,6 +841,9 @@ def fit_tasks(rows, targets):
         e = dict(n=len(rs), n_fit=len(cf), n_cert=len(cc), accuracy=float(np.mean([r["ok"] for r in rs])),
                  method=METHOD, targets={})
         for risk in targets:
+            old = ((shipped or {}).get(t) or {}).get(str(float(risk)))
+            if old is not None:
+                e.setdefault("shipped", {})[str(float(risk))] = dict(confidence=old, cert=gate(cc, old))
             thr = threshold(cf, risk) if cf else None
             if thr is None:
                 e["targets"][str(float(risk))] = dict(
@@ -862,7 +888,8 @@ def table(report):
     lines = ["", f"{'type':<7}{'n':>6}{'FIT':>6}{'CERT':>6}{'accuracy':>10}   {'temperature shipped -> fitted':<32}"
                  f"ECE on CERT shipped -> fitted"]
     for t, r in report["types"].items():
-        temp = f"{num(r['T_shipped'])} -> {num(r['T'])}" + ("" if r["source"].startswith("fitted") else " (kept)")
+        temp = f"{num(r['T_shipped'])} -> {num(r['T'])}" + (
+            "" if r["source"].startswith("fitted") else " (blended)" if r["source"].startswith("blended") else " (kept)")
         lines.append(f"{t:<7}{r['n']:>6}{r['n_fit']:>6}{r['n_cert']:>6}{r['accuracy']:>10.3f}   {temp:<32}"
                      f"{num(r['ece_shipped'])} -> {num(r['ece'])}")
     for name, r in (report.get("buckets") or {}).items():  # calibration file 2: choice per option-count bucket
@@ -931,6 +958,10 @@ def task_table(report):
             else:
                 lines.append(left + f"{float(risk):<10g}{x['confidence']:>10.4f}{pct(x['cert_coverage']):>11}"
                                     f"{pct(x['cert_error']):>8}{pct(x['cert_upper95']):>8}")
+        for risk, x in (e.get("shipped") or {}).items():
+            g = x["cert"]
+            lines.append(f"{'':<9}compared file's threshold {float(risk):g}: {x['confidence']:.4f}, automated "
+                         f"{pct(g['coverage'])}, error {pct(g['error'])}, bound {pct(g['upper95'])} on CERT")
     return "\n".join(lines)
 
 
@@ -1005,7 +1036,8 @@ def refit(a, targets, reference, reference_name):
     rows = [json.loads(x) for x in lines[1:] if x.strip()]
     base_file = Path(a.calibration) if a.calibration else (Path(head["baseline"]) if head.get("baseline") else None)
     baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
-    cal, report = fit(rows, baseline, targets, a.min_per_type, head["fmt"], a.min_family, reference, a.min_per_set)
+    cal, report = fit(rows, baseline, targets, a.min_per_type, head["fmt"], a.min_family, reference, a.min_per_set,
+                      a.min_blend)
     cal["gates"]["ece_reference"] = reference_name
     cal["engine"] = engine_name(head["kind"], head["quant"])
     cal["fitted_on"] = dict(data=head["data"], decisions=sum(r["prim"] != "multi" for r in rows),
@@ -1046,6 +1078,10 @@ def parser():
     ap.add_argument("--targets", default="0.01,0.05", help="max_error targets (comma-separated)")
     ap.add_argument("--min-per-type", dest="min_per_type", type=int, default=50,
                     help="FIT decisions needed to fit a type's temperature")
+    ap.add_argument("--min-blend", dest="min_blend", type=int, default=MIN_BLEND,
+                    help="a type (or bucket) with fewer FIT decisions than --min-per-type but at least this many gets "
+                         "the fitted temperature blended with the shipped one in proportion n / --min-per-type; 0 "
+                         "keeps the shipped one")
     ap.add_argument("--min-family", dest="min_family", type=int, default=30,
                     help="CERT decisions of a type a family needs for its leave-one-family-out ECE")
     ap.add_argument("--min-per-set", dest="min_per_set", type=int, default=30,
@@ -1105,7 +1141,8 @@ def main(argv=None):
         if decisions and not rows:
             raise SystemExit("no decisions to fit")
         if rows:
-            cal, report = fit(rows, baseline, targets, a.min_per_type, fmt, a.min_family, reference, a.min_per_set)
+            cal, report = fit(rows, baseline, targets, a.min_per_type, fmt, a.min_family, reference, a.min_per_set,
+                              a.min_blend)
             cal["gates"]["ece_reference"] = reference_name
         else:  # task questions only: the temperatures and thresholds of the compared file stay as they are
             cal, report = {k: v for k, v in baseline.items() if k not in KEPT_OUT}, None
@@ -1156,8 +1193,9 @@ def main(argv=None):
               file=sys.stderr)
     if units and not trows:
         raise SystemExit("no task decisions to fit")
-    task_thr, task_report = fit_tasks(trows, targets) if trows else ({}, {})
     shipped_tasks = baseline.get("task_thresholds") or {}
+    # the compared file's task thresholds are measured on your data when the answers were served with its temperatures
+    task_thr, task_report = fit_tasks(trows, targets, None if rows else shipped_tasks) if trows else ({}, {})
     # a shipped task threshold holds for the shipped temperatures: kept only when this file keeps them too
     dropped = sorted(t for t in shipped_tasks if t not in task_report) if rows else []
     kept = {} if rows else {t: v for t, v in shipped_tasks.items() if t not in task_report}
