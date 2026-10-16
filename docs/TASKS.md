@@ -159,6 +159,10 @@ documents; not CLINC150, BANKING77 or RAGTruth). Same sets, same engine:
 | invoices (fields correct) | 90.1% | 91.4% |
 | documents in layouts never used in training (fields correct) | 84.8% | 89.3% |
 
+An overlap check found 27 test items (12 VitaminC, 15 QASPER) that share a 13-word span with its training rows; without
+them the gains are +4.2 and +2.7 points (paired 95% intervals +2.1 to +6.2 and +0.8 to +4.9), and the mean of the six
+sets is still 85.1 (1.0-max: 83.5).
+
 It is slightly behind 1.0-max on general decisions (Werdykt 0.821 vs 0.823; ContractNLI −13.7 points, where it leans
 to "not stated"), so 1.0-max stays the default; its card has the full comparison.
 
