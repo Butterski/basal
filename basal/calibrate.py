@@ -85,8 +85,8 @@ from . import __version__
 from . import tasks as task_types
 from .engine import resolve
 from .prompt import max_options, model_format
-from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, default_mode,
-                     model_identity, temper, temperature, to_items)
+from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, certified,
+                     default_mode, model_identity, temper, temperature, to_items)
 from .sets import label_set_id
 from .sets import select as select_set
 
@@ -726,6 +726,19 @@ def effective_gate(rows, temps, buckets, entry):
     return dict(coverage=len(acc) / len(rows), error=(len(acc) - sum(acc)) / len(acc) if acc else None)
 
 
+def served_gate(rows, temps, buckets, cal, risk):
+    """Share and error of the decisions basal-serve automates at max_error `risk` with the calibration `cal` (its
+    temperatures given as temps / buckets): each type at the threshold the server applies to it (server.certified)."""
+    if not rows:
+        return dict(coverage=None, error=None)
+    acc = []
+    for r, (c, ok) in zip(rows, served(rows, temps, buckets)):
+        thr = certified(cal, risk, r["prim"])
+        if thr is not None and c >= thr:
+            acc.append(ok)
+    return dict(coverage=len(acc) / len(rows), error=(len(acc) - sum(acc)) / len(acc) if acc else None)
+
+
 def type_threshold(entry, q_type):
     """The threshold basal-serve applies to a question type: its own certified one, else None (the pooled one is
     never applied)."""
@@ -745,7 +758,7 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
     temps, source, buckets, bsource = fit_temps(fit_rows, shipped_T, shipped_B, min_per_type, fmt, min_blend)
     cs_fit, cs_cert = served(fit_rows, temps, buckets), served(cert_rows, temps, buckets)
     shipped_cert = served(cert_rows, shipped_T, shipped_B)
-    thresholds, report = {}, dict(types={}, targets={}, n_fit=len(fit_rows), n_cert=len(cert_rows))
+    thresholds, report = {}, dict(types={}, targets={}, n_fit=len(fit_rows), n_cert=len(cert_rows), compared={})
     automated, automated_pooled, automated_error = {}, {}, {}
     for risk in targets:
         thr = threshold(cs_fit, risk)
@@ -763,6 +776,8 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
         automated[str(float(risk))] = eff["coverage"]
         automated_error[str(float(risk))] = eff["error"]
         automated_pooled[str(float(risk))] = (g_cert["coverage"] if thr is not None else 0.0) if cs_cert else None
+        if (baseline.get("thresholds") or {}).get(str(float(risk))):  # the compared file as basal-serve applies it
+            report["compared"][str(float(risk))] = served_gate(cert_rows, shipped_T, shipped_B, baseline, risk)
         old = (baseline.get("thresholds") or {}).get(str(float(risk)), {}).get("confidence")
         report["targets"][risk] = dict(shipped=old, shipped_cert=gate(shipped_cert, old) if old is not None else None,
                                        fitted=entry, fitted_cert=g_cert)
@@ -908,6 +923,8 @@ def table(report):
             g = r["fitted_cert"]
             lines.append(left + f"{f['confidence']:>17.4f}{pct(g['coverage']):>10}{pct(g['error']):>8}"
                                 f"{pct(g['upper95']):>8}")
+    lines.append("(one threshold pooled over the types, informational: basal-serve applies each type's own, as in "
+                 "\"automated on CERT\" below)")
     gates = report.get("gates") or {}
     if gates.get("ece_lofo"):
         lines += ["", f"LOFO ECE on CERT   {'families':>9}{'mean':>8}{'floor':>8}   {'max (family)':<26}{'pooled':>8}"
@@ -921,10 +938,14 @@ def table(report):
             lines.append(f"{t:<18}{g['n_families']:>9}{g['mean']:>8.3f}{g['mean_floor']:>8.3f}   {worst:<26}"
                          f"{num(g['pooled']):>8}{num(g['reference']):>11}{mark}")
     if gates.get("automated_at"):
-        lines += ["", f"automated on CERT   {'per-type thresholds':>20}{'error':>8}   {'pooled (not applied)':>20}"]
+        compared = report.get("compared") or {}
+        lines += ["", f"automated on CERT   {'per-type thresholds':>20}{'error':>8}   {'pooled (not applied)':>20}"
+                      + ("   compared file, as served" if compared else "")]
         for k, v in gates["automated_at"].items():
+            c = compared.get(k)
             lines.append(f"max_error {float(k):<9g} {pct(v):>20}{pct(gates['automated_error'].get(k)):>8}   "
-                         f"{pct(gates['automated_at_pooled'].get(k)):>20}")
+                         f"{pct(gates['automated_at_pooled'].get(k)):>20}"
+                         + (f"   {pct(c['coverage'])} at {pct(c['error'])} error" if c else ""))
         for risk, r in report["targets"].items():
             per = r["fitted"].get("per_type") or {}
             lines.append(f"  {risk:g} per type: " + ", ".join(

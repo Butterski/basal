@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import basal.server as server_module
-from basal.calibrate import field_correct, fit_tasks, main, read, task_rows, task_units
+from basal.calibrate import field_correct, fit, fit_tasks, is_cert, main, read, served, task_rows, task_units
 from basal.server import Server, calibration_mismatch, model_identity, parser, temper
 from tests.test_calibrate import StubBackend, synthetic
 from tests.test_server import FakeServer
@@ -226,3 +226,21 @@ def test_extract_fields_report_automated():
     assert x["method"]["automated"] == {"0.05": x["method"]["confidence"] >= 0.9}
     assert x["tags"]["automated"] == {"0.05": None}
     assert x["count"]["value"] is None and x["count"]["automated"] == {"0.05": False}  # "two" does not parse
+
+
+def test_the_compared_file_is_measured_as_served():
+    """The report's compared column uses the threshold basal-serve applies to each type (its own), not the pooled one."""
+    rng = np.random.default_rng(3)
+    rows = []
+    for i in range(2000):
+        prim = ("choice", "noul")[i % 2]
+        q = rng.uniform(0.5, 1.0)
+        rows.append(dict(prim=prim, p=[q, 1 - q], gold=0 if rng.random() < q else 1, group=f"g{i}", name="x"))
+    base = {"prompt": 2, "temperature_per_prim": {"choice": 1.0, "noul": 1.0},
+            "thresholds": {"0.05": {"confidence": 0.5, "per_type": {"choice": {"confidence": 0.97}}}}}
+    _, report = fit(rows, base, [0.05], fmt=2)
+    cert = [r for r in rows if is_cert(r["group"])]
+    want = [ok for r, (c, ok) in zip(cert, served(cert, {"choice": 1.0, "noul": 1.0})) if r["prim"] == "choice" and c >= 0.97]
+    got = report["compared"]["0.05"]
+    assert abs(got["coverage"] - len(want) / len(cert)) < 1e-12           # noul has no threshold of its own: deferred
+    assert abs(got["error"] - (len(want) - sum(want)) / len(want)) < 1e-12
