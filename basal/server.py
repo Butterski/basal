@@ -469,10 +469,11 @@ def orders_for(orders, k):
     return 1
 
 
-def models_payload(name, mode, policies, temperatures=None, prompt_format=None, orders=None, media=()):
+def models_payload(name, mode, policies, temperatures=None, prompt_format=None, orders=None, media=(),
+                   calibration_warning=None):
     """GET /v1/models in the official ModelMetadataList shape, plus the serving mode, early-exit levels, the
     temperatures in use ({} = uncalibrated probabilities, what basal-calibrate needs from a running server), the
-    model's prompt format and the option orders served."""
+    model's prompt format, the option orders served and why the --calibration file may not belong to the model."""
     entry = {"name": name, "release_date": RELEASE_DATE,
              "description": "basal typed-decision model (choice / noul / score / act / multi / tool), Polish and "
                             "English",
@@ -483,6 +484,8 @@ def models_payload(name, mode, policies, temperatures=None, prompt_format=None, 
         entry["media"] = list(media)
     if orders is not None:
         entry["orders"] = orders
+    if calibration_warning:
+        entry["calibration_warning"] = calibration_warning
     return {"models": [entry]}
 
 
@@ -493,6 +496,30 @@ def calibration_orders(cal):
     fitted = cal.get("fitted_on")
     o = fitted.get("orders") if isinstance(fitted, dict) and fitted.get("orders") is not None else cal.get("orders")
     return None if o is None else o if o == "auto" or str(o).startswith("2le") else int(o)
+
+
+def model_identity(name, md):
+    """(model, revision) of a served model: the repo id and commit of a Hugging Face cache snapshot, else the name as
+    given and no revision."""
+    p = Path(md) if md is not None else None
+    if p is not None and p.parent.name == "snapshots" and p.parent.parent.name.startswith("models--"):
+        return p.parent.parent.name[len("models--"):].replace("--", "/"), p.name
+    return str(name), None
+
+
+def calibration_mismatch(cal, name, md):
+    """Why a file written by basal-calibrate for another model, or for another revision of this one, does not belong
+    to the served model; None when it does or the file does not say (files that ship with a model)."""
+    fitted = cal.get("fitted_on")
+    if not isinstance(fitted, dict) or not fitted.get("model"):
+        return None
+    model, rev = model_identity(name, md)
+    key = lambda s: str(s).rstrip("/").split("/")[-1].lower()  # a repo id, a local copy or a served name
+    if key(fitted["model"]) != key(model):
+        return f"it was fitted on {fitted['model']}, the served model is {model}"
+    if fitted.get("revision") and rev and fitted["revision"] != rev:
+        return f"it was fitted on revision {fitted['revision'][:12]} of {model}, the served revision is {rev[:12]}"
+    return None
 
 
 def load_calibration(md, kind, path, quant, orders, off=False):
@@ -627,6 +654,13 @@ class Server:
         self.cal, cal, self.cal_unvalidated = load_calibration(md, kind, a.calibration, quant, self.orders,
                                                                 a.no_calibration)
         check_calibration(self.cal, self.fmt, cal)
+        self.cal_mismatch = calibration_mismatch(self.cal, a.model, md) if a.calibration and not a.no_calibration \
+            else None  # a file of your own (--calibration); the files in the model directory belong to it
+        if self.cal_mismatch:
+            if getattr(a, "strict_calibration", False):
+                raise SystemExit(f"{cal}: {self.cal_mismatch} (--strict-calibration)")
+            print(f"basal: warning: {cal.name}: {self.cal_mismatch}; its thresholds were certified on that model "
+                  "(refit with basal-calibrate, or --strict-calibration to refuse such a file)", flush=True)
         if self.cal_unvalidated:
             print(f"basal: warning: {self.cal_unvalidated}; its answers are marked \"calibration\": \"unvalidated\" "
                   "and max_error defers (fit a file for these orders with basal-calibrate, or serve with the file's "
@@ -1288,6 +1322,9 @@ def parser():
     ap.add_argument("--calibration", default=None,
                     help="calibration file (default: <model>/CALIBRATION.<engine>.json if shipped, else "
                          "CALIBRATION.json; fit your own with basal-calibrate)")
+    ap.add_argument("--strict-calibration", dest="strict_calibration", action="store_true",
+                    help="refuse to start when the --calibration file was fitted on another model or revision "
+                         "(default: a warning)")
     ap.add_argument("--log-decisions", dest="log_decisions", default=None, help="append a propensity log (JSONL)")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
@@ -1335,7 +1372,8 @@ def main():
 
     async def models(_):
         return JSONResponse(models_payload(srv.name, a.mode, getattr(srv.backend, "policies", {}), srv.temps,
-                                           srv.fmt, srv.orders, getattr(srv.backend, "media_kinds", ())))
+                                           srv.fmt, srv.orders, getattr(srv.backend, "media_kinds", ()),
+                                           getattr(srv, "cal_mismatch", None)))
 
     async def health(_):
         return JSONResponse({"status": "ok"})

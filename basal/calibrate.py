@@ -27,6 +27,13 @@ Input (JSONL): one /v1/systemone request per line, every question with its corre
           the labels, ask each one as a noul question with its gold).
   The simple items of basal-run and basal-bench ({"state", "question", "options", "type", "gold": <index>}) are
   accepted too, e.g. basal/examples/questions.jsonl.
+  tasks   classify (single label; gold = a label key, "none" with "none": true), verify (gold = {claim key: verdict},
+          or a list in the order of the claims; supported / contradicted / not_stated, binary: supported /
+          not_supported; null = not labelled) and extract (gold = the field values nested as in the schema; null = not
+          stated; a field left out is not labelled; arrays of enum are not certified) certify the task_thresholds of
+          their `automated` flag. They need the engine in process (not --url): the thresholds are certified on the
+          answers as served with the fitted temperatures. A file with task questions only keeps the decision
+          calibration it compares with and adds the task thresholds.
 
 Method (the one the shipped files were fitted with):
   * the decisions are split by a hash of their group into FIT (70%) and CERT (30%);
@@ -51,7 +58,14 @@ Method (the one the shipped files were fitted with):
   * multi: per label set (its labels and fallback; id = basal.sets.label_set_id) the fallback_threshold with the best
     mean IoU on FIT over a log grid (null = the default rule wins), with IoU, empty-set accuracy and false-empty rate
     on CERT next to the default. basal-serve uses it for a request with the same label set and fallback and no
-    fallback_threshold of its own.
+    fallback_threshold of its own;
+  * tasks: per task (classify, verify, extract; every claim and field is one decision) the certified threshold of each
+    target error, by the same bound on FIT, with its coverage, error and bound on CERT ("task_thresholds" and
+    "task_gates"). The task thresholds a shipped file holds are kept only when the temperatures are (no decision
+    questions in the input); otherwise a task without labelled questions has none and its answers report
+    automated: null.
+  * fitted_on names the model (and its Hugging Face revision): basal-serve warns when a --calibration file was fitted
+    on another model or revision, and refuses it with --strict-calibration.
 """
 import argparse
 import asyncio
@@ -67,10 +81,11 @@ import numpy as np
 import torch
 
 from . import __version__
+from . import tasks as task_types
 from .engine import resolve
 from .prompt import max_options, model_format
-from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, default_mode, temper,
-                     temperature, to_items)
+from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, default_mode,
+                     model_identity, temper, temperature, to_items)
 from .sets import label_set_id
 from .sets import select as select_set
 
@@ -84,6 +99,10 @@ METHOD = "bound-controlled (one-sided 95% Clopper-Pearson on FIT)"
 POOLED_NOTE = ("informational: \"confidence\" here is one threshold pooled over all types; basal-serve applies only "
                "per_type[type].confidence and defers a type without one")
 YES, NO = {"yes", "true", "tak"}, {"no", "false", "nie"}
+TASKS = ("classify", "verify", "extract")  # the tasks with an `automated` flag (compress has none)
+VERDICTS = ("supported", "contradicted", "not_stated")
+# what a file with task questions only does not take over from the file it keeps (written anew, or merged)
+KEPT_OUT = ("fitted_on", "certified_on", "baseline", "engine", "task_thresholds", "task_gates", "decision_calibration")
 # mean leave-one-family-out ECE of basal-1.5 (4.5B) per type on our calibration split (--reference basal-1.5)
 REFERENCE = {"basal-1.5": {"choice": 0.082, "noul": 0.062, "score": 0.109}}
 # fallback_threshold candidates of the multi fit (None: the default rule), 0.001-0.81 log-spaced and 0.05-0.95
@@ -151,9 +170,117 @@ def simple(rec):
     return dict(body, **{k: rec[k] for k in ("id", "group", "family") if k in rec})
 
 
+def _at(obj, path):
+    """(found, value) at a dotted field path of a nested gold object."""
+    for k in path.split("."):
+        if not isinstance(obj, dict) or k not in obj:
+            return False, None
+        obj = obj[k]
+    return True, obj
+
+
+def field_gold(path, kind, spec, v):
+    """The gold of an extract field -> the value basal-serve would return for it (None = not stated)."""
+    if v is None:
+        return None
+    if kind == "enum":
+        vals = [c for c, _ in task_types._consts(spec)]
+        hit = [c for c in vals if c == v or str(c) == str(v)]
+        if not hit:
+            raise ValueError(f"field {path!r}: gold {v!r} is not one of its values {vals[:10]}")
+        return hit[0]
+    if kind == "boolean":
+        s = str(v).strip().lower()
+        if s in YES or s in NO:
+            return s in YES
+        raise ValueError(f"field {path!r}: gold {v!r} is not true / false")
+    if kind in ("number", "integer"):
+        x = v if isinstance(v, (int, float)) and not isinstance(v, bool) else task_types.parse_number(str(v))
+        if x is None:
+            raise ValueError(f"field {path!r}: gold {v!r} is not a number")
+        return x
+    if isinstance(v, (dict, list)):
+        raise ValueError(f"field {path!r}: gold must be the text of the value")
+    return str(v)
+
+
+def field_correct(kind, value, gold):
+    """Whether an extract field's value is its gold: numbers by value, text up to spacing and case."""
+    if value is None or gold is None:
+        return value is None and gold is None
+    if kind in ("number", "integer"):
+        return abs(float(value) - float(gold)) <= 1e-9 * max(1.0, abs(float(gold)))
+    if kind == "string":
+        norm = lambda s: " ".join(str(s).split()).casefold()
+        return norm(value) == norm(gold)
+    return value == gold
+
+
+def task_units(name, q, gold, state):
+    """A labelled task question -> its labelled decisions [(part, gold)]: classify one (part None), verify one per
+    labelled claim, extract one per labelled field. The question must expand as basal-serve expands it."""
+    t = q["type"]
+    if t == "compress":
+        raise ValueError("compress has no automated flag, so there is nothing to certify: leave it out")
+    task_types.expand({"state": state, "questions": {name: q}})  # the errors basal-serve would give
+    if t == "classify":
+        if q.get("multi_label"):
+            raise ValueError("multi-label classify has no automated flag (it reports set_confidence): ask it "
+                             "single-label, or each label as a noul question")
+        keys = list(task_types._labels(q.get("labels") or q.get("criteria"), name)) + (["none"] if q.get("none") else [])
+        if isinstance(gold, (dict, list)) or str(gold) not in keys:
+            raise ValueError(f"gold {gold!r} is not a label (keys: {', '.join(keys[:10])})")
+        return [(None, str(gold))]
+    if t == "verify":
+        claims = q["claims"]
+        keys = [str(i) for i in range(len(claims))] if isinstance(claims, list) else [str(k) for k in claims]
+        if isinstance(gold, list):
+            if len(gold) != len(keys):
+                raise ValueError(f"gold has {len(gold)} verdicts for {len(keys)} claims")
+            gold = dict(zip(keys, gold))
+        if not isinstance(gold, dict):
+            raise ValueError("gold of verify: {claim key: verdict}, or a list in the order of the claims "
+                             "(null = not labelled)")
+        allowed = ("supported", "not_supported") if q.get("binary") else VERDICTS
+        out = []
+        for k, v in gold.items():
+            if str(k) not in keys:
+                raise ValueError(f"gold names claim {k!r}, which is not one of {keys[:10]}")
+            if v is None:
+                continue
+            if isinstance(v, bool) and q.get("binary"):
+                v = "supported" if v else "not_supported"
+            v = str(v).strip().lower().replace(" ", "_").replace("-", "_")
+            if v not in allowed:
+                raise ValueError(f"claim {k!r}: verdict {v!r} is not one of {', '.join(allowed)}")
+            out.append((str(k), v))
+        if not out:
+            raise ValueError("no claim has a verdict")
+        return out
+    if not isinstance(gold, dict):
+        raise ValueError("gold of extract: the field values nested as in the schema (null = not stated; a field left "
+                         "out is not labelled)")
+    out = []
+    for path, kind, spec in task_types.leaves(q.get("schema") or {}):
+        found, v = _at(gold, path)
+        if found and kind != "enum_list":  # a label set has no certified threshold
+            out.append((path, (kind, field_gold(path, kind, spec, v))))
+    if not out:
+        raise ValueError("gold labels no field (enum, boolean, string, number or integer) of the schema")
+    return out
+
+
 def load(path):
-    """Labelled JSONL -> (requests to send, decisions). Raises InputError listing every problem with its line."""
-    errors, bodies, decisions = [], [], []
+    """Labelled JSONL -> (requests to send, decisions): the decision questions only (read() also returns the task
+    questions). Raises InputError listing every problem with its line."""
+    bodies, decisions, _, _ = read(path)
+    return bodies, decisions
+
+
+def read(path):
+    """Labelled JSONL -> (decision requests, decisions, task requests, labelled task decisions). Raises InputError
+    listing every problem with its line."""
+    errors, bodies, decisions, task_bodies, units = [], [], [], [], []
     for n, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
@@ -177,19 +304,35 @@ def load(path):
             errors.append(f'{where}: facts must be "off" or "auto"')
             continue
         body = {k: v for k, v in rec.items() if k not in ("id", "group", "family")}
-        body["questions"] = {}
+        body["questions"], task_body = {}, dict(body, questions={})
         for name, q in rec["questions"].items():
             at = f"{where}, question {name!r}"
             if not isinstance(q, dict):
                 errors.append(f"{at}: not an object")
                 continue
             t = q.get("type", "choice")
+            if t in task_types.TASKS:  # classify / verify / extract: their task thresholds (in process, served)
+                if "gold" not in q:
+                    errors.append(f'{at}: no "gold" answer')
+                    continue
+                clean = {k: v for k, v in q.items() if k not in ("gold", "group", "family")}
+                try:
+                    labelled = task_units(name, clean, q["gold"], rec["state"])
+                except (ValueError, KeyError, TypeError) as e:
+                    errors.append(f"{at}: {str(e).removeprefix(f'question {name!r}: ')}")
+                    continue
+                task_body["questions"][name] = clean
+                group = str(q.get("group", rec.get("group", rec.get("id", n))))
+                units += [dict(line=n, req=len(task_bodies), name=name, task=t, part=part, gold=g, group=group)
+                          for part, g in labelled]
+                continue
             if t == "multi" and q.get("fallback") is None:
                 errors.append(f'{at}: multi needs a "fallback" label (its fallback_threshold is fitted); to calibrate '
                               "the labels, ask each one as a noul question with its own gold")
                 continue
             if t not in ("choice", "noul", "score", "act", "multi"):
-                errors.append(f"{at}: unknown type {t!r} (choice, noul, score, act or multi)")
+                errors.append(f"{at}: unknown type {t!r} (choice, noul, score, act, multi, classify, verify or "
+                              "extract)")
                 continue
             if "gold" not in q:
                 errors.append(f'{at}: no "gold" answer')
@@ -215,12 +358,14 @@ def load(path):
             decisions.append(d)
         if body["questions"]:
             bodies.append(body)
+        if task_body["questions"]:
+            task_bodies.append(task_body)
     if errors:
         more = f"\n  ... and {len(errors) - 20} more" if len(errors) > 20 else ""
         raise InputError(f"{path}: {len(errors)} problem(s)\n  " + "\n  ".join(errors[:20]) + more)
-    if not decisions:
+    if not decisions and not units:
         raise InputError(f"{path}: no labelled questions")
-    return bodies, decisions
+    return bodies, decisions, task_bodies, units
 
 
 # -- probabilities ---------------------------------------------------------------------------------------------------
@@ -246,6 +391,23 @@ async def in_process(srv, bodies, concurrency):
     worker = asyncio.get_running_loop().create_task(srv.worker())
     try:
         return await collect(srv.decide, bodies, concurrency)
+    finally:
+        worker.cancel()
+
+
+async def two_passes(srv, bodies, task_bodies, concurrency, settle):
+    """In process: the decision requests without calibration, then settle(responses) -> the calibration to serve, and
+    the task requests served with it (their thresholds are certified on the answers as served). One event loop for
+    both: the server's queue belongs to it."""
+    worker = asyncio.get_running_loop().create_task(srv.worker())
+    try:
+        responses = await collect(srv.decide, bodies, concurrency) if bodies else []
+        cal = settle(responses)
+        if not task_bodies:
+            return responses, []
+        print(f"  task requests, served with the {'fitted' if bodies else 'kept'} calibration", file=sys.stderr)
+        srv.cal, srv.temps = cal, cal.get("temperature_per_prim", {})
+        return responses, await collect(srv.decide, task_bodies, concurrency)
     finally:
         worker.cancel()
 
@@ -618,6 +780,59 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
     return dict(temperature_per_prim=temps, temperature_source=source, thresholds=thresholds, **extra), report
 
 
+def task_rows(units, responses):
+    """Labelled task decisions + the served task answers -> (rows {task, group, c: confidence, ok}, failed requests).
+    An extract number that does not parse is left out: basal-serve never automates it."""
+    rows, failed = [], {}
+    for u in units:
+        r = responses[u["req"]]
+        if isinstance(r, Exception):
+            failed[u["req"]] = f"line {u['line']}: {r}"
+            continue
+        a = r["answers"][u["name"]]
+        if u["task"] == "classify":
+            conf, ok = a["confidence"], a["label"] == u["gold"]
+        elif u["task"] == "verify":
+            c = a["claims"][u["part"]]
+            conf, ok = c["confidence"], c["verdict"] == u["gold"]
+        else:
+            f = a["fields"][u["part"]]
+            if "error" in f:
+                continue
+            kind, gold = u["gold"]
+            conf, ok = f["confidence"], field_correct(kind, f["value"], gold)
+        rows.append(dict(task=u["task"], group=u["group"], c=float(conf), ok=bool(ok)))
+    return rows, list(failed.values())
+
+
+def fit_tasks(rows, targets):
+    """Task rows -> ({task: {target: threshold}} for the certified ones, report {task: ...}): the bound of the decision
+    types on each task's FIT decisions, with coverage, error and bound on its CERT decisions."""
+    thresholds, report = {}, {}
+    for t in TASKS:
+        rs = [r for r in rows if r["task"] == t]
+        if not rs:
+            continue
+        cf = [(r["c"], r["ok"]) for r in rs if not is_cert(r["group"])]
+        cc = [(r["c"], r["ok"]) for r in rs if is_cert(r["group"])]
+        e = dict(n=len(rs), n_fit=len(cf), n_cert=len(cc), accuracy=float(np.mean([r["ok"] for r in rs])),
+                 method=METHOD, targets={})
+        for risk in targets:
+            thr = threshold(cf, risk) if cf else None
+            if thr is None:
+                e["targets"][str(float(risk))] = dict(
+                    confidence=None, reason=no_threshold_reason(cf, risk) if cf else "no FIT decisions")
+                continue
+            g_fit, g_cert = gate(cf, thr), gate(cc, thr)
+            e["targets"][str(float(risk))] = dict(
+                confidence=thr, fit_coverage=g_fit["coverage"], fit_error=g_fit["error"], fit_upper95=g_fit["upper95"],
+                cert_coverage=g_cert["coverage"], cert_error=g_cert["error"], cert_upper95=g_cert["upper95"],
+                cert_accepted=g_cert["accepted"])
+            thresholds.setdefault(t, {})[str(float(risk))] = thr
+        report[t] = e
+    return thresholds, report
+
+
 def reference_values(ref):
     """--reference: a built-in name (basal-1.5) or a calibration file with gates.ece_lofo -> ({type: mean}, label)."""
     if ref is None:
@@ -704,6 +919,39 @@ def table(report):
     return "\n".join(lines)
 
 
+def task_table(report):
+    lines = ["", f"{'task':<9}{'n':>6}{'FIT':>6}{'CERT':>6}{'accuracy':>10}   {'max_error':<10}{'threshold':>10}"
+                 f"{'automated':>11}{'error':>8}{'bound':>8}   (automated share, error and bound on CERT)"]
+    for t, e in report.items():
+        head = f"{t:<9}{e['n']:>6}{e['n_fit']:>6}{e['n_cert']:>6}{e['accuracy']:>10.3f}   "
+        for i, (risk, x) in enumerate(e["targets"].items()):
+            left = head if i == 0 else " " * len(head)
+            if x["confidence"] is None:
+                lines.append(left + f"{float(risk):<10g}none: {x['reason']}")
+            else:
+                lines.append(left + f"{float(risk):<10g}{x['confidence']:>10.4f}{pct(x['cert_coverage']):>11}"
+                                    f"{pct(x['cert_error']):>8}{pct(x['cert_upper95']):>8}")
+    return "\n".join(lines)
+
+
+def task_warnings(report, dropped=()):
+    out = []
+    for t, e in report.items():
+        if e["n"] < RECOMMENDED:
+            out.append(f"{t}: only {e['n']} labelled decisions: the bounds are loose")
+        for risk, x in e["targets"].items():
+            if x["confidence"] is None:
+                out.append(f"max_error {float(risk):g}: {t} has no certified threshold; its answers report "
+                           "automated: null at this max_error")
+            elif x["cert_error"] is not None and x["cert_error"] > float(risk):
+                out.append(f"max_error {float(risk):g}: {t} CERT error {pct(x['cert_error'])} is above the target; "
+                           "label more data before relying on this threshold")
+    for t in dropped:
+        out.append(f"{t}: the shipped task threshold was certified with the shipped temperatures, which this file "
+                   f"changes; it is left out (add labelled {t} questions to certify one)")
+    return out
+
+
 def warnings(report, targets):
     out = []
     n = report["n_fit"] + report["n_cert"]
@@ -768,11 +1016,15 @@ def refit(a, targets, reference, reference_name):
                             split="FIT 70% / CERT 30% by group", tool=f"basal-calibrate {__version__} (--from-rows)")
     cal["certified_on"] = "CERT split of fitted_on.data (30% by group)"
     cal["baseline"] = str(base_file) if baseline else "none"
-    Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
     print(table(report))
-    for w in warnings(report, targets):
+    dropped = sorted(baseline.get("task_thresholds") or {})  # task answers are not in the rows: refit them in process
+    for w in warnings(report, targets) + task_warnings({}, dropped):
         print(f"warning: {w}")
-    print(f"\nwrote {a.out} (calibration file {head['fmt']}, engine {cal['engine']}, refitted from {a.input})")
+    if a.report_only:
+        print("\n--report-only: no file written")
+    else:
+        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
+        print(f"\nwrote {a.out} (calibration file {head['fmt']}, engine {cal['engine']}, refitted from {a.input})")
     bad = regressions(report)
     if a.strict and bad:
         print(f"--strict: leave-one-family-out ECE above the reference for {', '.join(bad)}", file=sys.stderr)
@@ -805,6 +1057,9 @@ def parser():
                     help="also write the uncalibrated probabilities of every decision (JSONL), to refit without a model")
     ap.add_argument("--from-rows", dest="from_rows", action="store_true",
                     help="the input is a file written by --save-rows: refit on it without running any engine")
+    ap.add_argument("--report-only", dest="report_only", action="store_true",
+                    help="print the report on your labelled requests (accuracy, ECE, certified thresholds, automated "
+                         "share) without writing a calibration file")
     ap.add_argument("--strict", action="store_true",
                     help="exit with status 1 when a type's leave-one-family-out ECE is above --reference")
     ap.add_argument("--concurrency", type=int, default=32, help="requests in flight (the engine batches them)")
@@ -829,10 +1084,34 @@ def main(argv=None):
     if a.from_rows:
         return refit(a, targets, reference, reference_name)
     try:
-        bodies, decisions = load(a.input)
+        bodies, decisions, task_bodies, units = read(a.input)
     except InputError as e:
         raise SystemExit(str(e)) from None
-    print(f"basal-calibrate: {len(decisions)} labelled decisions in {len(bodies)} requests", file=sys.stderr)
+    print(f"basal-calibrate: {len(decisions)} labelled decisions in {len(bodies)} requests"
+          + (f", {len(units)} labelled task decisions in {len(task_bodies)} requests" if units else ""),
+          file=sys.stderr)
+    if units and a.url:
+        raise SystemExit("task questions (classify / verify / extract) need the engine in process: their thresholds "
+                         "are certified on the answers as served with the fitted temperatures; give --model and --mode "
+                         "instead of --url, or leave the task questions out")
+    fitted = {}  # settle(): the decision rows, the file to serve and the report
+
+    def settle(responses):
+        """The decision part: the fit on the decision questions, else the compared calibration kept as it is."""
+        rows, failed = raw_rows(decisions, responses)
+        if failed:
+            print(f"warning: {len(failed)} request(s) failed and are left out:\n  " + "\n  ".join(failed[:5]),
+                  file=sys.stderr)
+        if decisions and not rows:
+            raise SystemExit("no decisions to fit")
+        if rows:
+            cal, report = fit(rows, baseline, targets, a.min_per_type, fmt, a.min_family, reference, a.min_per_set)
+            cal["gates"]["ece_reference"] = reference_name
+        else:  # task questions only: the temperatures and thresholds of the compared file stay as they are
+            cal, report = {k: v for k, v in baseline.items() if k not in KEPT_OUT}, None
+        fitted.update(rows=rows, failed=failed, cal=cal, report=report)
+        return cal
+
     if a.url:
         import httpx
         base = a.url.rstrip("/").removesuffix("/v1/systemone").removesuffix("/v1/basal")
@@ -848,6 +1127,7 @@ def main(argv=None):
         orders = entry.get("orders")  # the server's option orders (servers before this field: unknown)
         kind, quant = MODES.get(mode, ("", None, False))[:2]
         md = resolve(a.model, a.revision, metadata_only=True) if a.model else None
+        revision = model_identity(a.model, md)[1] if md is not None else None
         fmt = entry.get("prompt_format") or (model_format(md) if md is not None else 1)
         if a.no_calibration:
             base_file = None
@@ -855,7 +1135,9 @@ def main(argv=None):
             base_file = Path(a.calibration)
         else:
             base_file = calibration_file(md, kind, None, quant)
-        responses = asyncio.run(over_http(base + "/v1/systemone", bodies, a.concurrency))
+        baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
+        settle(asyncio.run(over_http(base + "/v1/systemone", bodies, a.concurrency)) if bodies else [])
+        task_responses = []
     else:
         a.model = a.model or add_engine_args(argparse.ArgumentParser()).get_default("model")  # basal-serve's
         mode = a.mode or default_mode()
@@ -863,49 +1145,72 @@ def main(argv=None):
                                            "no_calibration": True, "log_decisions": None}))
         kind, quant, fmt, orders = srv.kind, a.quant or MODES[mode][1], srv.fmt, srv.orders
         base_file = None if a.no_calibration else calibration_file(srv.md, srv.kind, a.calibration, quant)
-        model = a.model
+        baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
+        model, revision = a.model, model_identity(a.model, srv.md)[1]
         engine = mode + (f" --quant {a.quant}" if a.quant else "") + (f" --gguf {Path(a.gguf).name}" if a.gguf else "")
-        responses = asyncio.run(in_process(srv, bodies, a.concurrency))
-    baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
-    rows, failed = raw_rows(decisions, responses)
-    if failed:
-        print(f"warning: {len(failed)} request(s) failed and are left out:\n  " + "\n  ".join(failed[:5]),
+        _, task_responses = asyncio.run(two_passes(srv, bodies, task_bodies, a.concurrency, settle))
+    rows, failed, cal, report = fitted["rows"], fitted["failed"], fitted["cal"], fitted["report"]
+    trows, tfailed = task_rows(units, task_responses) if units else ([], [])
+    if tfailed:
+        print(f"warning: {len(tfailed)} task request(s) failed and are left out:\n  " + "\n  ".join(tfailed[:5]),
               file=sys.stderr)
-    if not rows:
-        raise SystemExit("no decisions to fit")
-    if a.save_rows:
+    if units and not trows:
+        raise SystemExit("no task decisions to fit")
+    task_thr, task_report = fit_tasks(trows, targets) if trows else ({}, {})
+    shipped_tasks = baseline.get("task_thresholds") or {}
+    # a shipped task threshold holds for the shipped temperatures: kept only when this file keeps them too
+    dropped = sorted(t for t in shipped_tasks if t not in task_report) if rows else []
+    kept = {} if rows else {t: v for t, v in shipped_tasks.items() if t not in task_report}
+    if kept or task_thr:
+        cal["task_thresholds"] = {**kept, **task_thr}
+    if task_report:
+        cal["task_gates"] = task_report
+    if a.save_rows and rows:
         head = dict(basal_calibrate_rows=1, fmt=fmt, kind=kind, quant=quant, model=str(model), engine=engine,
                     data=Path(a.input).name, requests=len(bodies) - len(failed),
                     baseline=str(base_file) if baseline else None, orders=orders)
         with open(a.save_rows, "w") as f:
             for x in [head] + rows:
                 f.write(json.dumps(x, ensure_ascii=False) + "\n")
-    cal, report = fit(rows, baseline, targets, a.min_per_type, fmt, a.min_family, reference, a.min_per_set)
-    cal["gates"]["ece_reference"] = reference_name
     cal["engine"] = engine_name(kind, quant)
     cal["fitted_on"] = dict(data=Path(a.input).name, decisions=sum(r["prim"] != "multi" for r in rows),
                             requests=len(bodies) - len(failed),
-                            fit=report["n_fit"], cert=report["n_cert"],
-                            per_type={t: r["n"] for t, r in report["types"].items()},
+                            fit=report["n_fit"] if report else 0, cert=report["n_cert"] if report else 0,
+                            per_type={t: r["n"] for t, r in report["types"].items()} if report else {},
                             multi=sum(r["prim"] == "multi" for r in rows),
                             date=datetime.date.today().isoformat(), model=model, engine=engine,
                             split="FIT 70% / CERT 30% by group", tool=f"basal-calibrate {__version__}")
+    if revision:
+        cal["fitted_on"]["revision"] = revision
+    if task_report:
+        cal["fitted_on"]["tasks"] = {t: e["n"] for t, e in task_report.items()}
+        cal["fitted_on"]["task_requests"] = len(task_bodies) - len(tfailed)
     if orders is not None:  # basal-serve applies the file only to these orders (or loads CALIBRATION.o<N>.json)
         cal["fitted_on"]["orders"] = orders
     cal["certified_on"] = "CERT split of fitted_on.data (30% by group)"
     cal["baseline"] = (str(a.calibration or f"{a.model}/{base_file.name}") if baseline else "none") + \
         (f" ({baseline['source_tag']})" if baseline.get("source_tag") else "")
-    Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
-    print(table(report))
-    for w in warnings(report, targets):
+    if not rows:
+        cal["decision_calibration"] = (f"kept from {cal['baseline']} (no decision questions in the input)" if baseline
+                                       else "none (no decision questions in the input, no calibration to keep)")
+    if report:
+        print(table(report))
+    else:
+        print(f"\ndecision questions: none; temperatures and thresholds kept from {cal['baseline']}")
+    if task_report:
+        print(task_table(task_report))
+    for w in (warnings(report, targets) if report else []) + task_warnings(task_report, dropped):
         print(f"warning: {w}")
-    print(f"\nwrote {a.out} (calibration file {fmt}, engine {cal['engine']})\n"
-          f"  basal-serve --model {a.model or '<model>'} --mode {mode} --calibration {a.out}")
-    bad = regressions(report)
+    if a.report_only:
+        print("\n--report-only: no file written")
+    else:
+        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
+        print(f"\nwrote {a.out} (calibration file {fmt}, engine {cal['engine']})\n"
+              f"  basal-serve --model {a.model or '<model>'} --mode {mode} --calibration {a.out}")
+    bad = regressions(report) if report else []
     if a.strict and bad:
         print(f"--strict: leave-one-family-out ECE above the reference for {', '.join(bad)}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
