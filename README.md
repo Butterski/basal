@@ -24,12 +24,28 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 
 ## Contents
 
-- [What is new in basal 2.1](#what-is-new-in-basal-21) · [What is new in basal-2.0](#what-is-new-in-basal-20)
+- [What is new in basal 2.2](#what-is-new-in-basal-22) · [What is new in basal 2.1](#what-is-new-in-basal-21) ·
+  [What is new in basal-2.0](#what-is-new-in-basal-20)
 - [Models](#models) · [Results](#results)
 - [Quick start](#quick-start) · [API](#api)
 - [Images and audio: basal-omni](#images-and-audio-basal-omni-experimental) · [MCP for agents](#mcp-basal-as-a-tool-for-agents)
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
 - [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) · [License](#license)
+
+## What is new in basal 2.2
+
+- **Calibrate the model on your own data**, for every basal and basal-omni model: label a few hundred of your own
+  requests, run `basal-calibrate`, and serve the file it writes. The probabilities, and the `max_error` thresholds
+  that decide what may be automated, are then certified on your data, not ours. A hosted decision API cannot be
+  recalibrated on your data; a basal model can.
+  ```bash
+  basal-calibrate my_labelled.jsonl --model Remek/basal-omni-1.0-max --mode eager    # writes CALIBRATION.custom.json
+  basal-serve --model Remek/basal-omni-1.0-max --mode eager --calibration CALIBRATION.custom.json
+  ```
+- New in 2.2: the task types' `automated` flag (`classify`, `verify`, and now `extract`) is certified from your
+  labelled task questions; a few dozen labels already move the temperatures; the report shows how the shipped file
+  does on your data, as served; `--report-only`; a calibration file knows the model it was fitted on.
+  [docs/CALIBRATION.md](docs/CALIBRATION.md)
 
 ## What is new in basal 2.1
 
