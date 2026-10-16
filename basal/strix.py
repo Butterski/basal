@@ -1,5 +1,6 @@
 """`--mode strix`: a basal-1.5 / basal-2.0 forward written for AMD Strix Halo (Radeon 8060S, gfx1151, ROCm), with
-Triton kernels where the stock ones fall short on this GPU. Speeds at ~6k tokens:
+Triton kernels where the stock ones fall short on this GPU (docs/benchmarks/STRIX_HALO.md, "--mode strix"). Speeds at
+~6k tokens:
 
   attention   flash attention over the packed prefix trie, GQA-packed (the query heads of a kv head share each key /
               value tile). GraphBackend's block mask becomes an interval per key: depth-first packing puts every
