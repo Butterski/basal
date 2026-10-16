@@ -29,9 +29,11 @@ written into the prompt as compact JSON (this has been true for every question t
 ```
 ```json
 {"type": "classify", "label": "card_payment_duplicate", "top_label": "card_payment_duplicate",
- "scores": {"card_payment_duplicate": 0.97, "card_lost": 0.01, "refund_status": 0.01, "none": 0.01},
- "confidence": 0.97, "automated": {"0.01": null, "0.05": null}, "experimental": true}
+ "scores": {"card_payment_duplicate": 0.9996, "card_lost": 0.0002, "refund_status": 0.0000, "none": 0.0002},
+ "confidence": 0.9996, "automated": {"0.01": null, "0.05": null}, "experimental": true}
 ```
+(basal-omni-1.0-max, eager bf16, rounded to 4 places. basal-omni-1.1-max ships a `classify` threshold for 5%, so the
+same answer there reads `"automated": {"0.01": null, "0.05": true}`.)
 
 - `labels`: `{key: rubric}`, a list of keys, or a list of `{"name", "rubric"}`. Up to 255 labels (format-2 models).
 - `none: true` adds the label `none` ("none of the labels above").
@@ -142,6 +144,23 @@ Measured with basal-omni-1.0-max (Gemma 4 12B), basal-serve eager bf16, on sets 
 | verify | RAGTruth, response vs source, binary (MIT) | 1,000 | accuracy 80.3%, F1 of "not supported" 0.65 |
 | compress | QASPER, paragraphs, keep 30% of characters (CC BY 4.0) | 248 | needed paragraphs kept: 90.1% (all of them for 84.3% of questions); at 10% / 20% / 50% of the text: 77.2% / 86.3% / 96.3% |
 | extract | synthetic PL / EN invoices, 12 fields (ours) | 400 | fields correct: 90.1% (invoice number 96%, tax id 100%, amounts 96.5–99.5%, dates 86–94%, seller / buyer name 81% / 86%, IBAN 81%, currency 62%, payment method 100%) |
+
+**basal-omni-1.1-max** (experimental, on Hugging Face from Sat 17 Oct, 09:00 CEST) is basal-omni-1.0-max with extra
+training on the `verify`, `compress` and `extract` formats (the train splits of VitaminC and QASPER, and synthetic
+documents; not CLINC150, BANKING77 or RAGTruth). Same sets, same engine:
+
+| set | 1.0-max | 1.1-max |
+|---|---|---|
+| CLINC150 (accuracy) | 85.4% | 86.4% |
+| BANKING77 (accuracy) | 74.6% | 74.0% |
+| VitaminC (accuracy) | 80.3% | 84.3% |
+| RAGTruth (accuracy) | 80.3% | 81.6% |
+| QASPER (needed paragraphs kept at 30%) | 90.1% | 93.1% |
+| invoices (fields correct) | 90.1% | 91.4% |
+| documents in layouts never used in training (fields correct) | 84.8% | 89.3% |
+
+It is slightly behind 1.0-max on general decisions (Werdykt 0.821 vs 0.823; ContractNLI −13.7 points, where it leans
+to "not stated"), so 1.0-max stays the default; its card has the full comparison.
 
 The `automated` flag uses thresholds certified on the models' own decision tasks. On these new label sets they do
 not hold (at a 1% target, the automated answers were wrong 2–9% of the time): so task answers report `automated` only with

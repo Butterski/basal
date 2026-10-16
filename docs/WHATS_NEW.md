@@ -10,6 +10,14 @@
 - Measured on public sets the models were not trained on, with basal-omni-1.0-max: see
   [TASKS.md](TASKS.md#results). Experimental: the API may change, and the `automated` flag of a task answer needs
   thresholds fitted for that task.
+- Every other request takes the same code path as in v2.0.0 (on basal-omni-1.0-max, 23,276 of 23,278 served-check
+  answers were the same; the two others were near-ties).
+
+**New models (Hugging Face, Sat 17 Oct, 09:00 CEST)**
+- **basal-omni-1.0-ultra** (31B, Gemma 4 31B; text and images): Werdykt 0.879, the highest of the basal models; and
+  **basal-omni-1.0-ultra-FP8** for `--mode vllm` (text only).
+- **basal-omni-1.1-max** (*experimental*): basal-omni-1.0-max with extra training on the task formats, better on the
+  tasks and slightly behind 1.0-max on general decisions; 1.0-max stays the default ([TASKS.md](TASKS.md#results)).
 
 # What is new in basal-2.0
 
