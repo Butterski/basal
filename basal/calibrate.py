@@ -1090,8 +1090,9 @@ def refit(a, targets, reference, reference_name):
     cal["certified_on"] = "CERT split of fitted_on.data (30% by group)"
     cal["baseline"] = str(base_file) if baseline else "none"
     print(table(report))
-    dropped = sorted(baseline.get("task_thresholds") or {})  # task answers are not in the rows: refit them in process
-    for w in warnings(report, targets) + task_warnings({}, dropped):
+    notes = [f"{t}: task thresholds are not refitted from rows (they are certified on the answers as served); the "
+             "refitted file leaves them out: fit them with the engine" for t in sorted(baseline.get("task_thresholds") or {})]
+    for w in warnings(report, targets) + notes:
         print(f"warning: {w}")
     if a.report_only:
         print("\n--report-only: no file written")
