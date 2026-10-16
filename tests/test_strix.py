@@ -2,6 +2,7 @@
 interval form of the prefix-trie mask against the block mask it replaces, and the whole backend against separate
 forwards of every prompt (tiny random Llama with biases, bf16, on the GPU)."""
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,7 +14,7 @@ from basal import server as server_module
 from basal.engine import GraphBackend
 
 triton = pytest.importorskip("triton")
-gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm (or CUDA) GPU and Triton")
+gpu = pytest.mark.skipif(not (torch.cuda.is_available() and torch.version.hip), reason="needs a ROCm GPU and Triton")
 
 
 class Tok:
@@ -33,14 +34,17 @@ def tiny():
     return m
 
 
-@pytest.fixture(scope="module")
-def be():
+def make(m, warm=False):
     from basal.strix import StrixHaloFastBackend
-    m = tiny()
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("basal.strix.AutoTokenizer.from_pretrained", lambda _: Tok())
         mp.setattr("basal.strix.AutoModelForCausalLM.from_pretrained", lambda _, dtype: m.to(dtype))
-        yield StrixHaloFastBackend("tiny", warm=False)
+        return StrixHaloFastBackend("tiny", warm=warm)
+
+
+@pytest.fixture(scope="module")
+def be():
+    return make(tiny())
 
 
 def request(state, n_q, first=20):
@@ -212,6 +216,59 @@ def test_deterministic(be):
     assert be.run_shared(g) == be.run_shared(g)
 
 
+@gpu
+def test_deterministic_algorithms(be):
+    """--deterministic: nothing the backend runs is refused under torch's deterministic algorithms, and the answers do
+    not change (torch.empty is then filled with NaN, so an output element no kernel writes would show)."""
+    g = groups_mixed()
+    ref = be.run_shared(g)
+    torch.use_deterministic_algorithms(True)
+    try:
+        assert be.run_shared(g) == ref
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+
+@gpu
+def test_warmup_with_a_small_vocabulary():
+    """The start-up warmup (token ids up to 2100) runs on a model with 64 tokens."""
+    assert make(tiny(), warm=True).run_shared(groups_mixed()[:1])
+
+
+def llama(**kw):
+    base = dict(hidden_size=2048, intermediate_size=11008, num_attention_heads=16, num_key_value_heads=2,
+                head_dim=128, num_hidden_layers=1, vocab_size=64)  # basal-1.5 / basal-2.0 4.5B shapes
+    return LlamaConfig(**{**base, **kw})
+
+
+def test_supported_shapes():
+    from basal.strix import StrixHaloFastBackend as B
+    assert B.unsupported(llama()) == [] and B.unsupported(tiny().config) == []
+    assert B.unsupported(llama(num_attention_heads=32, num_key_value_heads=1, head_dim=64)) == []
+
+
+@pytest.mark.parametrize("kw, why", [
+    (dict(head_dim=80), "head size 80"),                                                    # tl.arange(0, D)
+    (dict(num_attention_heads=24, num_key_value_heads=8), "24 query heads over 8"),         # 3 per kv head
+    (dict(num_attention_heads=8, num_key_value_heads=1, head_dim=16), "qkv projection"),    # 160 columns, tiles of 128
+    (dict(intermediate_size=5000), "gate / up projection"),
+    (dict(hidden_size=3072), "hidden size 3072"),
+    (dict(hidden_act="gelu"), "activation gelu"),
+    (dict(rope_parameters={"rope_type": "dynamic", "rope_theta": 1e6, "factor": 2.0}), "RoPE type dynamic"),
+])
+def test_unsupported_shapes_are_refused(kw, why):
+    """Plain attributes: LlamaConfig itself refuses some of them (24 heads over a 2048 hidden size)."""
+    from basal.strix import StrixHaloFastBackend as B
+    assert any(why in p for p in B.unsupported(SimpleNamespace(**{**llama().to_dict(), **kw})))
+
+
+def test_refused_without_rocm(monkeypatch):
+    from basal.strix import StrixHaloFastBackend
+    monkeypatch.setattr(torch.version, "hip", None)
+    with pytest.raises(ValueError, match="ROCm"):
+        StrixHaloFastBackend("tiny")
+
+
 class Made:
     def __init__(self, *args, **kwargs):
         self.args, self.kwargs, self.tok = args, kwargs, None
@@ -224,7 +281,7 @@ def test_mode_selects_the_backend(monkeypatch, tmp_path):
     srv = server_module.Server(server_module.parser().parse_args(["--mode", "strix"]))
     assert type(srv.backend).__name__ == "StrixHaloFastBackend"
     assert type(bench_module.build("strix", "md")).__name__ == "StrixHaloFastBackend"
-    assert server_module.MODES["strix"][0] == "strix"
+    assert server_module.MODES["strix"][0] == "strix" and "strix" in server_module.DETERMINISTIC_KINDS
 
 
 def test_graph_backend_untouched():

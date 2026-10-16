@@ -188,7 +188,9 @@ def _rope(x_ptr, pos_ptr, cos_ptr, sin_ptr, q_ptr, k_ptr, v_ptr, L, sxm, H: tl.c
 # -- backend -------------------------------------------------------------------------------------------------------
 class StrixHaloFastBackend(GraphBackend):
     """`--mode strix` (see the module docstring). Rows of one chunk are concatenated into a single sequence of at
-    most TOKEN_BUDGET tokens; a packed row longer than that is bisected like in GraphBackend (exact)."""
+    most TOKEN_BUDGET tokens; a packed row longer than that is bisected like in GraphBackend (exact). A single prompt
+    longer than that runs alone in one forward, as GraphBackend runs one past its largest graph (the server keeps
+    prompts within the model's context; activations grow linearly, attention memory does not grow with length)."""
 
     streams, inflight = False, 1  # its own run_shared: no early readouts, one call at a time
     TOKEN_BUDGET = 16384  # tokens per forward (the GGUF context): ~0.4 GB of FFN activations
@@ -208,9 +210,42 @@ class StrixHaloFastBackend(GraphBackend):
                  (None, dict(BM=128, BN=128, BK=64, GM=8, num_warps=4, num_stages=2)))}
     LINEAR_ROWS = 2304  # qkv and o run in row chunks of at most this many (they slow down past ~3k rows)
 
+    @classmethod
+    def unsupported(cls, cfg):
+        """What in a model config the kernels cannot run (empty: supported). Every tile config must divide its
+        projection (the matmuls have no column or depth masks), tl.arange needs power-of-two extents (head size, query
+        heads per kv head, hidden size), and the rotary tables are computed once at start-up."""
+        H, KV = cfg.num_attention_heads, cfg.num_key_value_heads
+        D = getattr(cfg, "head_dim", None) or cfg.hidden_size // H
+        hidden, inter = cfg.hidden_size, cfg.intermediate_size
+        pow2 = lambda n: n > 0 and n & (n - 1) == 0  # noqa: E731
+        rope = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None) or {}
+        rope = rope.get("rope_type", "default")
+        out = []
+        if cfg.hidden_act != "silu":
+            out.append(f"activation {cfg.hidden_act} (silu only)")
+        if not pow2(hidden):
+            out.append(f"hidden size {hidden} (a power of two)")
+        if not pow2(D) or D < 16:
+            out.append(f"head size {D} (a power of two, at least 16)")
+        if H % KV or not pow2(H // KV):
+            out.append(f"{H} query heads over {KV} kv heads (a power-of-two ratio)")
+        if "dynamic" in rope or rope == "longrope":
+            out.append(f"RoPE type {rope} (its frequencies depend on the sequence length)")
+        for name, n, k, cfgs in (("qkv", (H + 2 * KV) * D, hidden, cls.LINEAR["qkv"]),
+                                 ("o", hidden, H * D, cls.LINEAR["o"]), ("down", hidden, inter, cls.LINEAR["down"]),
+                                 ("gate / up", inter, hidden, cls.FFN)):
+            bn, bk = max(c["BN"] for _, c in cfgs), max(c["BK"] for _, c in cfgs)
+            if n % bn or k % bk:
+                out.append(f"{name} projection {k} -> {n} (multiples of {bk} -> {bn})")
+        return out
+
     def __init__(self, model_dir, dtype="bfloat16", warm=True):
         if dtype != "bfloat16":
             raise ValueError("--mode strix runs bf16 only")
+        if not torch.version.hip:
+            raise ValueError("--mode strix needs PyTorch built for ROCm (its kernels and tile configs are for AMD "
+                             "Strix Halo)")
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.bfloat16).cuda().eval()
@@ -222,10 +257,8 @@ class StrixHaloFastBackend(GraphBackend):
         self.H, self.KV = cfg.num_attention_heads, cfg.num_key_value_heads
         self.D = getattr(cfg, "head_dim", None) or cfg.hidden_size // self.H
         self.hidden, self.eps = cfg.hidden_size, cfg.rms_norm_eps
-        if self.D % 2 or self.hidden & (self.hidden - 1) or cfg.intermediate_size % 64 \
-                or self.hidden % 64 or cfg.hidden_act != "silu":
-            raise ValueError("--mode strix expects a Llama with silu, a power-of-two hidden size and an FFN size "
-                             "divisible by 64")
+        if problems := self.unsupported(cfg):
+            raise ValueError("--mode strix cannot run this model: " + "; ".join(problems))
         m = self.model.model
         self.layers = []
         for layer in m.layers:
@@ -252,10 +285,11 @@ class StrixHaloFastBackend(GraphBackend):
         ang = pos[:, None] * rot.inv_freq.float()[None, :]
         self.cos = (ang.cos() * rot.attention_scaling).to(torch.bfloat16).contiguous()
         self.sin = (ang.sin() * rot.attention_scaling).to(torch.bfloat16).contiguous()
-        if warm:  # compile every kernel once (Triton JIT), short and multi-block rows
-            for n in (300, 1100):
+        if warm:  # compile every kernel once (Triton JIT), short and multi-block rows; within vocabulary and context
+            V = self.embed.shape[0]
+            for n in (min(300, self.cos.shape[0] - 1), min(1100, self.cos.shape[0] - 1)):
                 toks = [[1] + list(range(1000, 1000 + n)), [1] + list(range(1000, 1000 + n // 2)) + [7, 8]]
-                self.run_shared([(toks, [[30, 31], [30, 31]])])
+                self.run_shared([([[t % V for t in x] for x in toks], [[30 % V, 31 % V]] * 2)])
 
     def _oversize(self, pack, n):
         return len(pack[0]) > self.TOKEN_BUDGET

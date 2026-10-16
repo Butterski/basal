@@ -332,7 +332,7 @@ def calibration_name(kind, quant):
     return kind if kind in ("vllm", "sglang", "mlx", "ollama", "llamacpp") else None
 
 
-DETERMINISTIC_KINDS = ("graph", "exit", "eager", "mps", "mlx", "gguf")  # engines that run in this process
+DETERMINISTIC_KINDS = ("graph", "exit", "eager", "mps", "mlx", "gguf", "strix")  # engines that run in this process
 
 
 def deterministic_setup(kind):
@@ -341,8 +341,8 @@ def deterministic_setup(kind):
     before the first cuBLAS call (the workspace setting is read when the handle is created)."""
     if kind not in DETERMINISTIC_KINDS:
         raise SystemExit("--deterministic needs an engine that runs in this process (fast, fast-nocompile, fast-exit, "
-                         "fp8, nvfp4, eager, mps, mlx, gguf); vLLM, SGLang, Ollama and llama.cpp server batch requests "
-                         "their own way")
+                         "fp8, nvfp4, eager, mps, mlx, gguf, strix); vLLM, SGLang, Ollama and llama.cpp server batch "
+                         "requests their own way")
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
