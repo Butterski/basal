@@ -105,6 +105,9 @@ The shipped files were fitted with the same steps:
 3. For each target error *r*, the threshold is the lowest confidence whose accepted FIT decisions have a one-sided 95%
    Clopper–Pearson upper bound ≤ *r*, scanned from the most confident decision down (at least 50 accepted; equal
    confidences are accepted or refused together). The candidates are the observed confidences, never a fixed grid.
+   A looser target never keeps a stricter threshold than a tighter one: a confidence certified at 1% is certified at
+   5% too, so where the 5% scan stops above the 1% threshold (it can pass early on a few very confident decisions
+   and stop on an error just below them), the 5% threshold is the 1% one, marked `floored_from`.
    - It is certified per question type (`thresholds[r].per_type`). A temperature preserves the order of a type's
      yes/no confidences (and, up to ties, its other confidences), so a type's certified coverage does not depend on
      its temperature.

@@ -739,6 +739,27 @@ def served_gate(rows, temps, buckets, cal, risk):
     return dict(coverage=len(acc) / len(rows), error=(len(acc) - sum(acc)) / len(acc) if acc else None)
 
 
+def floor_thresholds(thresholds, targets):
+    """A confidence certified at a target error is certified at every looser target too (its bound is below both), so a
+    looser target never keeps a stricter threshold than a tighter one: the scan stops at the first failing level after
+    a pass, and at a loose target it can pass early on a small top level and stop on a few errors below it (basal-omni
+    mini FP8, 17 Oct 2026: 5% at 0.9999 against 1% at 0.9587). Floors the pooled and per-type entries in place, marking
+    them "floored_from"; returns the targets whose entries changed."""
+    changed = set()
+    rs = sorted(float(r) for r in targets)
+    for lo, hi in zip(rs, rs[1:]):
+        a, b = thresholds[str(lo)], thresholds[str(hi)]
+        for t, e in (a.get("per_type") or {}).items():
+            eh = (b.get("per_type") or {}).get(t) or {}
+            if e.get("confidence") is not None and (eh.get("confidence") is None or eh["confidence"] > e["confidence"]):
+                b.setdefault("per_type", {})[t] = dict(e, floored_from=str(lo))
+                changed.add(str(hi))
+        if a.get("confidence") is not None and (b.get("confidence") is None or b["confidence"] > a["confidence"]):
+            b.update({k: v for k, v in a.items() if k not in ("per_type", "pooled")}, floored_from=str(lo))
+            changed.add(str(hi))
+    return changed
+
+
 def type_threshold(entry, q_type):
     """The threshold basal-serve applies to a question type: its own certified one, else None (the pooled one is
     never applied)."""
@@ -781,6 +802,13 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
         old = (baseline.get("thresholds") or {}).get(str(float(risk)), {}).get("confidence")
         report["targets"][risk] = dict(shipped=old, shipped_cert=gate(shipped_cert, old) if old is not None else None,
                                        fitted=entry, fitted_cert=g_cert)
+    for k in floor_thresholds(thresholds, targets):  # the automated share of a floored target, as served
+        eff = effective_gate(cert_rows, temps, buckets, thresholds[k])
+        automated[k], automated_error[k] = eff["coverage"], eff["error"]
+        thr = thresholds[k]["confidence"]
+        if thr is not None and cs_cert:
+            automated_pooled[k] = gate(cs_cert, thr)["coverage"]
+        report["targets"][float(k)]["fitted_cert"] = gate(cs_cert, thr)
     for t in PRIMS:
         rs = [r for r in rows if r["prim"] == t]
         if not rs:
@@ -885,6 +913,12 @@ def fit_tasks(rows, targets, shipped=None):
                 cert_coverage=g_cert["coverage"], cert_error=g_cert["error"], cert_upper95=g_cert["upper95"],
                 cert_accepted=g_cert["accepted"])
             thresholds.setdefault(t, {})[str(float(risk))] = thr
+        rs_ = sorted(float(r) for r in targets)  # a looser target never keeps a stricter threshold (floor_thresholds)
+        for lo, hi in zip(rs_, rs_[1:]):
+            a, b = e["targets"][str(lo)], e["targets"][str(hi)]
+            if a["confidence"] is not None and (b["confidence"] is None or b["confidence"] > a["confidence"]):
+                e["targets"][str(hi)] = dict(a, floored_from=str(lo))
+                thresholds.setdefault(t, {})[str(hi)] = a["confidence"]
         report[t] = e
     return thresholds, report
 

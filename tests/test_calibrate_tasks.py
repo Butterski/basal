@@ -268,3 +268,22 @@ def test_calibrate_compares_the_file_basal_serve_loads_for_its_orders(tmp_path, 
     cal = json.loads(out.read_text())
     assert cal["baseline"] == "stub/CALIBRATION.o2.json" and cal["task_thresholds"]["verify"] == {"0.05": 0.95}
     assert cal["fitted_on"]["orders"] == 2
+
+
+def test_a_looser_target_never_keeps_a_stricter_threshold():
+    """The fixed-sequence scan can pass early at 5% on a small top level and stop on a few errors below it, while 1%
+    passes much lower down (basal-omni mini FP8, 17 Oct): the 5% threshold is floored at the 1% one."""
+    rows, i = [], 0
+    for conf, n, wrong in ((0.999, 200, 0), (0.998, 40, 12), (0.99, 3000, 0)):
+        for k in range(n):
+            rows.append(dict(prim="noul", p=[conf, 1 - conf], gold=1 if k < wrong else 0, group=f"g{i}", name="x"))
+            i += 1
+    cal, report = fit(rows, {"temperature_per_prim": {"noul": 1.0}}, [0.01, 0.05], min_per_type=10 ** 9, min_blend=0,
+                      fmt=2)
+    one, five = (cal["thresholds"][r]["per_type"]["noul"] for r in ("0.01", "0.05"))
+    assert one["confidence"] is not None and abs(one["confidence"] - 0.99) < 1e-6     # float32, as served
+    assert five["confidence"] == one["confidence"] and five["floored_from"] == "0.01"
+    assert cal["gates"]["automated_at"]["0.05"] >= cal["gates"]["automated_at"]["0.01"] > 0.9
+    thr, rep = fit_tasks([dict(task="verify", group=r["group"], c=r["p"][0], ok=r["gold"] == 0) for r in rows],
+                         [0.01, 0.05])
+    assert thr["verify"]["0.05"] == thr["verify"]["0.01"] and rep["verify"]["targets"]["0.05"]["floored_from"] == "0.01"

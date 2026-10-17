@@ -19,6 +19,8 @@
   would automate 12.6% of decisions at 8.0% error there; calibrated on the train split, the calibration error falls
   from 0.268 / 0.106 / 0.104 to 0.083 / 0.073 / 0.052 (choice / yes-no / score) and nothing is automated above its
   target. [The example](CALIBRATION.md#example-a-new-domain-measured)
+- **Fix:** a looser `max_error` target no longer keeps a stricter threshold than a tighter one (the scan could stop
+  early at 5% and automate fewer decisions than at 1%); also in the task thresholds.
 - Every other request takes the same code path as in v2.1.0.
 
 # What is new in basal 2.1
