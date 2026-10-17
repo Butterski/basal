@@ -29,7 +29,7 @@ mlx = [  # Apple Silicon: --mode mlx / mlx-q8 (-MLX-8bit / -MLX-fp4 exports or b
   "mlx-lm>=0.32; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.11'",
 ]
 media = ["pillow", "soundfile", "scipy", "torchvision"]  # --media on (basal-omni): images and audio; Gemma 4 image processing needs torchvision (the build of the installed torch)
-gguf = ["llama-cpp-python>=0.3.35"]  # --mode gguf: a GGUF file in process (Metal, CUDA or CPU)
+gguf = ["llama-cpp-python>=0.3.36"]  # --mode gguf: a GGUF file in process (Metal, CUDA or CPU); 0.3.36: Gemma 4 (basal-omni) checked
 mcp = ["mcp>=2.3,<3"]  # basal-serve --mcp on (MCP at /mcp) and the basal-mcp stdio bridge, for agents
 test = [
   "pytest", "jsonschema", "mcp>=2.3,<3",

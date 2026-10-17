@@ -32,6 +32,10 @@ hf download pawelkiszczak/basal-1.0-4.5B-GGUF basal-1.0-4.5B-F16.gguf --local-di
 basal-serve --mode gguf --model Remek/basal-1.0-4.5B --gguf basal-1.0-4.5B-F16.gguf --port 8000
 ```
 
+**basal-omni-1.0** (Gemma 4, text only): convert the model with llama.cpp's converter (below; b11312 or later, the
+llama.cpp of llama-cpp-python 0.3.36) and pass its directory as `--model`; the server checks the GGUF file against the
+`text_config` of its `config.json`. Gates and speeds of F16 to Q4_K_M: [OMNI.md](OMNI.md#gguf-llamacpp-ollama-and-mlx-text).
+
 With a full model directory as `--model`, the server checks that its `config.json` (layers, hidden size, vocabulary)
 matches the GGUF file. In this mode `--model` is downloaded without its weights.
 
