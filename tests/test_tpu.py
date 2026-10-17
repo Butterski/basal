@@ -48,7 +48,7 @@ def backend(ckpt):
     mp.setattr(TPUBackend, "LONG_LENS", [48, 64])  # above LENS[-1]: blocked attention
     mp.setattr(TPUBackend, "Q_BLOCK", 16)
     mp.setattr(TPUBackend, "KV_BLOCK", 8)
-    mp.setattr(TPUBackend, "WARM_READOUTS", 8)
+    mp.setattr(TPUBackend, "READOUTS", 4)  # below the readouts of a SOAM request: read in several calls
     yield TPUBackend(ckpt[0], "float32", warm=True, max_len=64, platform=PLATFORM)  # warm: all shapes compile
     mp.undo()
 
@@ -169,3 +169,35 @@ def test_many_option_codes(backend, ckpt):
     (probs,) = backend.run_shared([([A, B], [codes, codes[::-1]])])
     assert np.allclose(probs[0], torch_probs(m, A, codes), atol=1e-5)
     assert np.allclose(probs[1], torch_probs(m, B, codes[::-1]), atol=1e-5)
+
+
+def test_no_compile_after_warm_up(backend, ckpt):
+    """Every shape a request can need compiles at start-up: mixed readout counts per batch (one or two orders, a
+    request with more readouts than READOUTS) run with the warmed programs only."""
+    _, m = ckpt
+    before = backend._fwd._cache_size(), backend._read._cache_size()
+    groups = [([A], [LETTERS]), ([B, B[:-1] + [4]], [LETTERS, LETTERS]), (SOAM, [LETTERS] * len(SOAM))]
+    for k in range(1, len(groups) + 1):
+        res = backend.run_shared(groups[:k])
+        for (prompts, lids), probs in zip(groups, res):
+            for t, li, p in zip(prompts, lids, probs):
+                assert np.allclose(p, torch_probs(m, t, li), atol=1e-5)
+    assert (backend._fwd._cache_size(), backend._read._cache_size()) == before
+
+
+def test_broken_jax_is_no_tpu(monkeypatch):
+    """The default-mode probe: a JAX that fails to import or to initialise means no TPU, not a crash."""
+    import builtins
+    import jax
+    from basal.tpu import tpu_available
+    monkeypatch.setattr(jax, "devices", lambda *a: (_ for _ in ()).throw(ValueError("broken libtpu")))
+    assert tpu_available() is False
+    real = builtins.__import__
+
+    def no_jax(name, *a, **k):  # jax is found but its import fails (e.g. a jaxlib of another version)
+        if name == "jax":
+            raise ImportError("jaxlib version mismatch")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_jax)
+    assert tpu_available() is False

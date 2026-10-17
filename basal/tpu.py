@@ -155,14 +155,15 @@ def subtree_ends(seg, parent):
 
 
 def tpu_available():
-    """True when JAX is installed and sees a TPU."""
+    """True when JAX is installed and sees a TPU. Only the default-mode probe: a JAX that fails to import or to
+    initialise counts as no TPU (an explicit --mode tpu shows the error, TPUBackend)."""
     import importlib.util
     if importlib.util.find_spec("jax") is None:
         return False
-    import jax
     try:
+        import jax
         return bool(jax.devices("tpu"))
-    except RuntimeError:
+    except Exception:
         return False
 
 
@@ -176,9 +177,8 @@ class TPUBackend(GraphBackend):
     GraphBackend's units (every group -- all option orders of a question, or every branch of a request: SOAM -- is
     the compressed prefix trie of its prompts) packed as ONE row each: the attention mask comes from the trie, so a
     unit runs whole whatever its branches. Units are batched by length into forwards of at most TOKEN_BUDGET padded
-    tokens. The forward compiles once per (rows, length) bucket and the small readout once per (rows, length,
-    readouts) with the readout count rounded up to a power of two; with warm=True all of them (readouts up to
-    WARM_READOUTS per row) compile at start-up.
+    tokens. The forward and the small readout (always READOUTS positions, more in several calls) compile once per
+    (rows, length) bucket; with warm=True all of them compile at start-up.
 
     Units longer than the largest bucket run alone in one of the coarse LONG_LENS buckets up to max_len, with a
     blocked attention (Q_BLOCK queries x KV_BLOCK keys, online softmax), so memory grows with the length instead of
@@ -195,7 +195,8 @@ class TPUBackend(GraphBackend):
     LONG_LENS = [4096, 6144, 8192, 12288, 16384, 24576, 32768]  # above LENS[-1]; multiples of Q_BLOCK and KV_BLOCK
     Q_BLOCK = 1024  # queries per attention block for lengths above LENS[-1]
     KV_BLOCK = 1024  # keys per attention block for lengths above LENS[-1]
-    WARM_READOUTS = 64  # readouts per row (questions x option orders of a request) whose readout compiles at start-up
+    READOUTS = 64  # positions per readout call (padded; a forward with more readouts reads them in several calls),
+    #               so the readout has one shape per bucket whatever the questions x option orders of its rows
 
     def __init__(self, model_dir, dtype="bfloat16", shared=True, warm=True, max_len=4096, platform="tpu"):
         import jax
@@ -231,20 +232,12 @@ class TPUBackend(GraphBackend):
             self._warm()
 
     def _warm(self):
-        """Compile every bucket shape before serving: the forward per (batch, length), the readout for the readout
-        counts a row can need (the option orders of one question per row; for a single row also the many branches of
-        one request), so no request waits for a compilation."""
-        import jax.numpy as jnp
-        R0 = 2 if self.shared else 1
+        """Compile every bucket shape before serving: the forward and the readout per (batch, length), so no request
+        waits for a compilation (the readout's shape does not depend on the number of readouts)."""
         for L in self.LENS + self.long_lens:
             for b in self.BATCHES:
                 if b * L <= self.TOKEN_BUDGET or b == 1:
-                    self._forward_rows([([0] * L, list(range(L)), [0] * L, [L - 1] * R0, [-1])] * b, b, L)
-            h = jnp.zeros((1, L, self.cfg["hidden"]), self.params["embed"].dtype, device=self.device)
-            R = 4
-            while R <= self.WARM_READOUTS:
-                self._read(self.params, h, np.zeros(R, np.int32), np.zeros(R, np.int32), self._lids)
-                R *= 2
+                    self._forward_rows([([0] * L, list(range(L)), [0] * L, [L - 1], [-1])] * b, b, L)
 
     def _bucket(self, n, xs):
         for x in xs:
@@ -281,12 +274,12 @@ class TPUBackend(GraphBackend):
         for r, (t, pp, sg, last, parent) in enumerate(packs):
             ids[r, : len(t)], pos[r, : len(t)], end[r, : len(t)] = t, pp, subtree_ends(sg, parent)
             rows += [r] * len(last); cols += last
-        n = len(rows)
-        R = 1 << max(1, (n - 1).bit_length())  # readouts rounded up to a power of two (>= 2): few readout shapes
-        ri, ci = np.zeros(R, np.int32), np.zeros(R, np.int32)
+        n, R = len(rows), self.READOUTS
+        ri, ci = np.zeros(-(-n // R) * R, np.int32), np.zeros(-(-n // R) * R, np.int32)
         ri[:n], ci[:n] = rows, cols
         h = self._fwd(self.params, ids, pos, end)
-        return np.asarray(self._read(self.params, h, ri, ci, self._lids))[:n]
+        out = [self._read(self.params, h, ri[i: i + R], ci[i: i + R], self._lids) for i in range(0, n, R)]
+        return np.concatenate([np.asarray(x) for x in out])[:n]
 
     def _oversize(self, pack, n):
         """A unit that must be bisected: longer than max_len. The trie mask runs any unit as one row (several roots,
