@@ -35,8 +35,8 @@ def test_bad_files_are_refused_at_startup():
 def test_per_engine_file_names():
     assert calibration_name("graph", None) is None and calibration_name("eager", None) is None
     assert calibration_name("graph", "fp8") == "fp8" and calibration_name("exit", "nvfp4") == "nvfp4"
-    assert [calibration_name(k, None) for k in ("vllm", "sglang", "mlx", "ollama", "llamacpp")] == \
-        ["vllm", "sglang", "mlx", "ollama", "llamacpp"]
+    assert [calibration_name(k, None) for k in ("vllm", "sglang", "mlx", "gguf", "ollama", "llamacpp")] == \
+        ["vllm", "sglang", "mlx", "gguf", "ollama", "llamacpp"]
     assert calibration_name("mlx", "q8") == "mlx" and calibration_name("mps", None) is None
 
 
