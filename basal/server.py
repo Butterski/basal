@@ -330,7 +330,7 @@ def calibration_name(kind, quant):
     and the engines other than the basal bf16 path; None = CALIBRATION.json."""
     if kind in ("graph", "exit") and quant in ("fp8", "nvfp4"):
         return quant
-    return kind if kind in ("vllm", "sglang", "mlx", "ollama", "llamacpp") else None
+    return kind if kind in ("vllm", "sglang", "mlx", "gguf", "ollama", "llamacpp") else None
 
 
 DETERMINISTIC_KINDS = ("graph", "exit", "eager", "mps", "mlx", "gguf")  # engines that run in this process
