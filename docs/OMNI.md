@@ -16,6 +16,11 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   `--mode vllm` only.
   With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max and the `-FP8` checkpoints) uses
   it; the others use their `CALIBRATION.json`.
+- **Repeatable answers with vLLM:** vLLM's numbers depend on what the server computed before (prefix cache,
+  batching), so a decision near a tie can change between runs. Start the server with `VLLM_BATCH_INVARIANT=1` for
+  repeatable answers: on basal-omni-1.0-max-FP8 (RTX PRO 6000, 2,000 decisions at 32 in flight) two runs then gave the
+  same top answer on all of them (without it, 94.7%), at about 23% fewer decisions per second. `--mode eager
+  --deterministic` is the other way.
 - **Option orders:** like every prompt-format-2 model, it asks one option order by default and loads
   `CALIBRATION.json`. `--orders 2` averages both orders and loads `CALIBRATION.o2.json`.
 - **Memory:** about 16 GB of GPU memory for mini and 24 GB for max (bf16); long states need more for attention.
