@@ -12,9 +12,10 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 ```
 
 - **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), and, since v2.1.0, `vllm`
-  (text only; faster, with prefix caching and FlashAttention). basal-omni-1.0-ultra-FP8 runs on `--mode vllm` only.
-  With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max, ultra-FP8) uses it; the others
-  use their `CALIBRATION.json`.
+  (text only; faster, with prefix caching and FlashAttention). The `-FP8` checkpoints (mini, max, ultra) run on
+  `--mode vllm` only.
+  With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max and the `-FP8` checkpoints) uses
+  it; the others use their `CALIBRATION.json`.
 - **Option orders:** like every prompt-format-2 model, it asks one option order by default and loads
   `CALIBRATION.json`. `--orders 2` averages both orders and loads `CALIBRATION.o2.json`.
 - **Memory:** about 16 GB of GPU memory for mini and 24 GB for max (bf16); long states need more for attention.
@@ -29,7 +30,7 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 - **Code logits:** option codes are read in fp32 from the output head's input, with Gemma's final logit softcap
   applied in fp32. The model body runs in bf16.
 - **Not yet for Gemma 4:** `fast` (shared prefix, CUDA graphs), the engine's own `fp8` and `nvfp4` modes, SGLang, MLX
-  and GGUF. FP8 weights are served through vLLM (basal-omni-1.0-ultra-FP8). The rest come with a later basal-omni
+  and GGUF. FP8 weights are served through vLLM (the `-FP8` checkpoints). The rest come with a later basal-omni
   release.
 
 ## Images and audio (`--media on`)
