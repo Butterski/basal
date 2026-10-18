@@ -1,4 +1,4 @@
-# basal 2.1
+# basal 2.2
 
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--2.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-20-6acd1712a8e443c86cd576fc)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--omni--1.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f)
@@ -48,6 +48,13 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
   labelled task questions; a few dozen labels already move the temperatures; the report shows how the shipped file
   does on your data, as served; `--report-only`; a calibration file knows the model it was fitted on.
   [docs/CALIBRATION.md](docs/CALIBRATION.md)
+- **basal-omni on llama.cpp, Ollama and Apple Silicon** (text only): `--mode gguf` runs a GGUF conversion of
+  basal-omni-1.0 through llama.cpp (Metal, CUDA or CPU) and `--mode mlx` / `mlx-q8` the bf16 weights through mlx-lm.
+  New model repositories for basal-omni-1.0-mini and -max: **`-GGUF`** (Q8_0 and Q6_K, with a calibration fitted on
+  Q8_0) and **`-FP8`** (`--mode vllm`). [docs/OMNI.md](docs/OMNI.md#gguf-llamacpp-ollama-and-mlx-text)
+
+Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the
+[release notes](https://github.com/rkinas/basal/releases/tag/v2.2.0).
 
 ## What is new in basal 2.1
 
@@ -100,14 +107,15 @@ Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the [release notes](https:
 
 | model | params | use | Hugging Face |
 |---|---|---|---|
-| **basal-omni-1.0-mini** | 4B (Gemma 4 E4B) | decisions about text, images and audio; about 16 GB of GPU memory | [`Remek/basal-omni-1.0-mini`](https://huggingface.co/Remek/basal-omni-1.0-mini) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-mini-FP8) |
-| **basal-omni-1.0-max** | 12B | the default 12B model (Werdykt 0.823); text, images and audio; about 24 GB of GPU memory | [`Remek/basal-omni-1.0-max`](https://huggingface.co/Remek/basal-omni-1.0-max) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-max-FP8) |
+| **basal-omni-1.0-mini** | 4B (Gemma 4 E4B) | decisions about text, images and audio; about 16 GB of GPU memory | [`Remek/basal-omni-1.0-mini`](https://huggingface.co/Remek/basal-omni-1.0-mini) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-mini-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-mini-GGUF) |
+| **basal-omni-1.0-max** | 12B | the default 12B model (Werdykt 0.823); text, images and audio; about 24 GB of GPU memory | [`Remek/basal-omni-1.0-max`](https://huggingface.co/Remek/basal-omni-1.0-max) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-max-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-max-GGUF) |
 | **basal-omni-1.1-max** | 12B | *experimental task model*: better on `classify`, `verify`, `compress` and `extract`, slightly behind 1.0-max on general decisions (Werdykt 0.821) | [`Remek/basal-omni-1.1-max`](https://huggingface.co/Remek/basal-omni-1.1-max) |
 | **basal-omni-1.0-ultra** | 31B (Gemma 4 31B) | highest Werdykt score of the basal models (0.879); text and images (no audio); 59 GB of bf16 weights | [`Remek/basal-omni-1.0-ultra`](https://huggingface.co/Remek/basal-omni-1.0-ultra) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-ultra-FP8) |
 
 - bf16 weights, served by `basal-serve --mode eager` on an NVIDIA GPU (`--media on` for images and audio).
   The `-FP8` checkpoints (mini 12 GB, max 14 GB, ultra 33 GB) are served by `--mode vllm`, text only, each with its own
-  calibration (`CALIBRATION.vllm.json`).
+  calibration (`CALIBRATION.vllm.json`). The `-GGUF` files (Q8_0 and Q6_K, mini and max) are served by `--mode gguf`
+  (llama.cpp, with `CALIBRATION.gguf.json`) or in front of Ollama, text only.
 - All models are fine-tuned from Apache-2.0 base models (Bielik v3 for basal-2.0, Gemma 4 for basal-omni; see
   [NOTICE](NOTICE)) and released under Apache-2.0.
 
@@ -140,7 +148,7 @@ NVIDIA GPU, with [uv](https://docs.astral.sh/uv/) in a fresh environment:
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -153,7 +161,7 @@ Apple Silicon:
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -219,7 +227,7 @@ The basal-omni models answer the same questions, and with `--media on` a request
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 
@@ -235,7 +243,7 @@ calibration, so validate them on your own media. Request format and limits:
 `decide_many`; `basal-mcp` is a stdio bridge for hosts that start local processes.
 
 ```bash
-uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --host 127.0.0.1 --port 8000 --mcp on
 claude mcp add --transport http basal http://127.0.0.1:8000/mcp     # Claude Code; other hosts take the same URL
 ```

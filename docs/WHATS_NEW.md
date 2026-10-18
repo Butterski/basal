@@ -21,6 +21,13 @@
   target. [The example](CALIBRATION.md#example-a-new-domain-measured)
 - **Fix:** a looser `max_error` target no longer keeps a stricter threshold than a tighter one (the scan could stop
   early at 5% and automate fewer decisions than at 1%); also in the task thresholds.
+- **basal-omni on GGUF and MLX (text only).** `--mode gguf --gguf <file>` runs a GGUF conversion of basal-omni-1.0
+  through llama.cpp (Metal, CUDA or CPU; llama-cpp-python 0.3.36 or newer) and `--mode mlx` / `mlx-q8` the bf16
+  weights through mlx-lm on Apple Silicon. Q8_0 and Q6_K pass the port gate against bf16; Q5_K_M and Q4_K_M do not.
+  `--mode gguf` loads `CALIBRATION.gguf.json` when the model ships one. [OMNI.md](OMNI.md#gguf-llamacpp-ollama-and-mlx-text)
+- **New model repositories:** `-GGUF` (Q8_0, Q6_K) and `-FP8` (`--mode vllm`) of basal-omni-1.0-mini and -max, each
+  with a calibration fitted on the port's own readouts (GGUF: on Q8_0). `VLLM_BATCH_INVARIANT=1` gives repeatable
+  answers in `--mode vllm` ([OMNI.md](OMNI.md#serve)).
 - Every other request takes the same code path as in v2.1.0.
 
 # What is new in basal 2.1

@@ -7,7 +7,7 @@ question. They are trained on text; with `--media on` the server also takes imag
 ## Serve
 
 ```bash
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.1.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000    # or Remek/basal-omni-1.0-mini
 ```
 
@@ -50,6 +50,10 @@ python llama.cpp/convert_hf_to_gguf.py basal-omni-1.0-mini --outtype q8_0 --outf
 basal-serve --model ./basal-omni-1.0-mini --mode gguf --gguf basal-omni-1.0-mini-Q8_0.gguf --port 8000
 basal-serve --model ./basal-omni-1.0-mini --mode mlx --port 8000        # Apple Silicon, bf16 weights (mlx-q8: 8-bit)
 ```
+
+Ready files: [`Remek/basal-omni-1.0-mini-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-mini-GGUF) and
+[`Remek/basal-omni-1.0-max-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-max-GGUF) (Q8_0 and Q6_K, Modelfiles for
+Ollama, `CALIBRATION.gguf.json` fitted on Q8_0); their cards have the commands.
 
 llama.cpp tokenizes the rendered basal-omni prompts exactly like the Hugging Face tokenizer (2,000 of 2,000 development
 prompts), so text front ends (Ollama, `llama-server` with text prompts) read the same tokens. For Gemma 4 the engine
