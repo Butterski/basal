@@ -419,7 +419,16 @@ cool-down; *TV*: mean / max total-variation distance to fp32, *changed*: decisio
 Figures: `python docs/figures/make_figures.py` (matplotlib) from the measurements in `docs/figures/apple_engines.json`.
 
 
-## AMD Strix Halo
+## AMD Strix Halo (experimental, community-maintained)
+
+`--mode strix` ([basal/strix.py](../basal/strix.py)) was contributed and is maintained by
+[@kardysm](https://github.com/kardysm) ([#14](https://github.com/rkinas/basal/pull/14)), not by the core team. It runs
+the Llama-architecture models basal-1.5 and basal-2.0 only, and was measured with the 4.5B ones. Shapes its kernels
+cannot run are refused at start-up with a message naming what does not fit: the mini models (hidden size 1,536, 6 query
+heads per kv head) and basal-omni (Gemma 4) are not supported; the 11B max models pass the checks but have not been
+measured. ROCm only, bf16, tile configs tuned on the Radeon 8060S. **Every number in this section was measured by
+@kardysm** on the machine below; we have not reproduced them. The benchmark scripts and raw results are in the author's
+fork, [kardysm/basal#3](https://github.com/kardysm/basal/pull/3).
 
 One Ryzen AI Max+ PRO 395 (Radeon 8060S, gfx1151, 128 GB unified memory; Fedora 44, PyTorch 2.12 + ROCm 7.2),
 basal-1.5 (4.5B). On this iGPU a decision is compute-bound prefill (~9.2 GFLOP per token), and the stock kernels reach
