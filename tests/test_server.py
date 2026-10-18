@@ -398,3 +398,13 @@ def test_percentage_is_a_vat_rate_only_with_vat_in_its_sentence():   # regressio
 def test_max_len_flag_for_vllm_and_sglang():
     assert parser().parse_args([]).max_len == 4096
     assert parser().parse_args(["--mode", "sglang", "--max-len", "32768"]).max_len == 32768
+
+
+def test_viz_segments_rebuild_the_prompt():
+    from basal.prompt import render
+    from basal.viz import segments
+    opts = ["Reklamacje kart", "Kredyty"]
+    p = render(Tok(), "Klient: błąd hasła.", "Który dział?", opts)
+    seg = segments(p, "Klient: błąd hasła.", "Który dział?", opts)
+    assert "".join(s["text"] for s in seg) == p
+    assert [s["kind"] for s in seg if s["kind"] != "template"] == ["state", "question", "option", "option", "prefill"]

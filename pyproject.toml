@@ -49,12 +49,13 @@ basal-run = "basal.run:main"
 basal-export-gguf = "basal.gguf_export:main"
 basal-mcp = "basal.mcp_server:main"
 basal-calibrate = "basal.calibrate:main"
+basal-viz = "basal.viz:main"
 
 [tool.setuptools]
 packages = ["basal"]
 
 [tool.setuptools.package-data]
-basal = ["examples/*.jsonl", "examples/*.py"]
+basal = ["examples/*.jsonl", "examples/*.py", "viz.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]  # tests import shared stubs from tests.test_server
