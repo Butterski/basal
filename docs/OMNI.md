@@ -55,8 +55,9 @@ Ready files: [`Remek/basal-omni-1.0-mini-GGUF`](https://huggingface.co/Remek/bas
 [`Remek/basal-omni-1.0-max-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-max-GGUF) (Q8_0 and Q6_K, Modelfiles for
 Ollama, `CALIBRATION.gguf.json` fitted on Q8_0); their cards have the commands.
 
-8-bit MLX port for `--mode mlx` (Apple Silicon, `CALIBRATION.mlx.json`):
-[`Remek/basal-omni-1.0-mini-MLX`](https://huggingface.co/Remek/basal-omni-1.0-mini-MLX).
+8-bit MLX ports for `--mode mlx` (Apple Silicon, `CALIBRATION.mlx.json`):
+[`Remek/basal-omni-1.0-mini-MLX`](https://huggingface.co/Remek/basal-omni-1.0-mini-MLX),
+[`Remek/basal-omni-1.0-max-MLX`](https://huggingface.co/Remek/basal-omni-1.0-max-MLX).
 
 llama.cpp tokenizes the rendered basal-omni prompts exactly like the Hugging Face tokenizer (2,000 of 2,000 development
 prompts), so text front ends (Ollama, `llama-server` with text prompts) read the same tokens. For Gemma 4 the engine
@@ -89,6 +90,7 @@ F16 file, without an importance matrix.
 | max | GGUF Q4_K_M | 7.4 GB | CUDA | 0.9346 | 0.9607 | -1.0 pt | +0.016 | 8.7 | fail |
 | max | GGUF Q8_0 | 12.7 GB | Metal | 0.9950 | 1.0000 | +0.0 pt | +0.013 | 0.4 | (3) |
 | max | MLX `mlx-q8` | 14 GB | Metal | 0.9875 | 0.9973 | +0.8 pt | +0.008 | 0.3 | pass (4) |
+| max | MLX 8-bit port (`-MLX`) | 13.6 GB | Metal | 0.989 | 1.000 | -0.1 pt | +0.002 | 0.25 | pass (5) |
 
 (1) On the 24 GB Mac, 191 of the 300 longest prompts (27-255 options) ran out of GPU memory with bf16 weights; the
 2-10-option items the gate reads all ran. (2) 300 items with 2-10 options, one request at a time (Ollama returns at
@@ -97,6 +99,9 @@ most 20 log-probabilities, so up to 20 options). (3) max Q8_0 with the default 1
 the CUDA run of the same file on the same 400 items is +0.001 and the relative temperature is 1.00: binned ECE at this
 size moves by about 0.01; a Metal run on more items (or a larger Mac) is needed before claiming it. (4) 24 of the 100
 longest prompts ran out of GPU memory on the 24 GB Mac; accuracy and ECE are close to the bars on 400 items.
+(5) [`Remek/basal-omni-1.0-max-MLX`](https://huggingface.co/Remek/basal-omni-1.0-max-MLX) on the same M4 Pro (24 GB),
+8 in flight: one question takes 453 ms; long prompts can run out of GPU memory at 24 GB. Its own
+`CALIBRATION.mlx.json` automates 36% of decisions at `max_error` 1% and 85% at 5%.
 For comparison on the same GPU: eager bf16 985 s (mini) and 2,157 s (max) for the 10,606 decisions at 8 in flight, vLLM
 bf16 415 s and 840 s; GGUF Q8_0 646 s and 1,186 s at 16. Use Q8_0 (or Q6_K where memory is short); Q5_K_M and Q4_K_M
 move too many close decisions.

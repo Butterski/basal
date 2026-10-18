@@ -26,9 +26,9 @@
   weights through mlx-lm on Apple Silicon. Q8_0 and Q6_K pass the port gate against bf16; Q5_K_M and Q4_K_M do not.
   `--mode gguf` loads `CALIBRATION.gguf.json` when the model ships one. [OMNI.md](OMNI.md#gguf-llamacpp-ollama-and-mlx-text)
 - **New model repositories:** `-GGUF` (Q8_0, Q6_K) and `-FP8` (`--mode vllm`) of basal-omni-1.0-mini and -max, each with
-  a calibration fitted on the port's own readouts (GGUF: on Q8_0); an 8-bit `-MLX` port (`--mode mlx`,
-  `CALIBRATION.mlx.json`) of 1.0-mini. `VLLM_BATCH_INVARIANT=1` gives repeatable answers in `--mode vllm`
-  ([OMNI.md](OMNI.md#serve)).
+  a calibration fitted on the port's own readouts (GGUF: on Q8_0); 8-bit `-MLX` ports (`--mode mlx`,
+  `CALIBRATION.mlx.json`) of 1.0-mini and 1.0-max. `VLLM_BATCH_INVARIANT=1` gives repeatable answers in
+  `--mode vllm` ([OMNI.md](OMNI.md#serve)).
 - **From the community.** `basal-export-gguf` (Piotr Durlej, #8; extra `basal[gguf-export]`) converts a basal model
   to GGUF, or repairs an existing GGUF file, with the tokenizer fix of the `-GGUF` files, so that llama.cpp and Ollama
   tokenize like the Hugging Face tokenizer ([GGUF.md](GGUF.md#convert-yourself)). Two experimental,
