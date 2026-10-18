@@ -185,11 +185,31 @@ def test_no_compile_after_warm_up(backend, ckpt):
     assert (backend._fwd._cache_size(), backend._read._cache_size()) == before
 
 
+def test_no_libtpu_does_not_import_jax(monkeypatch):
+    """The default-mode probe: a JAX without libtpu (CPU or GPU JAX installed for something else) is not imported."""
+    import builtins
+    import importlib.util
+    from basal.tpu import tpu_available
+    find, real, seen = importlib.util.find_spec, builtins.__import__, []
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "libtpu" else find(name, *a))
+
+    def record(name, *a, **k):
+        seen.append(name)
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", record)
+    assert tpu_available() is False
+    assert "jax" not in seen
+
+
 def test_broken_jax_is_no_tpu(monkeypatch):
     """The default-mode probe: a JAX that fails to import or to initialise means no TPU, not a crash."""
     import builtins
+    import importlib.util
     import jax
     from basal.tpu import tpu_available
+    find = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: object() if name == "libtpu" else find(name, *a))
     monkeypatch.setattr(jax, "devices", lambda *a: (_ for _ in ()).throw(ValueError("broken libtpu")))
     assert tpu_available() is False
     real = builtins.__import__

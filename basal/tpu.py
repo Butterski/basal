@@ -155,10 +155,12 @@ def subtree_ends(seg, parent):
 
 
 def tpu_available():
-    """True when JAX is installed and sees a TPU. Only the default-mode probe: a JAX that fails to import or to
-    initialise counts as no TPU (an explicit --mode tpu shows the error, TPUBackend)."""
+    """True when JAX and libtpu (basal[tpu]) are installed and JAX sees a TPU. Only the default-mode probe: without
+    libtpu JAX is not imported (a CPU or GPU JAX installed for something else never selects or slows another mode),
+    and a JAX that fails to import or to initialise counts as no TPU (an explicit --mode tpu shows the error,
+    TPUBackend)."""
     import importlib.util
-    if importlib.util.find_spec("jax") is None:
+    if importlib.util.find_spec("jax") is None or importlib.util.find_spec("libtpu") is None:
         return False
     try:
         import jax
