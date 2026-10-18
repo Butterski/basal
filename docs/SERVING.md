@@ -1,6 +1,7 @@
 # Serving, batch inference and benchmarks
 
-Flags of `basal-serve`, inference on a JSONL file with `basal-run`, and benchmarking a GPU.
+Flags of `basal-serve`, inference on a JSONL file with `basal-run`, a look inside one decision with `basal-viz`, and
+benchmarking a GPU.
 
 ## Serving modes
 
@@ -124,6 +125,25 @@ Ready-to-run examples (Polish and English) in `basal/examples/` of the repositor
 ```bash
 for f in choice noul score complex; do basal-run --input $EX/$f.jsonl --output answers_$f.jsonl; done
 ```
+
+## See how a decision is made
+
+`basal-viz` (contributed by [@lukaspoloki](https://github.com/lukaspoloki), [#2](https://github.com/rkinas/basal/pull/2))
+opens a local web page that runs the model and shows every step of a decision: the prompt of each option order the
+server asks (prompt format and option codes from the model's `basal.json`; one order by default for basal-2.0), the
+shared-prefix packing when there are two orders, the code probabilities after every layer ("logit lens"), the code
+readout, the calibration and the decision against the thresholds the calibration file certifies. The same request is
+answered by the server in the same process, and the page shows the difference (0 for a single question; a request with
+several questions shares its state in one packed row, which moves bf16 probabilities by a few thousandths). The bundled
+examples are in a drop-down, with the expected answer where the file has one.
+
+```bash
+basal-viz --model Remek/basal-2.0-mini --port 8080     # then open http://127.0.0.1:8080
+```
+
+It runs `--mode mps` on Apple Silicon and `--mode eager` elsewhere (`--device`, `--orders 1|2`, `--calibration` as for
+`basal-serve`), and only the Llama-architecture models (basal-1.0, basal-1.5, basal-2.0; not basal-omni). It is meant
+for exploring, not serving: every question runs one extra forward per option order to record all layers.
 
 ## Benchmark your GPU
 

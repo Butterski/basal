@@ -408,3 +408,30 @@ def test_viz_segments_rebuild_the_prompt():
     seg = segments(p, "Klient: błąd hasła.", "Który dział?", opts)
     assert "".join(s["text"] for s in seg) == p
     assert [s["kind"] for s in seg if s["kind"] != "template"] == ["state", "question", "option", "option", "prefill"]
+
+
+def test_viz_segments_format_2_codes():
+    """Prompt format 2 (basal-2.0): option codes past Z, and the segments still rebuild the prompt."""
+    from basal.prompt import render
+    from basal.viz import segments
+    opts = [f"Dział {i}" for i in range(30)]
+    p = render(Tok(), "Klient: błąd hasła.", "Który dział?", opts, fmt=2)
+    seg = segments(p, "Klient: błąd hasła.", "Który dział?", opts, fmt=2)
+    assert "".join(s["text"] for s in seg) == p
+    kinds = [s["kind"] for s in seg if s["kind"] != "template"]
+    assert kinds == ["state", "question"] + ["option"] * 30 + ["prefill"]
+    assert [s["text"] for s in seg if s["kind"] == "option"][27] == "AB. Dział 27"
+
+
+def test_viz_packing_and_served_comparison():
+    from basal.viz import compare_served, packing
+    assert packing([[1, 2, 3, 4], [1, 2, 5, 6, 7]]) == {"prefix": 2, "tails": [2, 3], "separate": 9}
+    assert packing([[1, 2, 3]]) == {"prefix": 0, "tails": [3], "separate": 3}  # one option order: nothing to share
+    res = {"questions": [
+        {"qname": "dept", "label_key": None, "keys": ["it", "hr"], "calibrated": [0.75, 0.25]},
+        {"qname": "tags", "label_key": "d", "keys": ["true", "false"], "calibrated": [0.6, 0.4]}]}
+    served = {"answers": {"dept": {"probabilities": {"it": 0.7, "hr": 0.3}},
+                          "tags": {"probabilities": {"d": 0.625, "z": 0.1}}}}
+    out = compare_served(res, served)
+    assert abs(out["questions"][0]["served_max_diff"] - 0.05) < 1e-9
+    assert abs(out["questions"][1]["served_max_diff"] - 0.025) < 1e-9 and out["served"] is served["answers"]

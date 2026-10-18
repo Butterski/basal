@@ -197,8 +197,9 @@ canvas.mask { width: 200px; height: 200px; border-radius: 6px; border: 1px solid
   <section id="out">
     <div class="empty">
       <h2>Pick an example or write a question, then press Decide</h2>
-      <p>Every step the model takes is shown: the prompt it reads, both option orders packed into one pass,
-        how the answer forms layer by layer, the letter readout, averaging, calibration and the final call.</p>
+      <p>Every step the model takes is shown: the prompt it reads, the option orders it is asked in (packed into one
+        pass when there are two), how the answer forms layer by layer, the option-code readout, calibration and the final
+        call, next to the answer basal-serve returns for the same request.</p>
     </div>
   </section>
 </main>
@@ -213,6 +214,7 @@ const FINAL = "var(--ink-2)";
 const pct = (p, d = 1) => (p * 100).toFixed(d) + "%";
 const optColor = j => j < SERIES.length ? `var(${SERIES[j]})` : "var(--neutral-mark)";
 let INFO = null, EXAMPLES = [], last = null;
+const EDITABLE = ["choice", "noul", "score", "multi"];
 
 function h(tag, attrs = {}, ...kids) {
   const e = document.createElement(tag);
@@ -259,7 +261,8 @@ const hideTip = () => { tip.style.display = "none"; };
 // ---- editor -----------------------------------------------------------------------------------------------------
 function questionEditor(name, q) {
   const box = h("div", { class: "qedit" });
-  const type = h("select", {}, ...["choice", "noul", "score"].map(t => h("option", { value: t }, t)));
+  if (!EDITABLE.includes(q.type || "choice")) return rawEditor(name, q);
+  const type = h("select", {}, ...EDITABLE.map(t => h("option", { value: t }, t)));
   type.value = q.type || "choice";
   const nm = h("input", { value: name, placeholder: "name", style: { width: "110px" }, "aria-label": "Question name" });
   const instr = h("textarea", { rows: 2, placeholder: "Question, e.g. Do którego działu skierować zgłoszenie?" });
@@ -283,7 +286,7 @@ function questionEditor(name, q) {
   const addBtn = h("button", { class: "ghost", onclick: () => addOpt("", "") }, "+ option");
   const sync = () => {
     const noul = type.value === "noul";
-    addBtn.style.display = noul ? "none" : ""; keys.style.display = type.value === "noul" ? "none" : "";
+    addBtn.style.display = noul ? "none" : ""; keys.style.display = ["noul", "multi"].includes(type.value) ? "none" : "";
     if (noul) {
       const rows = [...opts.children];
       while (rows.length > 2) rows.pop().remove();
@@ -302,9 +305,22 @@ function questionEditor(name, q) {
     const t = type.value, rows = [...opts.children].map(r => [r.children[0].value.trim(), r.children[1].value.trim()]);
     const out = { type: t, instructions: instr.value.trim() };
     if (t === "noul") { const c = {}; if (rows[0][1]) c.true = rows[0][1]; if (rows[1][1]) c.false = rows[1][1]; if (Object.keys(c).length) out.criteria = c; }
-    else { out.criteria = Object.fromEntries(rows.filter(r => r[0] || r[1]).map((r, i) => [r[0] || String(i), r[1] || null])); out.option_keys = keys.value; }
+    else {
+      out.criteria = Object.fromEntries(rows.filter(r => r[0] || r[1]).map((r, i) => [r[0] || String(i), r[1] || null]));
+      if (t !== "multi") out.option_keys = keys.value;
+    }
     return [nm.value.trim() || "q", out];
   };
+  return box;
+}
+function rawEditor(name, q) {  // a question type the form does not edit: its JSON, sent as written
+  const box = h("div", { class: "qedit" });
+  const nm = h("input", { value: name, placeholder: "name", style: { width: "110px" }, "aria-label": "Question name" });
+  const js = h("textarea", { rows: 6, "aria-label": "Question JSON" });
+  js.value = JSON.stringify(q, null, 2);
+  box.append(h("div", { class: "row" }, nm, h("span", { class: "chip" }, q.type), h("button", { class: "ghost", title: "Remove question", onclick: () => box.remove() }, "×")),
+    h("label", { class: "f" }, "Question ", h("span", { class: "hint" }, "JSON, as in the API")), js);
+  box.read = () => [nm.value.trim() || "q", JSON.parse(js.value)];
   return box;
 }
 function loadRequest(req) {
@@ -371,8 +387,9 @@ $("#ex").onchange = e => {
 // ---- rendering --------------------------------------------------------------------------------------------------
 function verdict(conf, th) {
   const t1 = th["0.01"], t5 = th["0.05"];
+  if (t1 == null && t5 == null) return { color: "var(--neutral-mark)", icon: "–", label: "No certified threshold", why: "the calibration file certifies no confidence level for this question type, so basal-serve defers it whenever a request sets max_error" };
   if (t1 != null && conf >= t1) return { color: "var(--good)", icon: "✓", label: "Auto-accept", why: `confidence ≥ ${t1.toFixed(3)}: accepting every decision at least this confident gave about 1% errors on test data` };
-  if (t5 != null && conf >= t5) return { color: "var(--warning)", icon: "!", label: "Accept at 5% risk", why: `confidence ≥ ${t5.toFixed(3)}: accepting every decision at least this confident gave about 5% errors (the 1% level starts at ${t1.toFixed(3)})` };
+  if (t5 != null && conf >= t5) return { color: "var(--warning)", icon: "!", label: "Accept at 5% risk", why: `confidence ≥ ${t5.toFixed(3)}: accepting every decision at least this confident gave about 5% errors ${t1 != null ? ` (the 1% level starts at ${t1.toFixed(3)})` : " (no 1% level is certified)"}` };
   return { color: "var(--critical)", icon: "?", label: "Route to a person", why: `below ${t5 != null ? t5.toFixed(3) : "the threshold"}: too uncertain to accept automatically` };
 }
 function statusChip(v) { return h("span", { class: "status", title: v.why }, h("span", { class: "ic", style: { background: v.color } }, v.icon), v.label); }
@@ -387,7 +404,9 @@ function render(res, req, gold) {
 function renderQuestion(q, goldKey) {
   const a = q.answer, v = verdict(a.confidence, q.thresholds);
   const wrap = h("div", { class: "result" });
-  const typeLabel = { choice: "choice", noul: "yes / no", score: "score" }[q.type];
+  const typeLabel = q.kind === "multi" ? "multi-label (yes / no per label)" : ({ choice: "choice", noul: "yes / no", score: "score" }[q.type] + (q.kind !== q.type ? ` (${q.kind})` : ""));
+  const two = q.orders.length > 1;
+  let n = 0;
   let heroV = pct(a.confidence, 1), heroL = "confidence";
   if (q.type === "noul") { heroV = pct(a.noul, 1); heroL = "P(yes)"; }
   if (q.type === "score") { heroV = a.score.toFixed(2); heroL = `expected level (0–${q.options.length - 1})`; }
@@ -400,29 +419,32 @@ function renderQuestion(q, goldKey) {
     h("div", { class: "hero" }, h("div", { class: "v" }, heroV), h("div", { class: "l" }, heroL)),
     h("div", { class: "answer" }, h("span", { class: "hint" }, "Answer"), h("span", { class: "opt-text" }, q.options[a.index]), statusChip(v), goldEl)));
 
-  wrap.append(step(1, "What the model reads",
-    "Your question becomes a chat prompt with lettered options. The assistant turn is pre-filled with {\"answer\": \" so the very next token must be a letter. It is asked twice: options in original and in reversed order.",
+  wrap.append(step(++n, "What the model reads",
+    `Your question becomes a chat prompt with an option code before each option (prompt format ${INFO?.prompt_format ?? "?"}). The assistant turn is pre-filled with {"answer": " so the very next token must be a code. ` +
+      (two ? "It is asked twice: options in original and in reversed order." : "It is asked once, in the order given (this model's default; basal-serve --orders 2 adds the reversed order)."),
     promptView(q)));
-  wrap.append(step(2, "Both orders in one forward pass",
+  if (two) wrap.append(step(++n, "Both orders in one forward pass",
     "The two prompts share everything up to the options. The server packs them into one row: the shared prefix is computed once, and each option block attends only to the prefix and to itself.",
     packView(q)));
-  wrap.append(step(3, "How the decision forms, layer by layer",
-    `After each of the ${q.layers.length} layers, the hidden state at the answer position is read through the final norm and output head ("logit lens"), averaged over both orders. Early layers were not trained to be read this way, so treat them as a rough picture; the last layer is the real answer.`,
+  wrap.append(step(++n, "How the decision forms, layer by layer",
+    `After each of the ${q.layers.length} layers, the hidden state at the answer position is read through the final norm and output head ("logit lens")${two ? ", averaged over both orders" : ""}. Early layers were not trained to be read this way, so treat them as a rough picture; the last layer is the real answer.`,
     layerChart(q)));
-  wrap.append(step(4, "Letter readout",
-    "Only the logits of the option letters are kept and turned into probabilities. The same option has a different letter in each order.",
+  wrap.append(step(++n, "Option-code readout",
+    "Only the logits of the option codes are kept and turned into probabilities." + (two ? " The same option has a different code in each order." : ""),
     readoutView(q)));
-  wrap.append(step(5, "Average both orders, then calibrate",
-    `Probabilities are mapped back to the options and averaged, which cancels most of the preference for a position. Then the per-type temperature from CALIBRATION.json (T = ${q.temperature.toFixed(3)} for ${q.type}) makes the confidence match the observed accuracy.`,
+  wrap.append(step(++n, two ? "Average both orders, then calibrate" : "Calibrate",
+    (two ? "Probabilities are mapped back to the options and averaged, which cancels most of the preference for a position. Then t" : "T") +
+      `he temperature of the calibration file (T = ${q.temperature.toFixed(3)} for ${q.type} with ${q.options.length} options) makes the confidence match the observed accuracy.`,
     averageView(q)));
-  wrap.append(step(6, "Decision",
-    "The top option is the answer. Its calibrated confidence is compared with thresholds fixed on calibration data before testing.",
+  wrap.append(step(++n, "Decision",
+    "The top option is the answer. Its calibrated confidence is compared with the thresholds the calibration file certifies for this question type.",
     decisionView(q, v)));
   const t = q.timing_ms;
   wrap.append(h("div", { class: "step foot" },
-    h("span", {}, `packed forward as served: ${Math.round(t.packed)} ms`),
-    h("span", {}, `two separate forwards with every layer recorded: ${Math.round(t.separate_with_lens)} ms`),
-    h("span", {}, `packed vs separate max difference: ${q.packed_max_diff.toExponential(1)}`)));
+    h("span", {}, `${INFO?.mode ?? "engine"} forward as served: ${Math.round(t.packed)} ms`),
+    h("span", {}, `${two ? "two separate forwards" : "a forward"} with every layer recorded: ${Math.round(t.separate_with_lens)} ms`),
+    h("span", {}, `served vs recorded readout, max difference: ${q.packed_max_diff.toExponential(1)}`),
+    q.served_max_diff != null ? h("span", {}, `basal-serve's answer vs this page: max difference ${q.served_max_diff.toExponential(1)}`) : null));
   return wrap;
 }
 
@@ -436,7 +458,7 @@ function promptView(q) {
     count.textContent = `${o.n_tokens} tokens · option order ${o.perm.map(j => o.letters[o.perm.indexOf(j)] + "=" + (j + 1)).join(" ")}`;
   };
   const tabs = h("div", { class: "tabs" }, ...q.orders.map((_, i) => h("button", { onclick: () => show(i) },
-    h("span", { class: "lk", style: { background: ORDER_COLORS[i], marginRight: "6px", verticalAlign: "middle" } }), i ? "Order 2 (reversed)" : "Order 1 (original)")));
+    h("span", { class: "lk", style: { background: ORDER_COLORS[i], marginRight: "6px", verticalAlign: "middle" } }), q.orders.length < 2 ? "Option order (as given)" : i ? "Order 2 (reversed)" : "Order 1 (original)")));
   const count = h("span", { class: "hint", style: { marginLeft: "10px" } });
   box.append(h("div", {}, tabs, count), pre, h("div", { class: "keyrow" },
     ...[["var(--w-state)", "state"], ["var(--w-question)", "question"], ["var(--w-option)", "options"], ["var(--w-prefill)", "answer pre-fill"]].map(([c, l]) => h("span", {}, h("span", { class: "sw", style: { background: c } }), l)),
@@ -550,12 +572,12 @@ function readoutView(q) {
     o.letters.forEach((letter, pos) => {
       const j = o.perm[pos], p = o.letter_probs[pos], win = pos === best ? "win" : "";
       grid.append(h("span", { class: "letter" }, letter), h("span", { class: "txt " + win, title: q.options[j] }, q.options[j]),
-        h("div", { class: "track", onpointermove: e => showTip(e, `order ${i + 1} · letter ${letter}`, [{ color: ORDER_COLORS[i], value: pct(p, 2), label: q.options[j] }]), onpointerleave: hideTip },
+        h("div", { class: "track", onpointermove: e => showTip(e, `order ${i + 1} · code ${letter}`, [{ color: ORDER_COLORS[i], value: pct(p, 2), label: q.options[j] }]), onpointerleave: hideTip },
           h("div", { style: { width: Math.max(0.3, p * 100) + "%", background: ORDER_COLORS[i] } })),
         h("span", { class: "val " + win }, pct(p)));
     });
     const top = o.top_tokens.slice(0, 3).map(([t, p]) => h("span", {}, h("code", {}, JSON.stringify(t)), " " + pct(p) + "  "));
-    return h("div", {}, h("h4", {}, h("span", { class: "lk", style: { background: ORDER_COLORS[i] } }), i ? "Order 2 (reversed)" : "Order 1 (original)"), grid,
+    return h("div", {}, h("h4", {}, h("span", { class: "lk", style: { background: ORDER_COLORS[i] } }), q.orders.length < 2 ? "Option order (as given)" : i ? "Order 2 (reversed)" : "Order 1 (original)"), grid,
       h("div", { class: "toptok" }, "Unrestricted next token: ", ...top));
   });
   return h("div", { class: "orders" }, ...cols);
@@ -576,7 +598,7 @@ function averageView(q) {
       h("span", { class: "val" }, pct(q.mean[j])));
   }
   const gap = Math.max(...q.options.map((_, j) => Math.abs(q.orders[0].canon[j] - (q.orders[1]?.canon[j] ?? q.orders[0].canon[j]))));
-  const c = h("div", { class: "cmp", style: { marginTop: "18px" } }, h("span", { class: "hdr" }, "option"), h("span", { class: "hdr" }, "average → calibrated"), h("span", { class: "hdr", style: { textAlign: "right" } }, "final"));
+  const c = h("div", { class: "cmp", style: { marginTop: "18px" } }, h("span", { class: "hdr" }, "option"), h("span", { class: "hdr" }, q.orders.length > 1 ? "average → calibrated" : "raw → calibrated"), h("span", { class: "hdr", style: { textAlign: "right" } }, "final"));
   for (let j = 0; j < k; j++) {
     const win = j === q.answer.index;
     c.append(h("span", { class: "txt", style: { fontWeight: win ? 600 : 400 }, title: q.options[j] }, q.options[j]),
@@ -586,9 +608,11 @@ function averageView(q) {
         h("div", { style: { width: Math.max(.3, q.calibrated[j] * 100) + "%", background: FINAL } })),
       h("span", { class: "val", style: { fontWeight: win ? 600 : 400, color: win ? "var(--ink)" : "" } }, pct(q.calibrated[j])));
   }
+  const calLegend = legend([{ color: "var(--neutral-mark)", label: q.orders.length > 1 ? "average (raw)" : "raw" }, { color: FINAL, label: `calibrated, T = ${q.temperature.toFixed(3)}${q.temperature > 1 ? " (softens)" : q.temperature < 1 ? " (sharpens)" : ""}` }]);
+  if (q.orders.length < 2) return h("div", {}, c, calLegend);
   return h("div", {}, g, legend([{ color: ORDER_COLORS[0], label: "order 1" }, { color: ORDER_COLORS[1], label: "order 2" }, { color: "var(--neutral-mark)", label: "average" }]),
     h("p", { class: "hint", style: { margin: "8px 0 0" } }, `Largest disagreement between the two orders: ${pct(gap)}${gap > 0.2 ? " — the model is sensitive to option order here" : ""}.`),
-    c, legend([{ color: "var(--neutral-mark)", label: "average (raw)" }, { color: FINAL, label: `calibrated, T = ${q.temperature.toFixed(3)}${q.temperature > 1 ? " (softens)" : q.temperature < 1 ? " (sharpens)" : ""}` }]));
+    c, calLegend);
 }
 
 function decisionView(q, v) {
@@ -609,7 +633,8 @@ function decisionView(q, v) {
     body.push(h("div", { class: "scale" }, ...q.options.map((o, i) => h("div", { class: i === lvl ? "on" : "", title: o }, `${i} · ${o}`))),
       h("p", { class: "hint", style: { margin: "6px 0 0" } }, `Expected level ${q.answer.score.toFixed(2)} = Σ level × probability; most likely level: ${q.options[q.answer.index]}.`));
   }
-  if (q.type === "noul") body.push(h("p", { class: "hint", style: { margin: "8px 0 0" } }, `P(yes) = ${pct(q.answer.noul, 2)} — the API returns this as "noul".`));
+  if (q.type === "noul") body.push(h("p", { class: "hint", style: { margin: "8px 0 0" } }, `P(yes) = ${pct(q.answer.noul, 2)} — ` +
+    (q.kind === "multi" ? `the API returns it as this label's probability in the multi answer.` : `the API returns this as "noul".`)));
   return h("div", {}, ...body);
 }
 
@@ -618,7 +643,7 @@ function decisionView(q, v) {
   renderHistory();
   try {
     INFO = await (await fetch("/api/info")).json();
-    $("#modelchip").textContent = `${INFO.model} · ${INFO.device} · ${INFO.dtype} · ${INFO.layers} layers`;
+    $("#modelchip").textContent = `${INFO.model} · ${INFO.device} · ${INFO.dtype} · ${INFO.layers} layers · prompt format ${INFO.prompt_format} · ${INFO.orders} option order${INFO.orders === 1 ? "" : "s"}`;
     EXAMPLES = await (await fetch("/api/examples")).json();
     const sel = $("#ex"), groups = {};
     EXAMPLES.forEach((e, i) => {
