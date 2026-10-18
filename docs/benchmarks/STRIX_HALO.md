@@ -1,5 +1,11 @@
 # `--mode strix`: basal-1.5 and basal-2.0 on AMD Strix Halo
 
+*Experimental, community-maintained:* `--mode strix` was contributed by [@kardysm](https://github.com/kardysm)
+([#14](https://github.com/rkinas/basal/pull/14)), and every number on this page was measured by @kardysm on the machine
+described below. The benchmark scripts (`bench_matrix.py`, `edge_check.py`, `bench_ab.py`, `report.py`) and the raw
+results behind these tables are in the author's fork: [kardysm/basal#3](https://github.com/kardysm/basal/pull/3);
+[Raw results](#raw-results-summary) summarises them.
+
 `--mode strix` (`basal/strix.py`) is a basal forward written for the Radeon 8060S (gfx1151) after a profile of where
 `--mode gguf` spends its time on it. It keeps the bf16 weights and replaces the slow kernels with Triton ones. It was
 written and tuned on basal-1.5; basal-2.0 has the same architecture and runs through it unchanged. On the request matrix
@@ -67,9 +73,9 @@ reads one option order by default (basal-1.5 read two), so a request has about h
 `--mode strix` with the bf16 weights, `--mode gguf` with `basal-2.0-4.5B-Q8_0.gguf`; both use the model's
 `CALIBRATION.json` (the same file in both folders).
 
-Interleaved A/B (`bench_ab.py`: both servers up, each shape sent to both engines in alternating order, median of 5
-rounds; 32 clients: median of 2 bursts of 128 single questions each), so thermal drift and the power limit hit both
-engines alike:
+Interleaved A/B (`bench_ab.py` in [kardysm/basal#3](https://github.com/kardysm/basal/pull/3): both servers up, each
+shape sent to both engines in alternating order, median of 5 rounds; 32 clients: median of 2 bursts of 128 single
+questions each), so thermal drift and the power limit hit both engines alike:
 
 | request | prompt tokens | `gguf` | **`strix`** | speed-up |
 |---|---|---|---|---|
@@ -94,7 +100,7 @@ engines alike:
   equal fp32. `strix` and `gguf` differ on 4 of 188 matrix decisions, all yes / no labels of a multi-label question
   on XL at 0.47–0.54.
 - Start-up 6.2 s and 10.1 GiB GTT (`gguf` 3.3 s, 5.8 GiB), as with basal-1.5.
-- The matrix run (one engine at a time, full tables under [Results: basal-2.0](#results-basal-20)) agrees with the A/B
+- The matrix run (one engine at a time, tables under [Raw results](#raw-results-summary)) agrees with the A/B
   within 5%, except S with 1 question: `strix` 231 ms in the matrix and 142–148 ms in all 5 A/B rounds, `gguf` 126 and
   131–143 ms.
 
@@ -145,19 +151,19 @@ every question is what basal-2.0 saves.
 
 ## Method
 
-**Request matrix** (`bench_matrix.py`): four states built from the bundled examples, S / M / L / XL ≈ 100 / 570 / 2,000 /
-6,060 tokens, each with 1, 2, 5, 10 and 20 questions from a fixed mixed pool (choice, yes/no, score, an `act` with costs
-and a 4-label `multi`, so 20 questions are 23 branches and 46 prompts). Pass 0 keeps the answers; two timed passes put a
-marker in front of the state so no engine can answer from a prompt cache. Concurrency: single questions over short
-states, 48–256 requests per level.
+**Request matrix** (`bench_matrix.py`, in the fork): four states built from the bundled examples, S / M / L / XL ≈ 100 /
+570 / 2,000 / 6,060 tokens, each with 1, 2, 5, 10 and 20 questions from a fixed mixed pool (choice, yes/no, score, an
+`act` with costs and a 4-label `multi`, so 20 questions are 23 branches and 46 prompts). Pass 0 keeps the answers; two
+timed passes put a marker in front of the state so no engine can answer from a prompt cache. Concurrency: single
+questions over short states, 48–256 requests per level.
 
 **Reference**: `basal-serve --mode eager --dtype float32 --soam off --max-batch 1`, every prompt computed on its own in
 fp32 (S, M and L with all question counts, XL with 1 and 2; XL with more questions takes minutes per request in fp32).
 
-**Edge cases** (`edge_check.py`): 12 requests (mixed PL / EN questions over one state, 10 options, the same question
-three times, a JSON state, `facts: auto`, long option texts, a 5-level score, an 8-label `multi` with `min` / `max`, an
-`act` with a cost matrix, English only, a 2-character state, `option_keys` show vs hide), sent one after another and
-then all at once (the server batches them).
+**Edge cases** (`edge_check.py`, in the fork): 12 requests (mixed PL / EN questions over one state, 10 options, the same
+question three times, a JSON state, `facts: auto`, long option texts, a 5-level score, an 8-label `multi` with `min` /
+`max`, an `act` with a cost matrix, English only, a 2-character state, `option_keys` show vs hide), sent one after
+another and then all at once (the server batches them).
 
 **Engines** (all `basal-serve` on one port):
 
@@ -174,18 +180,9 @@ basal-2.0: the same servers with `--model Remek/basal-2.0-4.5B` (`strix`, fp32 r
 Start-up is the time to the first `/health`; GTT the memory the server adds (`mem_info_gtt_used` before the start and
 after it; it does not grow under load).
 
-Reproduce: start an engine, then
-
-```bash
-python docs/benchmarks/bench_matrix.py --url http://127.0.0.1:8000/v1/systemone --label strix
-python docs/benchmarks/edge_check.py --url http://127.0.0.1:8000/v1/systemone --label strix
-python docs/benchmarks/report.py results/matrix results/edge > report.md
-# interleaved A/B of two running engines (basal-2.0 results in results/2.0/)
-python docs/benchmarks/bench_ab.py --a gguf=http://127.0.0.1:8031/v1/systemone \
-    --b strix=http://127.0.0.1:8030/v1/systemone --out results/2.0/ab.json
-```
-
-`results/matrix` and `results/edge` hold the basal-1.5 runs, `results/2.0/` the basal-2.0 runs.
+Reproduce: the scripts, the commands and the raw results (basal-1.5 in `results/matrix` and `results/edge`, basal-2.0 in
+`results/2.0/`) are in `docs/benchmarks/` of the author's fork,
+[kardysm/basal#3](https://github.com/kardysm/basal/pull/3).
 
 ## Tests
 
@@ -198,240 +195,77 @@ and the same request alone, several forwards per call with a request bisected, d
 `basal-serve` and `basal-bench`. Full suite on this machine: 76 passed, 3 skipped (MLX / Apple only); on engine 2.0.0,
 511 passed, 19 skipped (MLX and the extras not installed).
 
-## Results: basal-1.5
+## Raw results (summary)
 
-Generated by `report.py` from `results/matrix` and `results/edge` (raw answers and latencies of every run).
+The contributor's raw results (the JSON written by `bench_matrix.py`, `edge_check.py` and `bench_ab.py`) are in
+[kardysm/basal#3](https://github.com/kardysm/basal/pull/3). We computed the tables below from those files before
+removing them from this repository; **every number is @kardysm's measurement**, not ours. The edge-case files record the
+model of each run (`basal-1.5-4.5B`, `basal-2.0-4.5B`, and the `-GGUF` folders for `gguf`); no file records the machine
+or the date. The machine is the one at the top of this page, and the commits that added the files are dated 15 Oct
+(basal-2.0) and 16 Oct 2026 (basal-1.5). The latency, throughput, start-up and agreement figures in the sections above
+agree with these files.
 
-### gguf → strix per request shape
+**Request matrix**, p50 latency per request over HTTP (states S / M / L / XL ≈ 100 / 570 / 2,000 / 6,000 tokens, 1-20
+questions; prompt tokens as the server counted them). p50 of the 2 timed passes for `gguf` and `strix` and of 1 timed
+pass for `fast-nocompile`; the fp32 reference ran each request once. Two passes give no p95 per shape: they differ by
+less than 5% except basal-2.0 `strix` S with 1 question (141 / 322 ms) and M with 2 (280 / 468 ms), and basal-1.5
+`strix` L with 10 (1.46 / 1.57 s).
 
-`--mode gguf` (llama.cpp in process, Vulkan, Q8_0) against `--mode strix` (PyTorch + Triton kernels for gfx1151, bf16). p50 of 2 timed passes, unique states.
+| request | tokens 1.5 | `gguf` | **`strix`** | `fast-nocompile` | fp32 ref. | tokens 2.0 | `gguf` | **`strix`** | fp32 ref. |
+|---|---|---|---|---|---|---|---|---|---|
+| S, 1 q | 480 | 178 ms | 159 ms | 309 ms | 1.77 s | 201 | 126 ms | 231 ms | 858 ms |
+| S, 2 q | 928 | 242 ms | 194 ms | 362 ms | 3.41 s | 386 | 145 ms | 149 ms | 1.60 s |
+| S, 5 q | 3,640 | 573 ms | 348 ms | 1.30 s | 13.79 s | 1,508 | 275 ms | 211 ms | 6.20 s |
+| S, 10 q | 6,496 | 1.13 s | 671 ms | 3.08 s | 24.70 s | 2,741 | 541 ms | 320 ms | 11.23 s |
+| S, 20 q | 11,178 | 1.79 s | 1.08 s | 5.28 s | 42.04 s | 4,692 | 831 ms | 467 ms | 19.61 s |
+| M, 1 q | 1,416 | 439 ms | 289 ms | 786 ms | 5.51 s | 669 | 397 ms | 264 ms | 2.59 s |
+| M, 2 q | 2,800 | 501 ms | 304 ms | 792 ms | 10.89 s | 1,322 | 409 ms | 374 ms | 5.13 s |
+| M, 5 q | 11,128 | 817 ms | 480 ms | 1.66 s | 43.00 s | 5,252 | 539 ms | 326 ms | 20.46 s |
+| M, 10 q | 18,664 | 1.39 s | 797 ms | 3.62 s | 72.17 s | 8,825 | 816 ms | 463 ms | 34.47 s |
+| M, 20 q | 32,706 | 2.12 s | 1.25 s | 7.33 s | 126.51 s | 15,456 | 1.13 s | 618 ms | 60.27 s |
+| L, 1 q | 4,296 | 1.28 s | 736 ms | 3.09 s | 18.65 s | 2,109 | 1.26 s | 711 ms | 9.32 s |
+| L, 2 q | 8,560 | 1.33 s | 766 ms | 3.68 s | 37.16 s | 4,202 | 1.29 s | 719 ms | 18.64 s |
+| L, 5 q | 34,168 | 1.73 s | 1.09 s | 4.96 s | 150.77 s | 16,772 | 1.42 s | 792 ms | 75.35 s |
+| L, 10 q | 56,104 | 2.38 s | 1.51 s | 19.44 s | 254.29 s | 27,545 | 1.72 s | 979 ms | 124.31 s |
+| L, 20 q | 98,946 | 3.22 s | 2.12 s | 24.44 s | 441.53 s | 48,576 | 2.07 s | 1.17 s | 217.49 s |
+| XL, 1 q | 12,404 | 4.16 s | 2.73 s | 34.02 s | 70.29 s | 6,163 | 4.20 s | 2.47 s | 31.81 s |
+| XL, 2 q | 24,776 | 4.25 s | 2.76 s | 67.15 s | 139.18 s | 12,310 | 4.22 s | 2.46 s | 64.06 s |
+| XL, 5 q | 99,032 | 4.78 s | 3.28 s | – | – | 49,204 | 4.42 s | 2.63 s | – |
+| XL, 10 q | 161,508 | 5.65 s | 3.85 s | – | – | 80,247 | 4.82 s | 2.79 s | – |
+| XL, 20 q | 285,430 | 6.77 s | 4.57 s | – | – | 141,818 | 5.26 s | 3.00 s | – |
 
-| state | questions | prompt tokens | gguf | strix | speed-up |
-|---|---|---|---|---|---|
-| S | 1 | 480 | 178 ms | **159 ms** | 1.12× |
-| S | 2 | 928 | 242 ms | **194 ms** | 1.25× |
-| S | 5 | 3,640 | 573 ms | **348 ms** | 1.65× |
-| S | 10 | 6,496 | 1.13 s | **671 ms** | 1.68× |
-| S | 20 | 11,178 | 1.79 s | **1.08 s** | 1.66× |
-| M | 1 | 1,416 | 439 ms | **289 ms** | 1.52× |
-| M | 2 | 2,800 | 501 ms | **304 ms** | 1.65× |
-| M | 5 | 11,128 | 817 ms | **480 ms** | 1.70× |
-| M | 10 | 18,664 | 1.39 s | **797 ms** | 1.75× |
-| M | 20 | 32,706 | 2.12 s | **1.25 s** | 1.70× |
-| L | 1 | 4,296 | 1.28 s | **736 ms** | 1.74× |
-| L | 2 | 8,560 | 1.33 s | **766 ms** | 1.74× |
-| L | 5 | 34,168 | 1.73 s | **1.09 s** | 1.59× |
-| L | 10 | 56,104 | 2.38 s | **1.51 s** | 1.57× |
-| L | 20 | 98,946 | 3.22 s | **2.12 s** | 1.52× |
-| XL | 1 | 12,404 | 4.16 s | **2.73 s** | 1.52× |
-| XL | 2 | 24,776 | 4.25 s | **2.76 s** | 1.54× |
-| XL | 5 | 99,032 | 4.78 s | **3.28 s** | 1.46× |
-| XL | 10 | 161,508 | 5.65 s | **3.85 s** | 1.47× |
-| XL | 20 | 285,430 | 6.77 s | **4.57 s** | 1.48× |
+**Per engine.** Start-up (to the first `/health`) and GTT of the matrix server. Decisions equal to the fp32 reference
+on the 17 requests it ran (S, M and L with 1-20 questions, XL with 1 and 2: 144 decisions; a decision is the top option
+of a question or the yes / no of one label of a multi-label question). The 12 edge-case requests sent one at a time (26
+decisions; with 12 requests, p95 is the slowest). Single questions over short states with 1 and 32 clients: decisions
+per second (p50 / p90 latency).
 
-| clients (single questions) | gguf dec/s · p50 | strix dec/s · p50 | throughput |
-|---|---|---|---|
-| 1 | 6.9/s · 141 ms | **6.1/s** · 159 ms | 0.88× |
-| 4 | 7.4/s · 540 ms | **8.4/s** · 470 ms | 1.14× |
-| 8 | 7.6/s · 1.06 s | **10.2/s** · 787 ms | 1.35× |
-| 16 | 7.7/s · 2.07 s | **10.5/s** · 1.51 s | 1.37× |
-| 32 | 7.7/s · 4.12 s | **10.9/s** · 2.92 s | 1.42× |
-| 64 | 7.7/s · 8.33 s | **11.0/s** · 5.79 s | 1.44× |
-
-### Start-up and memory
-
-| engine | start-up | GTT after start |
-|---|---|---|
-| gguf | 3.2 s | 5.8 GiB |
-| fast-nocompile | 888.4 s | 32.1 GiB |
-| **strix** | 6.1 s | 10.0 GiB |
-| eager fp32 (reference) | 5.6 s | 18.4 GiB |
-
-### Latency per request, all engines (p50; bold: fastest)
-
-| state | q | branches | gguf | fast-nocompile | **strix** |
-|---|---|---|---|---|---|
-| S | 1 | 1 | 178 ms | 309 ms | **159 ms** |
-| S | 2 | 2 | 242 ms | 362 ms | **194 ms** |
-| S | 5 | 8 | 573 ms | 1.30 s | **348 ms** |
-| S | 10 | 13 | 1.13 s | 3.08 s | **671 ms** |
-| S | 20 | 23 | 1.79 s | 5.28 s | **1.08 s** |
-| M | 1 | 1 | 439 ms | 786 ms | **289 ms** |
-| M | 2 | 2 | 501 ms | 792 ms | **304 ms** |
-| M | 5 | 8 | 817 ms | 1.66 s | **480 ms** |
-| M | 10 | 13 | 1.39 s | 3.62 s | **797 ms** |
-| M | 20 | 23 | 2.12 s | 7.33 s | **1.25 s** |
-| L | 1 | 1 | 1.28 s | 3.09 s | **736 ms** |
-| L | 2 | 2 | 1.33 s | 3.68 s | **766 ms** |
-| L | 5 | 8 | 1.73 s | 4.96 s | **1.09 s** |
-| L | 10 | 13 | 2.38 s | 19.44 s | **1.51 s** |
-| L | 20 | 23 | 3.22 s | 24.44 s | **2.12 s** |
-| XL | 1 | 1 | 4.16 s | 34.02 s | **2.73 s** |
-| XL | 2 | 2 | 4.25 s | 67.15 s | **2.76 s** |
-| XL | 5 | 8 | 4.78 s | – | **3.28 s** |
-| XL | 10 | 13 | 5.65 s | – | **3.85 s** |
-| XL | 20 | 23 | 6.77 s | – | **4.57 s** |
-
-### Cost of one more question (1 → 20 questions, per added question)
-
-| state | gguf | fast-nocompile | **strix** |
-|---|---|---|---|
-| S | 85 ms | 262 ms | 48 ms |
-| M | 88 ms | 344 ms | 50 ms |
-| L | 102 ms | 1.12 s | 73 ms |
-| XL | 137 ms | – | 97 ms |
-
-### Concurrency (single questions over short states, unique per request)
-
-| clients | gguf | fast-nocompile | **strix** |
-|---|---|---|---|
-| 1 | 6.9/s · 141 ms | 3.8/s · 246 ms | 6.1/s · 159 ms |
-| 4 | 7.4/s · 540 ms | 3.8/s · 1.10 s | 8.4/s · 470 ms |
-| 8 | 7.6/s · 1.06 s | 4.1/s · 1.95 s | 10.2/s · 787 ms |
-| 16 | 7.7/s · 2.07 s | 4.3/s · 3.70 s | 10.5/s · 1.51 s |
-| 32 | 7.7/s · 4.12 s | 4.6/s · 6.93 s | 10.9/s · 2.92 s |
-| 64 | 7.7/s · 8.33 s | 5.3/s · 12.06 s | 11.0/s · 5.79 s |
-
-### Agreement with the fp32 reference
-
-Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt computed separately in fp32), on 17 requests (S-q1, S-q2, S-q5, S-q10, S-q20, M-q1, M-q2, M-q5, M-q10, M-q20, L-q1, L-q2, L-q5, L-q10, L-q20, XL-q1, XL-q2). A decision is the top option of a question or the yes/no of one label of a multi-label question.
-
-| engine | same decision | mean \|Δp\| | max \|Δp\| |
-|---|---|---|---|
-| gguf | 143/144 | 0.0067 | 0.078 |
-| fast-nocompile | 143/144 | 0.0045 | 0.037 |
-| **strix** | 144/144 | 0.0042 | 0.028 |
-
-### strix against gguf (whole matrix)
-
-| comparison | same decision | mean \|Δp\| | max \|Δp\| |
-|---|---|---|---|
-| gguf (Q8_0) vs strix (bf16) | 187/188 | 0.0080 | 0.100 |
-
-### Edge cases
-
-12 requests: mixed PL / EN questions over one state, 10 options, the same question three times, a JSON state, `facts: auto`, long option texts, a 5-level score, an 8-label multi with min / max, an `act` with a cost matrix, an English-only request, a 2-character state, `option_keys` show vs hide. Sent one after another, then all at once (the server batches them).
-
-| engine | errors | concurrent = sequential decisions | concurrent vs sequential, max \|Δp\| | duplicate questions, max \|Δp\| | multi within min/max | act action | vs fp32: same decision | vs fp32: max \|Δp\| |
+| model, engine | start-up | GTT | matrix vs fp32: same decision | mean / max \|Δp\| | edge vs fp32 | edge, one at a time: p50 / p95 | 1 client | 32 clients |
 |---|---|---|---|---|---|---|---|---|
-| gguf | none | 26/26 | 0.0183 | 0.0e+00 | True | human | 26/26 | 0.016 |
-| **strix** | none | 26/26 | 0.0112 | 0.0e+00 | True | human | 26/26 | 0.009 |
-| eager fp32 (reference) | none | 26/26 | 0.0000 | 0.0e+00 | True | human | – | – |
+| basal-1.5, `gguf` (Q8_0) | 3.2 s | 5.8 GiB | 143/144 | 0.0067 / 0.078 | 26/26 | 218 ms / 502 ms | 6.9/s (141 ms / 166 ms) | 7.7/s (4.12 s / 4.26 s) |
+| basal-1.5, **`strix`** (bf16) | 6.1 s | 10.0 GiB | 144/144 | 0.0042 / 0.028 | 26/26 | 180 ms / 350 ms | 6.1/s (159 ms / 183 ms) | 10.9/s (2.92 s / 3.00 s) |
+| basal-1.5, `fast-nocompile` | 888.4 s | 32.1 GiB | 143/144 | 0.0045 / 0.037 | – | – | 3.8/s (246 ms / 304 ms) | 4.6/s (6.93 s / 7.02 s) |
+| basal-1.5, fp32 reference | 5.6 s | 18.4 GiB | reference | – | reference | 2.78 s / 13.99 s | – | – |
+| basal-2.0, `gguf` (Q8_0) | 3.3 s | 5.8 GiB | 142/144 | 0.0064 / 0.068 | 26/26 | 136 ms / 247 ms | 8.9/s (111 ms / 119 ms) | 12.1/s (2.60 s / 2.70 s) |
+| basal-2.0, **`strix`** (bf16) | 6.2 s | 10.1 GiB | 142/144 | 0.0047 / 0.028 | 26/26 | 145 ms / 194 ms | 7.1/s (140 ms / 142 ms) | 20.3/s (1.57 s / 1.58 s) |
+| basal-2.0, fp32 reference | 4.8 s | 17.9 GiB | reference | – | reference | 1.23 s / 6.06 s | – | – |
 
-## Results: basal-2.0
+Edge cases, every engine and both models: no request failed, the 12 requests sent all at once gave the same 26
+decisions as sent one at a time, a question asked three times got identical probabilities, the multi-label answer kept
+within its min / max, and the `act` question chose `human`.
 
-Generated by `report.py` from `results/2.0/matrix` and `results/2.0/edge`.
+**basal-2.0, interleaved A/B** (`bench_ab.py`: both servers up, 5 rounds per request; 32 clients: 2 bursts): median
+and slowest of the 5 rounds.
 
-### gguf → strix per request shape
-
-`--mode gguf` (llama.cpp in process, Vulkan, Q8_0) against `--mode strix` (PyTorch + Triton kernels for gfx1151, bf16). p50 of 2 timed passes, unique states.
-
-| state | questions | prompt tokens | gguf | strix | speed-up |
-|---|---|---|---|---|---|
-| S | 1 | 201 | 126 ms | **231 ms** | 0.54× |
-| S | 2 | 386 | 145 ms | **149 ms** | 0.97× |
-| S | 5 | 1,508 | 275 ms | **211 ms** | 1.30× |
-| S | 10 | 2,741 | 541 ms | **320 ms** | 1.69× |
-| S | 20 | 4,692 | 831 ms | **467 ms** | 1.78× |
-| M | 1 | 669 | 397 ms | **264 ms** | 1.50× |
-| M | 2 | 1,322 | 409 ms | **374 ms** | 1.09× |
-| M | 5 | 5,252 | 539 ms | **326 ms** | 1.66× |
-| M | 10 | 8,825 | 816 ms | **463 ms** | 1.76× |
-| M | 20 | 15,456 | 1.13 s | **618 ms** | 1.82× |
-| L | 1 | 2,109 | 1.26 s | **711 ms** | 1.77× |
-| L | 2 | 4,202 | 1.29 s | **719 ms** | 1.79× |
-| L | 5 | 16,772 | 1.42 s | **792 ms** | 1.79× |
-| L | 10 | 27,545 | 1.72 s | **979 ms** | 1.76× |
-| L | 20 | 48,576 | 2.07 s | **1.17 s** | 1.77× |
-| XL | 1 | 6,163 | 4.20 s | **2.47 s** | 1.70× |
-| XL | 2 | 12,310 | 4.22 s | **2.46 s** | 1.71× |
-| XL | 5 | 49,204 | 4.42 s | **2.63 s** | 1.68× |
-| XL | 10 | 80,247 | 4.82 s | **2.79 s** | 1.73× |
-| XL | 20 | 141,818 | 5.26 s | **3.00 s** | 1.75× |
-
-| clients (single questions) | gguf dec/s · p50 | strix dec/s · p50 | throughput |
+| request | `gguf` median (max) | **`strix`** median (max) | speed-up |
 |---|---|---|---|
-| 1 | 8.9/s · 111 ms | **7.1/s** · 140 ms | 0.80× |
-| 4 | 11.1/s · 358 ms | **12.3/s** · 325 ms | 1.11× |
-| 8 | 11.6/s · 682 ms | **17.1/s** · 465 ms | 1.47× |
-| 16 | 12.1/s · 1.30 s | **20.4/s** · 778 ms | 1.68× |
-| 32 | 12.1/s · 2.60 s | **20.3/s** · 1.57 s | 1.68× |
-| 64 | 12.0/s · 5.28 s | **20.4/s** · 3.10 s | 1.69× |
-
-### Start-up and memory
-
-| engine | start-up | GTT after start |
-|---|---|---|
-| gguf | 3.3 s | 5.8 GiB |
-| **strix** | 6.2 s | 10.1 GiB |
-| eager fp32 (reference) | 4.8 s | 17.9 GiB |
-
-### Latency per request, all engines (p50; bold: fastest)
-
-| state | q | branches | gguf | **strix** |
-|---|---|---|---|---|
-| S | 1 | 1 | **126 ms** | 231 ms |
-| S | 2 | 2 | **145 ms** | 149 ms |
-| S | 5 | 8 | 275 ms | **211 ms** |
-| S | 10 | 13 | 541 ms | **320 ms** |
-| S | 20 | 23 | 831 ms | **467 ms** |
-| M | 1 | 1 | 397 ms | **264 ms** |
-| M | 2 | 2 | 409 ms | **374 ms** |
-| M | 5 | 8 | 539 ms | **326 ms** |
-| M | 10 | 13 | 816 ms | **463 ms** |
-| M | 20 | 23 | 1.13 s | **618 ms** |
-| L | 1 | 1 | 1.26 s | **711 ms** |
-| L | 2 | 2 | 1.29 s | **719 ms** |
-| L | 5 | 8 | 1.42 s | **792 ms** |
-| L | 10 | 13 | 1.72 s | **979 ms** |
-| L | 20 | 23 | 2.07 s | **1.17 s** |
-| XL | 1 | 1 | 4.20 s | **2.47 s** |
-| XL | 2 | 2 | 4.22 s | **2.46 s** |
-| XL | 5 | 8 | 4.42 s | **2.63 s** |
-| XL | 10 | 13 | 4.82 s | **2.79 s** |
-| XL | 20 | 23 | 5.26 s | **3.00 s** |
-
-### Cost of one more question (1 → 20 questions, per added question)
-
-| state | gguf | **strix** |
-|---|---|---|
-| S | 37 ms | 12 ms |
-| M | 38 ms | 19 ms |
-| L | 43 ms | 24 ms |
-| XL | 55 ms | 28 ms |
-
-### Concurrency (single questions over short states, unique per request)
-
-| clients | gguf | **strix** |
-|---|---|---|
-| 1 | 8.9/s · 111 ms | 7.1/s · 140 ms |
-| 4 | 11.1/s · 358 ms | 12.3/s · 325 ms |
-| 8 | 11.6/s · 682 ms | 17.1/s · 465 ms |
-| 16 | 12.1/s · 1.30 s | 20.4/s · 778 ms |
-| 32 | 12.1/s · 2.60 s | 20.3/s · 1.57 s |
-| 64 | 12.0/s · 5.28 s | 20.4/s · 3.10 s |
-
-### Agreement with the fp32 reference
-
-Reference: `--mode eager --dtype float32 --soam off --max-batch 1` (every prompt computed separately in fp32), on 17 requests (S-q1, S-q2, S-q5, S-q10, S-q20, M-q1, M-q2, M-q5, M-q10, M-q20, L-q1, L-q2, L-q5, L-q10, L-q20, XL-q1, XL-q2). A decision is the top option of a question or the yes/no of one label of a multi-label question.
-
-| engine | same decision | mean \|Δp\| | max \|Δp\| |
-|---|---|---|---|
-| gguf | 142/144 | 0.0064 | 0.068 |
-| **strix** | 142/144 | 0.0047 | 0.028 |
-
-### strix against gguf (whole matrix)
-
-| comparison | same decision | mean \|Δp\| | max \|Δp\| |
-|---|---|---|---|
-| gguf (Q8_0) vs strix (bf16) | 184/188 | 0.0076 | 0.074 |
-
-### Edge cases
-
-12 requests: mixed PL / EN questions over one state, 10 options, the same question three times, a JSON state, `facts: auto`, long option texts, a 5-level score, an 8-label multi with min / max, an `act` with a cost matrix, an English-only request, a 2-character state, `option_keys` show vs hide. Sent one after another, then all at once (the server batches them).
-
-| engine | errors | concurrent = sequential decisions | concurrent vs sequential, max \|Δp\| | duplicate questions, max \|Δp\| | multi within min/max | act action | vs fp32: same decision | vs fp32: max \|Δp\| |
-|---|---|---|---|---|---|---|---|---|
-| gguf | none | 26/26 | 0.0446 | 0.0e+00 | True | human | 26/26 | 0.038 |
-| **strix** | none | 26/26 | 0.0318 | 0.0e+00 | True | human | 26/26 | 0.027 |
-| eager fp32 (reference) | none | 26/26 | 0.0000 | 0.0e+00 | True | human | – | – |
+| S, 1 q | 136 ms (143 ms) | 144 ms (148 ms) | 0.94× |
+| S, 5 q | 277 ms (281 ms) | 203 ms (207 ms) | 1.37× |
+| M, 1 q | 397 ms (409 ms) | 263 ms (270 ms) | 1.51× |
+| M, 10 q | 816 ms (830 ms) | 464 ms (475 ms) | 1.76× |
+| L, 1 q | 1.27 s (1.29 s) | 714 ms (727 ms) | 1.77× |
+| L, 5 q | 1.41 s (1.44 s) | 788 ms (809 ms) | 1.79× |
+| XL, 1 q | 4.16 s (4.24 s) | 2.41 s (2.46 s) | 1.73× |
+| XL, 5 q | 4.37 s (4.47 s) | 2.52 s (2.58 s) | 1.73× |
+| XL, 20 q | 5.25 s (5.45 s) | 2.90 s (2.99 s) | 1.81× |
+| single questions, 32 clients | 11.5/s | 19.0/s | 1.65× |
