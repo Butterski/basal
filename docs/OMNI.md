@@ -55,6 +55,9 @@ Ready files: [`Remek/basal-omni-1.0-mini-GGUF`](https://huggingface.co/Remek/bas
 [`Remek/basal-omni-1.0-max-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-max-GGUF) (Q8_0 and Q6_K, Modelfiles for
 Ollama, `CALIBRATION.gguf.json` fitted on Q8_0); their cards have the commands.
 
+8-bit MLX port for `--mode mlx` (Apple Silicon, `CALIBRATION.mlx.json`):
+[`Remek/basal-omni-1.0-mini-MLX`](https://huggingface.co/Remek/basal-omni-1.0-mini-MLX).
+
 llama.cpp tokenizes the rendered basal-omni prompts exactly like the Hugging Face tokenizer (2,000 of 2,000 development
 prompts), so text front ends (Ollama, `llama-server` with text prompts) read the same tokens. For Gemma 4 the engine
 reads the decoder inside mlx-lm's multimodal wrapper, applies the softcap to the fp32 code logits and keeps the whole
