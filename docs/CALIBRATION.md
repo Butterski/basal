@@ -184,14 +184,16 @@ engine 2.2, 16 Oct 2026:
 | ECE, choice / yes-no / score | 0.268 / 0.106 / 0.104 | **0.083 / 0.073 / 0.052** |
 | `max_error: 0.01`: automated, and its error | 12.6%, **8.0% wrong** | 0% (nothing certifiable) |
 | `max_error: 0.05`: automated, and its error | 54.3%, **21.4% wrong** | 3.7%, 0.0% wrong |
-| `verify` claims at `max_error: 0.01` | no task threshold | 56.0% automated, 0.4% wrong |
+| `verify` claims at `max_error: 0.01` | no task threshold | 54.8% automated, 0 wrong (bound 1.1%) |
 
 The shipped file's certificate holds on our calibration data, not on this domain: here its 1% setting would automate one
-decision in eight at 8% error. Fitted on the user's labels, the temperatures about double (the model is overconfident
-on these records), the calibration error falls two to three times, and the thresholds certify only what the model gets
-right here (accuracy 0.57 / 0.80 / 0.67, against noisy teacher labels): almost nothing is automated, which is the right
-answer for a model this inaccurate on this data. On `verify`, where it is 95% accurate, the 1% threshold automates over
-half of the claims. A hosted decision API offers no such step: its confidence is what it is on your data.
+decision in eight at 8% error. Fitted on the user's labels, the temperatures rise (choice 1.14 → 2.52, yes / no 1.21 →
+2.03, score 1.41 → 1.78: the model is overconfident on these records), the calibration error falls by type (choice 0.268
+→ 0.083, about 3.2 times; score 0.104 → 0.052, half; yes / no 0.106 → 0.073, about 30% lower), and the thresholds
+certify only what the model gets right here (accuracy 0.57 / 0.80 / 0.67, against noisy teacher labels): almost nothing
+is automated, which is the right answer for a model this inaccurate on this data. On `verify`, where it is 95% accurate,
+the 1% threshold fitted on the train split automates over half of the test claims (54.8%) with none wrong; the one-sided
+95% bound on its error is 1.1%. A hosted decision API offers no such step: its confidence is what it is on your data.
 
 ## Tasks: classify, verify, extract
 
