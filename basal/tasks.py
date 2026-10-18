@@ -79,6 +79,7 @@ def _labels(spec, name):
 ABBREV = {"np", "itd", "itp", "tzw", "ul", "nr", "sp", "o.o", "tj", "ok", "godz", "pkt", "art", "ust", "zł", "e.g",
           "i.e", "etc", "mr", "mrs", "dr", "prof", "inc", "ltd", "co", "no", "vs", "st", "jr", "fig", "al"}
 SENT_END = re.compile(r"[.!?…]+[\"”»)\]]*\s+(?=[\"„«(\[]?[A-ZĄĆĘŁŃÓŚŹŻ0-9])")
+WORD_END = re.compile(r"([\w.]+)[.!?…]*[\"”»)\]]*$")
 
 
 def units(text, unit="sentence"):
@@ -92,9 +93,12 @@ def units(text, unit="sentence"):
     elif unit == "paragraph":
         cuts = [m.end() for m in re.finditer(r"\n[ \t]*\n", text)]
     else:
-        cuts = []
+        cuts, prev = [], 0
         for m in SENT_END.finditer(text):
-            word = re.search(r"([\w.]+)[.!?…]*[\"”»)\]]*$", text[:m.start() + 1].rstrip())
+            # Search from the previous match's end, not from 0 (O(n²) per document): text[prev - 1] is whitespace,
+            # which no WORD_END character class contains, so no match could start earlier.
+            word = WORD_END.search(text, prev, m.start() + 1)
+            prev = m.end()
             w = (word.group(1) if word else "").rstrip(".").lower()
             if m.group(0)[0] == "." and (w in ABBREV or len(w) == 1 and w.isalpha()):
                 continue
