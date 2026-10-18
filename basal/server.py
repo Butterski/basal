@@ -70,6 +70,7 @@ MODES = {
     "mlx-q8": ("mlx", "q8", False),         # "mlx" with 8-bit weights made at load time (less memory, not faster)
     "mps": ("mps", None, False),            # Apple Silicon: PyTorch MPS + shared prefix, no graphs
     "gguf": ("gguf", None, False),          # llama.cpp in process on a GGUF file (--gguf; Metal, CUDA or CPU)
+    "strix": ("strix", None, False),       # AMD Strix Halo: Triton attention / FFN kernels, one sequence per chunk
     "ollama": ("ollama", None, False),      # Ollama with the GGUF exports (1.5); --ollama-url, --ollama-model
     "llamacpp": ("llamacpp", None, False),  # llama.cpp server with the GGUF exports (1.5); --llamacpp-url
     "tpu": ("tpu", None, False),            # Google TPU (experimental, basal[tpu]): JAX / XLA, SOAM, one program per shape
@@ -338,7 +339,7 @@ def calibration_name(kind, quant):
     return kind if kind in ("vllm", "sglang", "mlx", "gguf", "ollama", "llamacpp", "tpu") else None
 
 
-DETERMINISTIC_KINDS = ("graph", "exit", "eager", "mps", "mlx", "gguf", "tpu")  # engines that run in this process
+DETERMINISTIC_KINDS = ("graph", "exit", "eager", "mps", "mlx", "gguf", "strix", "tpu")  # engines that run in this process
 
 
 def deterministic_setup(kind):
@@ -347,8 +348,8 @@ def deterministic_setup(kind):
     before the first cuBLAS call (the workspace setting is read when the handle is created)."""
     if kind not in DETERMINISTIC_KINDS:
         raise SystemExit("--deterministic needs an engine that runs in this process (fast, fast-nocompile, fast-exit, "
-                         "fp8, nvfp4, eager, mps, mlx, gguf, tpu); vLLM, SGLang, Ollama and llama.cpp server batch requests "
-                         "their own way")
+                         "fp8, nvfp4, eager, mps, mlx, gguf, strix, tpu); vLLM, SGLang, Ollama and llama.cpp server "
+                         "batch requests their own way")
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
@@ -637,6 +638,9 @@ class Server:
             self.backend = MPSBackend(md, a.dtype, shared=shared)
         elif kind == "gguf":
             self.backend = GGUFBackend(md, a.gguf)
+        elif kind == "strix":
+            from .strix import StrixHaloFastBackend
+            self.backend = StrixHaloFastBackend(md, a.dtype)
         elif kind == "ollama":
             self.backend = OllamaBackend(md, a.ollama_url, a.ollama_model, parallel=a.http_parallel)
         elif kind == "llamacpp":
