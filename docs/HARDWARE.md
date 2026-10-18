@@ -422,9 +422,12 @@ Figures: `python docs/figures/make_figures.py` (matplotlib) from the measurement
 ## Google TPU (experimental, community-maintained)
 
 `--mode tpu` (extra `basal[tpu]`, [install](INSTALL.md#google-tpu-experimental-community-maintained)) runs the bf16
-weights in JAX / XLA on one TPU chip with the same SOAM packing, option codes and calibration as the basal engine. It is
-maintained outside the core team; measured on a Colab TPU v5e-1 (`TPU v5 lite`, 16 GB HBM), JAX 0.11.1. basal-2.0-max
-(11B, 22 GB of bf16 weights) needs more HBM than one v5e chip has.
+weights in JAX / XLA on one TPU chip with the same SOAM packing, option codes and calibration as the basal engine.
+Contributed and maintained by [@qooba](https://github.com/qooba) ([#15](https://github.com/rkinas/basal/pull/15)), not
+by the core team. It runs the Llama-architecture models (basal-1.0, basal-1.5, basal-2.0) and refuses others at
+start-up (basal-omni, Gemma 4, is not supported). **Every number in this section was measured by @qooba** on a Colab
+TPU v5e-1 (`TPU v5 lite`, 16 GB HBM), JAX 0.11.1, with basal-2.0 and basal-2.0-mini; we have not reproduced them on a
+TPU of our own. basal-2.0-max (11B, 22 GB of bf16 weights) needs more HBM than one v5e chip has.
 
 `basal-bench` on the 44 bundled examples (the reference is `eager-fp32`, transformers on the VM's CPU; both option
 orders per decision):
@@ -452,7 +455,6 @@ every path is exact (|Δp| ≤ 1.7e-5): the TPU packing (prefix trie, batching, 
 error. In bf16 each 0.975 is one readout of 40, always at a reference top-2 gap ≤ 0.027 (the near ties of this
 sample); the decisions (both orders averaged) agree on 20/20 per path except mini orders2-batch, 19/20 (a decision
 with a reference gap ≤ 0.021). The sample is small: one flip moves a path below the 0.999 gate.
-
 
 Over HTTP (`basal-serve --mode tpu` with the 2.0 defaults: prompt format 2, one option order; `basal-loadtest`, 32
 clients): basal-2.0 17.1 ms p50, 59.6 decisions/s; basal-2.0-mini 7.3 ms p50, 165.5 decisions/s. One request with 1 / 5

@@ -229,7 +229,7 @@ use transformers), then the `tpu` extra (JAX and libtpu from PyPI; Python 3.12 o
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-tpu && source ~/basal-tpu/bin/activate
 uv pip install "torch>=2.11" --index-url https://download.pytorch.org/whl/cpu
-uv pip install "basal[tpu] @ https://github.com/rkinas/basal/archive/refs/tags/v2.0.0.tar.gz"
+uv pip install "basal[tpu] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"   # 2.2.0: the first release with --mode tpu
 basal-serve --model Remek/basal-2.0-4.5B --port 8000   # --mode tpu is the default on a TPU VM
 ```
 
