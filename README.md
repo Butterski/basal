@@ -56,8 +56,9 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
   Q8_0) and **`-FP8`** (`--mode vllm`). [docs/OMNI.md](docs/OMNI.md#gguf-llamacpp-ollama-and-mlx-text)
 - **From the community:** `basal-export-gguf` writes or repairs GGUF files so that llama.cpp and Ollama tokenize like
   the Hugging Face tokenizer (Piotr Durlej, #8); two experimental, community-maintained engines for basal-1.5 /
-  basal-2.0: `--mode tpu` on Google TPU (Kuba Sołtys, #15) and `--mode strix` on AMD Strix Halo (Michał Kardyś, #14).
-  [Contributors](#contributors)
+  basal-2.0: `--mode tpu` on Google TPU (Kuba Sołtys, #15) and `--mode strix` on AMD Strix Halo (Michał Kardyś, #14);
+  `basal-viz`, a local page that shows every step of a decision (@lukaspoloki, #2,
+  [SERVING.md](docs/SERVING.md#see-how-a-decision-is-made)). [Contributors](#contributors)
 
 Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the
 [release notes](https://github.com/rkinas/basal/releases/tag/v2.2.0).
@@ -362,6 +363,9 @@ Thank you to the people whose work is in this repository, by pull request:
 - Michał Kardyś ([@kardysm](https://github.com/kardysm)): the experimental `--mode strix`, a basal-1.5 / basal-2.0
   forward with Triton kernels for AMD Strix Halo, and its benchmarks
   ([#14](https://github.com/rkinas/basal/pull/14)).
+- [@lukaspoloki](https://github.com/lukaspoloki): `basal-viz`, a local page that shows every step of a decision, from
+  the prompt to the per-layer readout, the calibration and the decision
+  ([#2](https://github.com/rkinas/basal/pull/2)).
 
 `--mode tpu` and `--mode strix` are community-maintained: their numbers in [HARDWARE.md](docs/HARDWARE.md) are the
 contributors' own measurements.

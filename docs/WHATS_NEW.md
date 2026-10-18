@@ -34,6 +34,8 @@
   community-maintained engines for the Llama-architecture models (basal-1.5, basal-2.0), both opt-in: `--mode tpu`
   (Kuba Sołtys, #15; extra `basal[tpu]`) in JAX / XLA on a Google TPU, and `--mode strix` (Michał Kardyś, #14) with
   Triton kernels for AMD Strix Halo. Their numbers in [HARDWARE.md](HARDWARE.md) are the contributors' measurements.
+  `basal-viz` (@lukaspoloki, #2) opens a local page that shows every step of a decision, next to the served answer
+  ([SERVING.md](SERVING.md#see-how-a-decision-is-made)).
 - Every other request takes the same code path as in v2.1.0.
 
 # What is new in basal 2.1
