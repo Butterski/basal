@@ -200,7 +200,13 @@ class EagerBackend:
     def _chunked(self, e, lid):
         """One long prompt, prefilled in CHUNK-token parts through the KV cache (exact up to float rounding)."""
         from transformers import DynamicCache
-        ids, cache = torch.tensor([list(e)], device=self.dev), DynamicCache()
+        # a hybrid model (Qwen3.5: Gated DeltaNet and attention layers) needs its layer types in the cache, so the
+        # linear-attention layers carry their conv and recurrent states from part to part (an empty DynamicCache()
+        # raised IndexError there); attention-only models (Llama, Gemma 4) keep the plain cache
+        cfg = self.model.config
+        types = getattr(cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg, "layer_types", None) or ()
+        cache = DynamicCache(config=cfg) if "linear_attention" in types else DynamicCache()
+        ids = torch.tensor([list(e)], device=self.dev)
         for s0 in range(0, ids.shape[1], self.CHUNK):
             part = ids[:, s0:s0 + self.CHUNK]
             pos = torch.arange(s0, s0 + part.shape[1], device=self.dev)[None]
