@@ -93,9 +93,11 @@ Per-item deviations of every variant and of other engines:
 
 ## Convert yourself
 
-`basal-export-gguf` runs llama.cpp's converter and then applies the tokenizer fix of the `-GGUF` repositories
+`basal-export-gguf` (contributed by Piotr Durlej, [#8](https://github.com/rkinas/basal/pull/8)) runs llama.cpp's
+converter and then applies the tokenizer fix of the `-GGUF` repositories
 ([PORTS.md](PORTS.md#how-the-ports-are-made)), so llama.cpp and Ollama tokenize basal prompts exactly like the Hugging
-Face tokenizer. The converter lives in llama.cpp and needs transformers 5 to read the basal tokenizer config. Its
+Face tokenizer. It is for the Llama-architecture models (basal-1.0, basal-1.5, basal-2.0); basal-omni (Gemma 4) is
+converted with llama.cpp's converter alone, as in [Files](#files). The converter lives in llama.cpp and needs transformers 5 to read the basal tokenizer config. Its
 current `requirements-convert_hf_to_gguf.txt` pins transformers 4, so install the needed converter packages directly,
 and basal from a clone with the `gguf-export` extra in the same environment (the tool runs the converter with its own
 Python):
