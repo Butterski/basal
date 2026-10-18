@@ -28,7 +28,8 @@ Flags of `basal-serve`, inference on a JSONL file with `basal-run`, and benchmar
 - Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `tpu` on a TPU VM with
   `basal[tpu]`, `eager` otherwise.
 - `--calibration file.json` overrides the calibration file (default: `CALIBRATION.<mode>.json` when the model ships
-  one for that engine, else `CALIBRATION.json`; `--mode gguf` uses `CALIBRATION.json`; with `--orders 2`,
+  one for that engine, else `CALIBRATION.json`; `--mode gguf` loads `CALIBRATION.gguf.json` when the model ships one,
+  else `CALIBRATION.json`; with `--orders 2`,
   `CALIBRATION.o2.json` when shipped). A file applies its thresholds only to the option orders it was fitted with. `basal-calibrate` fits one on your labelled requests
   ([CALIBRATION.md](CALIBRATION.md)). A missing file is refused at start-up.
 - **Option orders** (`--orders 1 | 2 | auto`): `1` asks the order given (the default for prompt-format-2 models such as

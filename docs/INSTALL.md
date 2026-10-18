@@ -208,8 +208,9 @@ uv pip install "basal[gguf] @ https://github.com/rkinas/basal/archive/refs/tags/
 basal-serve --model ./basal-2.0-4.5B-GGUF --mode gguf --gguf basal-2.0-4.5B-GGUF/basal-2.0-4.5B-Q8_0.gguf --port 8000
 ```
 
-`--mode gguf` uses `CALIBRATION.json` (the bf16 fit); add `--calibration basal-2.0-4.5B-GGUF/CALIBRATION.llamacpp.json`
-to use the llama.cpp fit. Context: Ollama mode reads at most 4,096 tokens per prompt (basal sends `num_ctx` 4096, which
+`--mode gguf` loads `CALIBRATION.gguf.json` when the folder ships one; the basal-2.0 `-GGUF` folders do not, so it uses
+`CALIBRATION.json` (the bf16 fit); add `--calibration basal-2.0-4.5B-GGUF/CALIBRATION.llamacpp.json` to use the
+llama.cpp fit. Context: Ollama mode reads at most 4,096 tokens per prompt (basal sends `num_ctx` 4096, which
 overrides the Modelfile) and llama.cpp mode reads `llama-server -c`; longer states are cut in the middle
 (`usage.truncated`). For long documents use `llama-server -c 32768` or `--mode gguf`.
 
