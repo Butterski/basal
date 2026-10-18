@@ -139,7 +139,7 @@ def to_items(state, questions, max_opts=MAX_OPTIONS, force_lang=None):
     for every question's template, yes/no words and branch text, instead of the language detected from its text."""
     state = _text(state)
     out = []
-    state_pl = force_lang is None and lang_of(state) == "pl"  # once per request, not once per question
+    state_pl = not force_lang and lang_of(state) == "pl"  # once per request, not once per question
     for name, q in questions.items():
         t = q.get("type", "choice")
         instr = _text(q.get("instructions", ""))

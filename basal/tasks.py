@@ -295,6 +295,7 @@ def expand(body, max_options=255):
     state = body.get("state")
     text = state if isinstance(state, str) else ""
     questions, plans = {}, {}
+    text_pl = not body.get("lang") and lang_of(text) == "pl"  # once per request, not once per task question
     for name, q in body["questions"].items():
         if not is_task(q):
             questions[name] = q
@@ -302,7 +303,7 @@ def expand(body, max_options=255):
         if SEP in name:
             raise ValueError(f"question {name!r}: a task question's name may not contain {SEP!r}")
         t = q["type"]
-        lang = body.get("lang") or lang_of(text + str(q.get("instructions") or ""))
+        lang = body.get("lang") or ("pl" if text_pl else lang_of(str(q.get("instructions") or "")))
         w = W[lang]
         sub = {}
         if t == "classify":

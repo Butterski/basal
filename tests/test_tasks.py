@@ -176,3 +176,15 @@ def test_extract_line_without_candidates_is_not_stated():
 def test_task_name_separator_refused():
     with pytest.raises(ValueError, match="may not contain"):
         tasks.expand({"state": "x", "questions": {"a::b": {"type": "classify", "labels": ["p", "q"]}}})
+
+
+def test_task_language_from_state_then_instructions():
+    # a Polish state decides every task question; an English one leaves it to each question's instructions;
+    # the request's lang overrides both
+    qs = {"a": {"type": "classify", "labels": ["p", "q"], "none": True, "instructions": "Which one?"},
+          "b": {"type": "classify", "labels": ["p", "q"], "none": True, "instructions": "Która pasuje?"}}
+    none = lambda body: [body["questions"][f"{k}::labels"]["criteria"]["none"] for k in "ab"]
+    pl, en = tasks.W["pl"]["none"], tasks.W["en"]["none"]
+    assert none(tasks.expand({"state": "Kot śpi.", "questions": qs})[0]) == [pl, pl]
+    assert none(tasks.expand({"state": "The cat sleeps.", "questions": qs})[0]) == [en, pl]
+    assert none(tasks.expand({"state": "Kot śpi.", "questions": qs, "lang": "en"})[0]) == [en, en]
