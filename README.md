@@ -30,7 +30,8 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 - [Quick start](#quick-start) · [API](#api)
 - [Images and audio: basal-omni](#images-and-audio-basal-omni-experimental) · [MCP for agents](#mcp-basal-as-a-tool-for-agents)
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
-- [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) · [License](#license)
+- [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) ·
+  [Contributors](#contributors) · [License](#license)
 
 ## What is new in basal 2.2
 
@@ -53,6 +54,10 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
   basal-omni-1.0 through llama.cpp (Metal, CUDA or CPU) and `--mode mlx` / `mlx-q8` the bf16 weights through mlx-lm.
   New model repositories for basal-omni-1.0-mini and -max: **`-GGUF`** (Q8_0 and Q6_K, with a calibration fitted on
   Q8_0) and **`-FP8`** (`--mode vllm`). [docs/OMNI.md](docs/OMNI.md#gguf-llamacpp-ollama-and-mlx-text)
+- **From the community:** `basal-export-gguf` writes or repairs GGUF files so that llama.cpp and Ollama tokenize like
+  the Hugging Face tokenizer (Piotr Durlej, #8); two experimental, community-maintained engines for basal-1.5 /
+  basal-2.0: `--mode tpu` on Google TPU (Kuba Sołtys, #15) and `--mode strix` on AMD Strix Halo (Michał Kardyś, #14).
+  [Contributors](#contributors)
 
 Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the
 [release notes](https://github.com/rkinas/basal/releases/tag/v2.2.0).
@@ -340,6 +345,26 @@ basal-omni-1.0 (text, images and audio):
   url     = {https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f}
 }
 ```
+
+## Contributors
+
+Thank you to the people whose work is in this repository, by pull request:
+
+- Paweł Kiszczak ([@pawelkiszczak](https://github.com/pawelkiszczak)): the Apple Silicon engines `--mode mlx` /
+  `mlx-q8` and `--mode mps`, the in-process GGUF engine `--mode gguf` (llama-cpp-python) and `--mode ollama`, and the
+  comparison of Apple Silicon engines and quantised formats (MLX, oMLX oQ, GGUF) with its figures in
+  [HARDWARE.md](docs/HARDWARE.md#apple-silicon) ([#4](https://github.com/rkinas/basal/pull/4)).
+- Piotr Durlej ([@pdurlej](https://github.com/pdurlej)): `basal-export-gguf`, which converts a basal model to GGUF, or
+  repairs an existing GGUF file, so that its tokenizer matches the Hugging Face one, as in the official `-GGUF` files
+  ([#8](https://github.com/rkinas/basal/pull/8)).
+- Kuba Sołtys ([@qooba](https://github.com/qooba)): the experimental Google TPU engine `--mode tpu` in JAX / XLA, with
+  its Colab notebook ([#15](https://github.com/rkinas/basal/pull/15)).
+- Michał Kardyś ([@kardysm](https://github.com/kardysm)): the experimental `--mode strix`, a basal-1.5 / basal-2.0
+  forward with Triton kernels for AMD Strix Halo, and its benchmarks
+  ([#14](https://github.com/rkinas/basal/pull/14)).
+
+`--mode tpu` and `--mode strix` are community-maintained: their numbers in [HARDWARE.md](docs/HARDWARE.md) are the
+contributors' own measurements.
 
 ## License
 

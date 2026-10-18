@@ -28,6 +28,12 @@
 - **New model repositories:** `-GGUF` (Q8_0, Q6_K) and `-FP8` (`--mode vllm`) of basal-omni-1.0-mini and -max, each
   with a calibration fitted on the port's own readouts (GGUF: on Q8_0). `VLLM_BATCH_INVARIANT=1` gives repeatable
   answers in `--mode vllm` ([OMNI.md](OMNI.md#serve)).
+- **From the community.** `basal-export-gguf` (Piotr Durlej, #8; extra `basal[gguf-export]`) converts a basal model
+  to GGUF, or repairs an existing GGUF file, with the tokenizer fix of the `-GGUF` files, so that llama.cpp and Ollama
+  tokenize like the Hugging Face tokenizer ([GGUF.md](GGUF.md#convert-yourself)). Two experimental,
+  community-maintained engines for the Llama-architecture models (basal-1.5, basal-2.0), both opt-in: `--mode tpu`
+  (Kuba Sołtys, #15; extra `basal[tpu]`) in JAX / XLA on a Google TPU, and `--mode strix` (Michał Kardyś, #14) with
+  Triton kernels for AMD Strix Halo. Their numbers in [HARDWARE.md](HARDWARE.md) are the contributors' measurements.
 - Every other request takes the same code path as in v2.1.0.
 
 # What is new in basal 2.1
