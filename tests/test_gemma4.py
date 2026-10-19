@@ -3,6 +3,7 @@ one with its own keys and values at the answer rows only, media towers once per 
 transformers forward of the whole prompt (fp32, tiny random models shaped like basal-omni: E4B-like with KV sharing
 and per-layer inputs, 31B-like with keys = values and no sharing, a MoE block, and a multimodal model with images,
 audio and the larger models' bidirectional image attention)."""
+import copy
 import json
 
 import pytest
@@ -12,7 +13,7 @@ from transformers import (Gemma4AudioConfig, Gemma4Config, Gemma4ForCausalLM, Ge
 
 from basal import engine
 from basal.engine import EagerBackend
-from basal.gemma4 import Gemma4Forward
+from basal.gemma4 import Gemma4Forward, HostRows, offload_ple
 
 ROPE = {"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
         "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}}
@@ -215,3 +216,28 @@ def test_eager_forward_choice(tmp_path, monkeypatch):
     assert EagerBackend(tmp_path, "float32", device="cpu").g4 is None
     with pytest.raises(ValueError):
         EagerBackend(tmp_path, "float32", device="cpu", forward="fast")
+
+
+def test_ple_offload_same_answers(tmp_path, monkeypatch):
+    """--ple-offload on: the per-layer embedding table leaves the model's parameters for host memory; both forwards
+    read the same rows, so the answers do not change."""
+    m = tiny("e4b")
+    emb = m.model.embed_tokens_per_layer
+    ids = torch.tensor([[1, 5, 63, 0], [7, 7, 2, 9]])
+    assert torch.equal(HostRows(emb)(ids), emb(ids))
+    e16 = copy.deepcopy(emb).to(torch.bfloat16)
+    assert torch.equal(HostRows(e16)(ids), e16(ids))
+    m.save_pretrained(tmp_path)
+    tok = type("Tok", (), {"pad_token": "<pad>", "eos_token": "<eos>", "pad_token_id": 0})
+    monkeypatch.setattr(engine.AutoTokenizer, "from_pretrained", lambda *_a, **_k: tok())
+    groups = groups_of()
+    lids = [[[10, 11, 12]] * len(g) for g in groups]
+    ref = EagerBackend(tmp_path, "float32", device="cpu").run_shared(list(zip(groups, lids)))
+    for fwd in ("basal", "hf"):
+        be = EagerBackend(tmp_path, "float32", device="cpu", forward=fwd, ple_offload=True)
+        assert isinstance(be.model.model.embed_tokens_per_layer, HostRows)
+        assert not any("embed_tokens_per_layer" in n for n, _ in be.model.named_parameters())
+        for a, b in zip(be.run_shared(list(zip(groups, lids))), ref):
+            for x, y in zip(a, b):
+                assert max(abs(p - q) for p, q in zip(x, y)) < 1e-5
+    assert offload_ple(tiny("31b")) == 0  # no per-layer inputs: nothing to move

@@ -34,6 +34,40 @@ def text_model(model):
     return getattr(model.model, "language_model", model.model)
 
 
+class HostRows(torch.nn.Module):
+    """Gemma 4's per-layer embedding table in host memory (G3, --ple-offload on): E2B / E4B look up 256 extra numbers
+    per layer for every token in a table of 262,144 rows (E4B: x 42 layers = 10,752 columns, 5.6 GB in bf16, a third
+    of mini's weights). Only the rows of a forward's tokens are copied to the GPU; the values are those of
+    Gemma4TextScaledWordEmbedding (the rows times the scale in the table's dtype). Not a parameter, so model.to(device)
+    leaves the table where it is; the transformers forward reads it the same way."""
+
+    def __init__(self, emb):
+        super().__init__()
+        w = emb.weight.data.to("cpu")
+        self.table = w.pin_memory() if torch.cuda.is_available() else w
+        self.scale = emb.scalar_embed_scale
+        self.embedding_dim = w.shape[1]
+
+    def forward(self, ids):
+        flat = ids.reshape(-1).cpu()
+        rows = torch.empty((flat.numel(), self.embedding_dim), dtype=self.table.dtype,
+                           pin_memory=self.table.is_pinned())
+        torch.index_select(self.table, 0, flat, out=rows)
+        out = rows.to(ids.device, non_blocking=True).view(*ids.shape, -1)
+        return out * torch.tensor(self.scale, dtype=out.dtype, device=out.device)
+
+
+def offload_ple(model):
+    """Move a Gemma 4 model's per-layer embedding table to host memory (before model.to(device)); -> bytes moved
+    (0: the model has no per-layer inputs)."""
+    lm = text_model(model)
+    emb = getattr(lm, "embed_tokens_per_layer", None)
+    if emb is None or isinstance(emb, HostRows):
+        return 0
+    lm.embed_tokens_per_layer = HostRows(emb)
+    return lm.embed_tokens_per_layer.table.numel() * lm.embed_tokens_per_layer.table.element_size()
+
+
 class Gemma4Forward:
     # memory bounds as in EagerBackend: prefix parts of at most CHUNK tokens; at most MAX_BATCH_TOKENS padded tokens and
     # ATTN_PAIRS query-key pairs (rows x query tokens x keys: the attention scores of the math kernel) per forward,

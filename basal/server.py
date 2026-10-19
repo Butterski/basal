@@ -624,9 +624,12 @@ class Server:
         quant = a.quant or quant
         if getattr(a, "media", "off") == "on" and kind != "eager":
             raise SystemExit("--media on needs --mode eager (the media path of basal-omni runs in the eager backend)")
+        if getattr(a, "ple_offload", "off") == "on" and kind != "eager":
+            raise SystemExit("--ple-offload on needs --mode eager")
         if kind == "eager":
             self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on",
-                                        forward=getattr(a, "eager_forward", None))
+                                        forward=getattr(a, "eager_forward", None),
+                                        ple_offload=getattr(a, "ple_offload", "off") == "on")
         elif kind == "exit":
             self.backend = ExitGraphBackend(md, a.dtype, quant, compile=comp, heads_dir=a.exit_heads,
                                             default_policy=a.early_exit, attn=attn, merge=merge_arg(a.merge))
@@ -1238,6 +1241,9 @@ def add_engine_args(ap):
                     help="--mode eager with a Gemma 4 model (basal-omni): basal = the engine's own forward (the shared "
                          "prefix of a request once, the last layers at the answer rows only; default), hf = the "
                          "transformers forward of basal 2.2.0 (default: BASAL_EAGER_FORWARD, else basal)")
+    ap.add_argument("--ple-offload", dest="ple_offload", choices=["off", "on"], default="off",
+                    help="--mode eager with Gemma 4 E2B / E4B (basal-omni mini): keep the per-layer embedding table in "
+                         "host memory and copy only the rows of each forward's tokens (E4B: 5.6 GB less GPU memory)")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
                     help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu)")
     ap.add_argument("--orders", type=orders_arg, default=None,
