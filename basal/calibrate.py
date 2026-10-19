@@ -814,10 +814,12 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
         if not rs:
             continue
         cert = [r for r in cert_rows if r["prim"] == t]
+        # as served: a choice question of a format-2 file gets its option-count bucket temperature first
         report["types"][t] = dict(n=len(rs), n_fit=len(rs) - len(cert), n_cert=len(cert),
                                   accuracy=float(np.mean([ok for _, ok in served(rs, {})])),
                                   T_shipped=shipped_T.get(t), T=temps.get(t), source=source.get(t, "default 1.0"),
-                                  ece_shipped=ece(served(cert, shipped_T)), ece=ece(served(cert, temps)))
+                                  ece_shipped=ece(served(cert, shipped_T, shipped_B)),
+                                  ece=ece(served(cert, temps, buckets)))
     gates = dict(ece_lofo=lofo(fit_rows, cert_rows, shipped_T, shipped_B, min_per_type, fmt, min_family, reference,
                                min_blend=min_blend),
                  automated_at=automated, automated_error=automated_error, automated_at_pooled=automated_pooled,
