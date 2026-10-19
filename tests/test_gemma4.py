@@ -13,6 +13,7 @@ from transformers import (Gemma4AudioConfig, Gemma4Config, Gemma4ForCausalLM, Ge
 
 from basal import engine
 from basal.engine import EagerBackend
+from basal import gemma4
 from basal.gemma4 import Gemma4Forward, HostRows, offload_ple
 
 ROPE = {"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
@@ -72,6 +73,66 @@ def test_forward_equals_transformers(name, answer_rows):
         for t, h in zip(grp, hs):
             r = last_hidden(m, t)
             assert (h - r).abs().max() <= 1e-4 * r.abs().max(), (name, t)
+
+
+def varlen_reference(q, k, v, cu_q, cu_k, max_q, max_k, scale, window):
+    """What a FlashAttention varlen kernel computes (causal aligned at each sequence's end, left window), per
+    sequence with SDPA: [total q, heads, d] / [total k, kv heads, d] -> [total q, heads, d]."""
+    out = []
+    for b in range(len(cu_q) - 1):
+        qs, ks, vs = q[cu_q[b]: cu_q[b + 1]], k[cu_k[b]: cu_k[b + 1]], v[cu_k[b]: cu_k[b + 1]]
+        i = torch.arange(len(qs))[:, None] + len(ks) - len(qs)
+        j = torch.arange(len(ks))[None]
+        m = (j <= i) & (j > i - window) if window else j <= i
+        o = torch.nn.functional.scaled_dot_product_attention(
+            qs.transpose(0, 1)[None], ks.transpose(0, 1)[None], vs.transpose(0, 1)[None], attn_mask=m, scale=scale,
+            enable_gqa=True)
+        out.append(o[0].transpose(0, 1))
+    return torch.cat(out)
+
+
+@pytest.mark.parametrize("name", sorted(CONFIGS))
+@pytest.mark.parametrize("answer_rows", [True, False])
+def test_varlen_kernels_pack_rows(name, answer_rows, monkeypatch):
+    """A varlen kernel (here its reference) over the packed real queries and keys of every row: earlier passes' keys
+    (a prefix in parts, sliding layers' last window - 1 of them), padding, the answer rows of G1."""
+    monkeypatch.setitem(gemma4.VARLEN_KERNELS, "ref", varlen_reference)
+    monkeypatch.setattr(Gemma4Forward, "_kernel", lambda self, t, dtype, blk: self.attn[t])
+    m = tiny(name)
+    for attn in ({"sliding_attention": "ref", "full_attention": "sdpa"}, {"sliding_attention": "ref",
+                                                                           "full_attention": "ref"}):
+        g = Gemma4Forward(m, answer_rows=answer_rows, attn=attn)
+        g.CHUNK = 24
+        groups = groups_of()
+        for grp, hs in zip(groups, g.hidden(groups)):
+            for t, h in zip(grp, hs):
+                r = last_hidden(m, t)
+                assert (h - r).abs().max() <= 1e-4 * r.abs().max(), (name, attn, t)
+
+
+def test_flash_kernels_only_where_they_apply():
+    g = Gemma4Forward(tiny("31b"), attn={"sliding_attention": "fa3", "full_attention": "efficient"})
+    assert g._kernel("sliding_attention", torch.bfloat16, None) == "fa3"
+    assert g._kernel("sliding_attention", torch.float32, None) == "sdpa"  # fp32: no flash kernel
+    assert g._kernel("sliding_attention", torch.bfloat16, torch.zeros(1, 2)) == "sdpa"  # image blocks
+    assert g._kernel("full_attention", torch.bfloat16, torch.zeros(1, 2)) == "efficient"  # global layers: causal only
+
+
+def test_attention_plan(monkeypatch):
+    assert gemma4.attention_plan("math") == {}
+    assert gemma4.attention_plan("sliding=fa3,full=efficient") == {"sliding_attention": "fa3",
+                                                                   "full_attention": "efficient"}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    monkeypatch.setattr(engine, "attention_available", lambda impl: None)
+    assert gemma4.attention_plan("auto") == {"sliding_attention": "fa3", "full_attention": "efficient"}
+    monkeypatch.setattr(engine, "attention_available", lambda impl: "flash_attn_3 is not installed")
+    assert gemma4.attention_plan("auto") == {"sliding_attention": "efficient", "full_attention": "efficient"}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (12, 0))  # not measured on Blackwell: math
+    assert gemma4.attention_plan("auto") == {}
+    for bad in ("flash", "sliding=fa2", "global=fa3"):
+        with pytest.raises(ValueError):
+            gemma4.attention_plan(bad)
 
 
 def test_kv_sharing_layout():

@@ -19,13 +19,70 @@ model (the same modules and weights) in its own loop, for three things the trans
   (use_bidirectional_attention "vision") the soft tokens of one image attend to each other in the sliding-window
   layers, as transformers builds the mask; a prefix part never ends inside an image.
 
-Attention is torch SDPA with an explicit boolean mask (the math kernel; EagerBackend turns the others off for Gemma 4).
+Attention runs per layer type (E1, --eager-attn): torch SDPA with an explicit boolean mask (the math kernel by default;
+EagerBackend turns the others off for Gemma 4, so the memory-efficient kernel runs only when chosen), or a
+FlashAttention varlen kernel over the real queries and keys of every row. Measured on real activations of mini and
+max (H100, 2026-10-20: every attention call of a 1,857-token and three 12.6k-token prompts against float64): in the
+sliding-window layers (head size 256) FlashAttention 3 is within bf16 rounding of the math kernel at 11x its speed,
+the memory-efficient kernel at 4.4x; in the global layers (512) only the math and memory-efficient kernels run on
+Hopper (FA3 / FA4 take at most 256, cuDNN has no kernel, FlexAttention runs out of shared memory), the
+memory-efficient one 3x faster. The 7 Oct wrong attention (the memory-efficient kernel in the transformers forward of
+max, unpadded only: code log-prob off by 6.2 in fp32) does not occur on these inputs.
 """
 import os
 import sys
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
+
+# attention kernels per layer type (E1): "sdpa" = torch SDPA with the boolean mask on the kernels the process allows
+# (the math kernel: EagerBackend turns the others off for Gemma 4), "efficient" / "cudnn" = that SDPA kernel with the
+# mask, "fa3" / "fa4" = a FlashAttention varlen kernel over the rows' real queries and keys (causal, aligned at each
+# row's end, the sliding window as its left window)
+SDPA_KERNELS = {"sdpa": None, "efficient": "EFFICIENT_ATTENTION", "cudnn": "CUDNN_ATTENTION"}
+
+
+def _fa3(q, k, v, cu_q, cu_k, max_q, max_k, scale, window):
+    import flash_attn_interface as fa
+    o = fa.flash_attn_varlen_func(q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale=scale, causal=True,
+                                  window_size=(window - 1, 0) if window else (-1, -1))
+    return o[0] if isinstance(o, (tuple, list)) else o
+
+
+def _fa4(q, k, v, cu_q, cu_k, max_q, max_k, scale, window):
+    from flash_attn.cute import interface as fa
+    o = fa.flash_attn_varlen_func(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=max_q,
+                                  max_seqlen_k=max_k, softmax_scale=scale, causal=True,
+                                  window_size=(window - 1, 0) if window else (None, None))
+    return o[0] if isinstance(o, (tuple, list)) else o
+
+
+VARLEN_KERNELS = {"fa3": _fa3, "fa4": _fa4}
+KERNELS = tuple(SDPA_KERNELS) + tuple(VARLEN_KERNELS)
+TYPES = {"sliding": "sliding_attention", "full": "full_attention"}
+
+
+def attention_plan(spec="auto"):
+    """--eager-attn -> {layer type: kernel} of Gemma4Forward. math: the SDPA math kernel in every layer (basal 2.2);
+    auto: on Hopper (sm90, where E1 measured them) FlashAttention 3 in the sliding-window layers (the memory-efficient
+    kernel without the flash_attn_3 package) and the memory-efficient kernel in the global layers (head size 512: no
+    flash kernel runs it on Hopper), the math kernel elsewhere; "sliding=K,full=K" with K one of KERNELS."""
+    if spec == "math":
+        return {}
+    if spec == "auto":
+        from .engine import attention_available
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+            return {}
+        sliding = "fa3" if attention_available("fa3") is None else "efficient"
+        return {"sliding_attention": sliding, "full_attention": "efficient"}
+    plan = {}
+    for part in spec.split(","):
+        t, _, k = part.partition("=")
+        if t not in TYPES or k not in KERNELS:
+            raise ValueError(f"--eager-attn {spec!r}: math, auto, or sliding=K,full=K with K one of {', '.join(KERNELS)}")
+        plan[TYPES[t]] = k
+    return plan
 
 
 def text_model(model):
@@ -80,7 +137,7 @@ class Gemma4Forward:
     # row and key) with five questions over a 10k-token state would hold 3.2 GB per layer; at most KV_BYTES
     KV_BYTES = 2 << 30
 
-    def __init__(self, model, answer_rows=True):
+    def __init__(self, model, answer_rows=True, attn=None):
         self.model = model
         lm = self.lm = text_model(model)
         cfg = self.cfg = lm.config
@@ -98,6 +155,7 @@ class Gemma4Forward:
         self.bidir = getattr(cfg, "use_bidirectional_attention", None) == "vision"
         self.rope = sys.modules[type(self.layers[0].self_attn).__module__].apply_rotary_pos_emb
         self.answer_rows = answer_rows
+        self.attn = dict(attn or {})  # layer type -> kernel (SDPA_KERNELS, VARLEN_KERNELS); "sdpa" when absent
         top = model.config
         self.media_ids = {k: getattr(top, f"{k}_token_id", None) for k in ("image", "video", "audio")}
         self.pad = cfg.pad_token_id
@@ -176,6 +234,38 @@ class Gemma4Forward:
         v = a.v_proj(x).view(shape) if a.v_proj is not None else k
         return self.rope(a.k_norm(k), *cs, unsqueeze_dim=2).transpose(1, 2), a.v_norm(v).transpose(1, 2)
 
+    def _kernel(self, t, dtype, blk):
+        """The kernel of layer type t in a forward: the masked SDPA math kernel for fp32 and, in sliding-window layers,
+        for rows with images whose soft tokens attend to each other (a flash kernel's mask is causal only)."""
+        k = self.attn.get(t, "sdpa")
+        if k in VARLEN_KERNELS and (dtype not in (torch.bfloat16, torch.float16)
+                                    or blk is not None and t == "sliding_attention"):
+            return "sdpa"
+        return k
+
+    def _attend(self, kind, a, q, k, v, mask, kval, qval, window):
+        """Attention of one layer: q [B, H, Sq, d], k / v [B, kv heads, Lk, d] -> [B, H, Sq, d]. SDPA kernels take the
+        boolean mask; varlen kernels the real queries (qval [B, Sq]) and keys (kval [B, Lk]) of each row packed back to
+        back: a row's real keys are its earlier tokens' and its own, in position order, ending at its last real query,
+        so causal attention aligned at the row's end (with the window) is the mask's attention."""
+        if kind in SDPA_KERNELS:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            name = SDPA_KERNELS[kind]
+            gqa = name is None
+            if not gqa:  # the memory-efficient and cuDNN kernels take no enable_gqa: keys and values per query head
+                k, v = (x.repeat_interleave(q.shape[1] // k.shape[1], 1) for x in (k, v))
+            with sdpa_kernel([getattr(SDPBackend, name)]) if name else nullcontext():
+                return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=a.scaling, enable_gqa=gqa)
+        B, H, Sq, d = q.shape
+        nq, nk = qval.sum(1), kval.sum(1)
+        cu_q = F.pad(nq.cumsum(0), (1, 0)).to(torch.int32)
+        cu_k = F.pad(nk.cumsum(0), (1, 0)).to(torch.int32)
+        o = VARLEN_KERNELS[kind](q.transpose(1, 2)[qval], k.transpose(1, 2)[kval], v.transpose(1, 2)[kval], cu_q, cu_k,
+                                 int(nq.max()), int(nk.max()), a.scaling, window)
+        out = q.new_zeros(B, Sq, H, d)
+        out[qval] = o.to(q.dtype)
+        return out.transpose(1, 2)
+
     def _rest(self, layer, h, o, pli):
         """The decoder layer after attention (transformers' Gemma 4 decoder layer: MLP, MoE block, per-layer input)."""
         o = layer.self_attn.o_proj(o.transpose(1, 2).reshape(*h.shape[:2], -1))
@@ -205,7 +295,12 @@ class Gemma4Forward:
             grp = torch.zeros(B, dtype=torch.long, device=pos.device)
         types = set(self.types)
         rope = {t: self.lm.rotary_emb(h, pos, t) for t in types}
-        masks = {t: self._mask(t, pos, kpos[t][grp] if t in kpos else None, pos, valid, blk) for t in types}
+        kinds = {t: self._kernel(t, h.dtype, blk) for t in types}
+        masks = {t: self._mask(t, pos, kpos[t][grp] if t in kpos else None, pos, valid, blk)
+                 for t in types if kinds[t] in SDPA_KERNELS}
+        kval = {t: torch.cat([kpos[t][grp] >= 0, valid], 1) if t in kpos else valid
+                for t in types if kinds[t] in VARLEN_KERNELS}
+        qval = valid
         new, kept, sliced = {}, {}, False
         rows = None if read is None else (torch.arange(B, device=pos.device), read)
         # G1: the layers from the last one with its own keys and values on run at the answer rows only
@@ -232,9 +327,11 @@ class Gemma4Forward:
                 pli = pli[rows][:, None] if pli is not None else None
                 rope = {t2: (c[rows][:, None], s[rows][:, None]) for t2, (c, s) in rope.items()}
                 masks = {t2: m[rows[0], :, rows[1]][:, :, None] for t2, m in masks.items()}
+                qval = torch.ones(B, 1, dtype=torch.bool, device=pos.device)
                 sliced = True
             q = self._q(a, x, rope[t])
-            o = F.scaled_dot_product_attention(q, k, v, attn_mask=masks[t], scale=a.scaling, enable_gqa=True)
+            o = self._attend(kinds[t], a, q, k, v, masks.get(t), kval.get(t), qval,
+                             self.window if t == "sliding_attention" else None)
             h = self._rest(layer, h, o, pli[:, :, i] if pli is not None else None)
         if read is None:
             return new, None

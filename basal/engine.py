@@ -86,7 +86,8 @@ class EagerBackend:
     media_lock = threading.Lock()
     g4 = None  # basal/gemma4.py: the own Gemma 4 forward (shared prefixes, answer rows), None = the transformers forward
 
-    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False, forward=None, ple_offload=False):
+    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False, forward=None, ple_offload=False,
+                 attn="auto"):
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.padding_side = "left"
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
@@ -126,8 +127,8 @@ class EagerBackend:
             if forward not in EAGER_FORWARDS:
                 raise ValueError(f"eager forward {forward!r} (one of {', '.join(EAGER_FORWARDS)})")
             if forward == "basal":
-                from .gemma4 import Gemma4Forward
-                self.g4 = Gemma4Forward(self.model)
+                from .gemma4 import Gemma4Forward, attention_plan
+                self.g4 = Gemma4Forward(self.model, attn=attention_plan(attn))
         self.dev = dev
         self.prefill = PREFILL
         # option-code logits in fp32, as in GraphBackend._rows: the output head's input (the normalised last hidden
