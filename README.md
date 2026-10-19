@@ -368,6 +368,9 @@ Thank you to the people whose work is in this repository, by pull request:
 - [@lukaspoloki](https://github.com/lukaspoloki): `basal-viz`, a local page that shows every step of a decision, from
   the prompt to the per-layer readout, the calibration and the decision
   ([#2](https://github.com/rkinas/basal/pull/2)).
+- Milosz ([@Butterski](https://github.com/Butterski)): the prompt language is detected once per request instead of
+  once per question, so a large task request on a long English state is prepared in milliseconds instead of half a
+  second ([#17](https://github.com/rkinas/basal/pull/17)).
 
 `--mode tpu` and `--mode strix` are community-maintained: their numbers in [HARDWARE.md](docs/HARDWARE.md) are the
 contributors' own measurements.
