@@ -63,7 +63,8 @@
 - **`--mode gguf` uses every physical core.** llama.cpp in process ran its own default of 4 threads; it now takes
   PyTorch's thread count (the physical cores, or `OMP_NUM_THREADS` / `torch.set_num_threads`). basal-2.0-mini Q8_0 on
   a 6-core CPU: 1.34× faster on 16 recorded requests, probabilities bit-identical (each logit is still one dot product
-  in one thread). Builds with every layer on Metal or CUDA are not affected. Contributed by Milosz (@Butterski).
+  in one thread). Builds with every layer on Metal or CUDA are not affected. Contributed by Milosz (@Butterski),
+  [#20](https://github.com/rkinas/basal/pull/20).
 
 # What is new in basal 2.2
 
