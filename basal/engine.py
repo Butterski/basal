@@ -24,6 +24,7 @@ Backends:
   TPUBackend        (basal/tpu.py, extra basal[tpu]; experimental) the same SOAM packing in JAX / XLA on Google TPU
 """
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -1544,7 +1545,8 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
     A checkpoint quantised already (ModelOpt FP8 / NVFP4: quantization_config) keeps its own weights. fast_prefill:
     models whose last layers reuse earlier layers' keys and values (Gemma 4 E2B / E4B: num_kv_shared_layers) run those
     layers at the answer position only during prefill (vLLM's kv_sharing_fast_prefill, YOCO); the generated token, the
-    only one basal reads, is the same, prompt log-probabilities would not be. Without media, a model with image / audio
+    only one basal reads, is the same, prompt log-probabilities would not be. media (--media on): the encoders of the
+    media the model takes, at most media.MAX_ITEMS items per prompt, no video; without, a model with image / audio
     encoders is loaded without them (more memory for the KV cache)."""
     if preset not in VLLM_PRESETS:
         raise ValueError(f"unknown --vllm-preset {preset!r} (one of: {', '.join(VLLM_PRESETS)})")
@@ -1559,7 +1561,10 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
         env["VLLM_BATCH_INVARIANT"] = "1"
     if fast_prefill and text.get("num_kv_shared_layers"):
         kw["kv_sharing_fast_prefill"] = True
-    if not media and (cfg.get("vision_config") or cfg.get("audio_config")):
+    if media:
+        from .media import MAX_ITEMS, kinds_of
+        kw["limit_mm_per_prompt"] = {k: MAX_ITEMS if k in kinds_of(cfg) else 0 for k in ("image", "audio", "video")}
+    elif cfg.get("vision_config") or cfg.get("audio_config"):
         kw["language_model_only"] = True
     return kw, env
 
@@ -1577,18 +1582,28 @@ class VLLMBackend:
     CUDA (processed log-probabilities) are exactly the allowed codes."""
 
     LOGPROB_TOKEN_IDS = 128  # longest logprob_token_ids list vLLM accepts
+    lock = threading.Lock()  # one vLLM call at a time (text batches and media requests); a class default for tests
+    media_kinds, max_audio_s = (), None
 
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
-                 fast_prefill=True):
+                 fast_prefill=True, media=False):
         import os
         cfg_file = Path(model_dir) / "config.json"
-        kw, env = vllm_args(json.loads(cfg_file.read_text()) if cfg_file.exists() else {}, preset,
-                            fast_prefill=fast_prefill)
+        cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
+        kw, env = vllm_args(cfg, preset, media=media, fast_prefill=fast_prefill)
+        if media:  # --media on: the media the model takes (basal/media.py), as EagerBackend
+            from .media import audio_window, kinds_of
+            self.media_kinds = kinds_of(cfg)
+            if not self.media_kinds:
+                raise SystemExit("--media on: the model has no image or audio encoder (config.json: vision_config, "
+                                 "audio_config)")
+            pc = Path(model_dir) / "processor_config.json"
+            self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
         os.environ.update(env)  # before vLLM starts its engine process, which reads it
         from vllm import LLM
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.prefill = PREFILL
-        self.preset, self.engine_args = preset, kw
+        self.preset, self.engine_args, self.lock = preset, kw, threading.Lock()
         self.llm = LLM(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
                        enable_prefix_caching=True, logprobs_mode="processed_logprobs",
                        max_logprobs=max(16, max_options), **kw)
@@ -1596,21 +1611,50 @@ class VLLMBackend:
         self.context_reason = f"vLLM's --max-len {max_len}"
 
     def run(self, prompts, ids_list):
-        from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
         reqs = [TokensPrompt(prompt_token_ids=list(ids)) for ids in EagerBackend.encode(self, prompts)]
+        return [p for p, _ in self._generate(reqs, ids_list)]
+
+    def _generate(self, reqs, ids_list):
+        """One vLLM call -> [(softmax over the option codes, vLLM's output)]."""
+        from vllm import SamplingParams
         import inspect
         exact = "logprob_token_ids" in inspect.signature(SamplingParams).parameters
         sps = [SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(ids), allowed_token_ids=list(ids),
                               **(dict(logprob_token_ids=list(ids)) if exact and len(ids) <= self.LOGPROB_TOKEN_IDS
                                  else {}))
                for ids in ids_list]
+        with self.lock:
+            outs = self.llm.generate(reqs, sps, use_tqdm=False)
         res = []
-        for o, ids in zip(self.llm.generate(reqs, sps, use_tqdm=False), ids_list):
+        for o, ids in zip(outs, ids_list):
             lp = o.outputs[0].logprobs[0]
             x = torch.tensor([lp[i].logprob if i in lp else -1e9 for i in ids], dtype=torch.float32)
-            res.append(torch.softmax(x, -1).tolist())
+            res.append((torch.softmax(x, -1).tolist(), o))
         return res
+
+    def run_media(self, msgs_list, ids_list, images, audio, max_soft_tokens, max_tokens=None):
+        """Prompts of one request with media, as EagerBackend.run_media reads them: the chat template's text with one
+        placeholder per item, which vLLM's Gemma 4 processor expands with the Hugging Face processor (detail: the
+        image's soft tokens). All prompts go into one vLLM call, so they share the request's media and state through
+        the prefix cache: [(position probabilities, prompt tokens, media tokens)]."""
+        from .media import SAMPLE_RATE
+        mm = {k: v for k, v in (("image", list(images)), ("audio", [(a, SAMPLE_RATE) for a in audio])) if v}
+        reqs = [{"prompt": self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                        enable_thinking=False) + self.prefill,
+                 "multi_modal_data": mm, "mm_processor_kwargs": {"max_soft_tokens": max_soft_tokens}}
+                for msgs in msgs_list]
+        try:
+            outs = self._generate(reqs, ids_list)
+        except ValueError as e:  # vLLM: "The decoder prompt (length N) is longer than the maximum model length ..."
+            n = re.search(r"\(length (\d+)\) is longer than", str(e))
+            if not n:
+                raise
+            raise ValueError(f"the prompt with its media is {n.group(1)} tokens, more than the {max_tokens or '?'} "
+                             "tokens of the context; send fewer or shorter media, or detail \"default\"") from None
+        media_ids = {t for t in (getattr(self.tok, "image_token_id", None), getattr(self.tok, "audio_token_id", None))
+                     if t is not None}
+        return [(p, len(o.prompt_token_ids), sum(t in media_ids for t in o.prompt_token_ids)) for p, o in outs]
 
     def run_shared(self, groups, policy=None):
         flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])

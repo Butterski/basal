@@ -619,7 +619,8 @@ class Server:
         if getattr(a, "batches", "default") not in ("default", "auto") and kind not in ("graph", "exit"):
             raise SystemExit("--batches needs the CUDA graph engine (fast, fast-nocompile, fast-exit, fp8, nvfp4)")
         if getattr(a, "vllm_preset", "default") != "default" and kind != "vllm":
-            raise SystemExit("--vllm-preset needs --mode vllm (the CUDA graph engine has --quant fp8 and --deterministic)")
+            raise SystemExit("--vllm-preset needs --mode vllm (the CUDA graph engine has --quant fp8 and "
+                             "--deterministic)")
         attn = getattr(a, "attn", "auto")
         if attn not in ("auto", "fa2") and kind not in ("graph", "exit"):
             raise SystemExit(f"--attn {attn} needs the CUDA graph engine (--mode fast, fast-nocompile, fast-exit, fp8, "
@@ -633,8 +634,8 @@ class Server:
         shared = self.orders != 1 or a.soam == "on"  # prefix sharing: option orders, or the questions of a request
         self.name = a.name or a.model.rstrip("/").split("/")[-1]
         quant = a.quant or quant
-        if getattr(a, "media", "off") == "on" and kind != "eager":
-            raise SystemExit("--media on needs --mode eager (the media path of basal-omni runs in the eager backend)")
+        if getattr(a, "media", "off") == "on" and kind not in ("eager", "vllm"):
+            raise SystemExit("--media on needs --mode eager or vllm (the media paths of basal-omni)")
         if kind == "eager":
             self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on")
         elif kind == "exit":
@@ -643,7 +644,8 @@ class Server:
         elif kind == "vllm":
             self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options,
                                        preset=getattr(a, "vllm_preset", "default"),
-                                       fast_prefill=getattr(a, "vllm_fast_prefill", "auto") == "auto")
+                                       fast_prefill=getattr(a, "vllm_fast_prefill", "auto") == "auto",
+                                       media=getattr(a, "media", "off") == "on")
         elif kind == "sglang":
             self.backend = SGLangBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len)
         elif kind == "mlx":
@@ -1063,7 +1065,7 @@ class Server:
         # (question index, branch index, perms, prompts, code ids): every branch in the first pass's option orders
         branches = [self.branch(i, bi, q) for i, q in enumerate(qs) for bi in range(len(q["branches"]))]
         truncation, cut, lane, n_media = None, None, "main", 0
-        if m is not None:  # media: one forward per prompt in the eager backend (no queue, no truncation)
+        if m is not None:  # media: one forward per prompt (eager) or one vLLM call per request; no queue or truncation
             outs, n_tok, longest, n_media = await self.ask_media(qs, branches, m)
         else:
             qs, branches, outs, n_tok, longest, truncation, cut, lane = await self.ask_text(body, qs, branches, pol)
@@ -1100,8 +1102,8 @@ class Server:
         from .media import decode, detail_tokens
         kinds = getattr(self.backend, "media_kinds", ())
         if not kinds:
-            raise ValueError("this server does not take media (basal-serve --mode eager --media on, with a model that "
-                             "has an image / audio encoder)")
+            raise ValueError("this server does not take media (basal-serve --mode eager or vllm with --media on, and a "
+                             "model that has an image / audio encoder)")
         if pol is not None:
             raise ValueError("early_exit is not available with media")
         if any(q.get("evidence") for q in body["questions"].values() if isinstance(q, dict)):
@@ -1244,8 +1246,8 @@ def add_engine_args(ap):
                     help="override the quantisation of the mode (fp8 / nvfp4: CUDA graph modes, q8: mlx)")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--media", choices=["off", "on"], default="off",
-                    help="on: requests may carry images / audio (\"media\", basal/media.py); --mode eager and a model "
-                         "with an image / audio encoder (basal-omni, Gemma 4)")
+                    help="on: requests may carry images / audio (\"media\", basal/media.py); --mode eager or vllm "
+                         "and a model with an image / audio encoder (basal-omni, Gemma 4)")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
                     help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu)")
     ap.add_argument("--orders", type=orders_arg, default=None,
