@@ -135,3 +135,37 @@ def test_plain_block_mask_is_the_causal_window(L, W):
             j = int(bm.kv_indices[0, 0, i, c])
             got[rows, j * B: (j + 1) * B] = true[rows, j * B: (j + 1) * B]
     assert torch.equal(got, true)
+
+
+def test_state_cache_second_round_equals_separate():
+    """A request cut at its state (--state-cache-gb): the first call computes the state and stores its keys and values
+    (own-key layers only, two head sizes), a second request over the same state runs pass 2 only over the cached
+    ones; both equal separate prompts."""
+    from basal.engine import StateCache
+    m = tiny("e4b", torch.float32)
+    be = Stub(m)
+    be.state_cache = StateCache(1 << 30)
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
+    first = [state + [20, 21, 30 + o, 31 - o] for o in range(2)]
+    second = [state + [22, 23, 24, 30 + o] for o in range(2)]
+    lids = [[7, 8], [7, 8]]
+    for toks in (first, second):
+        res = be.run_shared([(toks, lids, len(state))])[0]
+        for r, e in zip(res, separate(m, toks, lids)):
+            assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+    s = be.state_cache.stats()
+    assert s["entries"] == 1 and s["hits"] == 1 and s["misses"] == 1
+
+
+def test_long_lane_equals_separate():
+    """The long lane (run_long): every unit alone, one decoder layer at a time (between(i) before layer i)."""
+    m = tiny("31b", torch.float32)
+    be = Stub(m)
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
+    toks = [state + [20, 21, 30 + o, 31 - o] for o in range(2)] + [state + [40, 41]]
+    lids = [[7, 8], [7, 8], [7, 9]]
+    calls = []
+    res = be.run_long([(toks[:2], lids[:2]), (toks[2:], lids[2:])], between=calls.append)
+    for r, e in zip(res[0] + res[1], separate(m, toks, lids)):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+    assert calls == list(range(6)) * 2  # the root and the single prompt layer by layer; pass 2 runs whole
