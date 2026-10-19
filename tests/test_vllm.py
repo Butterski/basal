@@ -40,10 +40,10 @@ def test_fp8_checkpoint_keeps_its_own_weights():
 def test_text_only_and_kv_shared_layers():
     assert vllm_args(BF16)[0] == {"language_model_only": True}             # no image / audio encoders without media
     assert "language_model_only" not in vllm_args(BF16, media=True)[0]
-    assert vllm_args(E4B)[0] == {"kv_sharing_fast_prefill": True, "language_model_only": True}
-    assert vllm_args(E4B, fast_prefill=False)[0] == {"language_model_only": True}   # --vllm-fast-prefill off
-    assert vllm_args(E4B, "fp8-kv")[0] == {"kv_cache_dtype": "fp8", "kv_sharing_fast_prefill": True,
-                                           "language_model_only": True}
+    assert vllm_args(E4B)[0] == {"language_model_only": True}                       # --vllm-fast-prefill off
+    assert vllm_args(E4B, fast_prefill=True)[0] == {"kv_sharing_fast_prefill": True, "language_model_only": True}
+    assert vllm_args(E4B, "fp8-kv", fast_prefill=True)[0] == {"kv_cache_dtype": "fp8", "kv_sharing_fast_prefill": True,
+                                                              "language_model_only": True}
 
 
 @pytest.fixture
@@ -62,12 +62,12 @@ def fake_vllm(monkeypatch):
 
 def test_backend_passes_the_preset_to_vllm(tmp_path, fake_vllm):
     (tmp_path / "config.json").write_text(json.dumps(E4B))
-    be = VLLMBackend(tmp_path, max_len=16384, preset="fp8-kv")
+    be = VLLMBackend(tmp_path, max_len=16384, preset="fp8-kv", fast_prefill=True)
     assert be.preset == "fp8-kv" and "quantization" not in fake_vllm and fake_vllm["kv_cache_dtype"] == "fp8"
     assert fake_vllm["kv_sharing_fast_prefill"] and fake_vllm["language_model_only"]
     assert fake_vllm["enable_prefix_caching"] and fake_vllm["max_model_len"] == 16384 and fake_vllm["env"] is None
     fake_vllm.clear()
-    VLLMBackend(tmp_path, preset="deterministic", fast_prefill=False)
+    VLLMBackend(tmp_path, preset="deterministic")
     assert fake_vllm["env"] == "1" and "kv_sharing_fast_prefill" not in fake_vllm and "quantization" not in fake_vllm
     assert fake_vllm["enable_prefix_caching"] is False  # the preset's value wins over the backend's default
 
@@ -81,9 +81,9 @@ def test_bench_mode_with_a_preset(tmp_path, fake_vllm):
 
 def test_flags():
     a = parser().parse_args([])
-    assert a.vllm_preset == "default" and a.vllm_fast_prefill == "auto"
-    a = parser().parse_args(["--mode", "vllm", "--vllm-preset", "fp8-kv", "--vllm-fast-prefill", "off"])
-    assert a.vllm_preset == "fp8-kv" and a.vllm_fast_prefill == "off"
+    assert a.vllm_preset == "default" and a.vllm_fast_prefill == "off"   # off until its gate passes
+    a = parser().parse_args(["--mode", "vllm", "--vllm-preset", "fp8-kv", "--vllm-fast-prefill", "auto"])
+    assert a.vllm_preset == "fp8-kv" and a.vllm_fast_prefill == "auto"
     with pytest.raises(SystemExit):
         parser().parse_args(["--mode", "vllm", "--vllm-preset", "nvfp4"])  # no NVFP4 preset
 
@@ -130,8 +130,7 @@ def test_preset_reported_and_named():
 
 
 def test_media_engine_args():
-    assert vllm_args(E4B, media=True)[0] == {"kv_sharing_fast_prefill": True,
-                                             "limit_mm_per_prompt": {"image": 8, "audio": 8, "video": 0}}
+    assert vllm_args(E4B, media=True)[0] == {"limit_mm_per_prompt": {"image": 8, "audio": 8, "video": 0}}
     assert vllm_args(BF16, "fp8", media=True)[0] == {"quantization": "fp8",  # ultra: images, no audio encoder
                                                      "limit_mm_per_prompt": {"image": 8, "audio": 0, "video": 0}}
 

@@ -1541,7 +1541,7 @@ VLLM_PRESETS = {
 }
 
 
-def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
+def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
     """vLLM engine arguments and environment of a --vllm-preset for a model's config.json -> (kwargs, env).
     A checkpoint quantised already (ModelOpt FP8 / NVFP4: quantization_config) keeps its own weights. fast_prefill:
     models whose last layers reuse earlier layers' keys and values (Gemma 4 E2B / E4B: num_kv_shared_layers) run those
@@ -1626,7 +1626,7 @@ class VLLMBackend:
     media_kinds, max_audio_s, inflight = (), None, 1
 
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
-                 fast_prefill=True, media=False, engine="offline"):
+                 fast_prefill=False, media=False, engine="offline"):
         import os
         cfg_file = Path(model_dir) / "config.json"
         cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}

@@ -644,7 +644,7 @@ class Server:
         elif kind == "vllm":
             self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options,
                                        preset=getattr(a, "vllm_preset", "default"),
-                                       fast_prefill=getattr(a, "vllm_fast_prefill", "auto") == "auto",
+                                       fast_prefill=getattr(a, "vllm_fast_prefill", "off") == "auto",
                                        media=getattr(a, "media", "off") == "on",
                                        engine=getattr(a, "vllm_engine", "offline"))
         elif kind == "sglang":
@@ -1276,9 +1276,10 @@ def add_engine_args(ap):
                     help="--mode vllm: offline = one vLLM call at a time (each takes the requests waiting); async = "
                          "vLLM's AsyncLLM, every prompt a request of its own and several calls in flight (continuous "
                          "batching across requests)")
-    ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="auto",
+    ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="off",
                     help="--mode vllm: auto = layers that reuse earlier layers' keys and values (Gemma 4 E2B / E4B) "
-                         "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill)")
+                         "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill; off by "
+                         "default until gated)")
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
                     help="--mode vllm / sglang / tpu: context length in tokens (longer states are refused; raise it for "
                          "long documents)")
