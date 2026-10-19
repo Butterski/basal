@@ -124,6 +124,23 @@ def test_soam_nested_prefixes_equal_separate(backend):
     assert np.allclose(packed, separate, atol=5e-3)
 
 
+def test_thread_count_does_not_change_probabilities(backend):
+    """The context uses PyTorch's thread count; any count must give the same probabilities bit for bit (ggml computes
+    each output element as one dot product in one thread)."""
+    import llama_cpp as C
+
+    g = group("a shared state of a request, long enough to matter: " * 3)
+    n = C.llama_n_threads_batch(backend.ctx)
+    try:
+        runs = []
+        for k in (1, 2, 3, 5):
+            C.llama_set_n_threads(backend.ctx, k, k)
+            runs.append(backend.run_shared([g])[0])
+    finally:
+        C.llama_set_n_threads(backend.ctx, n, n)
+    assert all(np.array_equal(r, runs[0]) for r in runs)
+
+
 def test_readouts_beyond_n_seq_are_split(backend):
     """A group with more readouts than sequences per chunk is bisected (exact: each part keeps the shared prefix)."""
     prompts = [f"shared state; option set {k}" for k in range(10)]
