@@ -23,7 +23,7 @@ def test_presets():
     assert list(VLLM_PRESETS) == ["default", "fp8", "fp8-kv", "deterministic"]
     assert vllm_args(TEXT) == ({}, {})                                              # default: as in 2.2
     assert vllm_args(TEXT, "fp8") == ({"quantization": "fp8"}, {})                  # bf16 weights quantised at load
-    assert vllm_args(TEXT, "fp8-kv") == ({"quantization": "fp8", "kv_cache_dtype": "fp8"}, {})
+    assert vllm_args(TEXT, "fp8-kv") == ({"kv_cache_dtype": "fp8"}, {})            # the checkpoint's own weights
     assert vllm_args(TEXT, "deterministic") == ({"enable_prefix_caching": False}, {"VLLM_BATCH_INVARIANT": "1"})
     with pytest.raises(ValueError, match="unknown --vllm-preset 'nvfp4'"):
         vllm_args(TEXT, "nvfp4")
@@ -41,8 +41,8 @@ def test_text_only_and_kv_shared_layers():
     assert "language_model_only" not in vllm_args(BF16, media=True)[0]
     assert vllm_args(E4B)[0] == {"kv_sharing_fast_prefill": True, "language_model_only": True}
     assert vllm_args(E4B, fast_prefill=False)[0] == {"language_model_only": True}   # --vllm-fast-prefill off
-    assert vllm_args(E4B, "fp8-kv")[0] == {"quantization": "fp8", "kv_cache_dtype": "fp8",
-                                           "kv_sharing_fast_prefill": True, "language_model_only": True}
+    assert vllm_args(E4B, "fp8-kv")[0] == {"kv_cache_dtype": "fp8", "kv_sharing_fast_prefill": True,
+                                           "language_model_only": True}
 
 
 @pytest.fixture
@@ -62,7 +62,7 @@ def fake_vllm(monkeypatch):
 def test_backend_passes_the_preset_to_vllm(tmp_path, fake_vllm):
     (tmp_path / "config.json").write_text(json.dumps(E4B))
     be = VLLMBackend(tmp_path, max_len=16384, preset="fp8-kv")
-    assert be.preset == "fp8-kv" and fake_vllm["quantization"] == "fp8" and fake_vllm["kv_cache_dtype"] == "fp8"
+    assert be.preset == "fp8-kv" and "quantization" not in fake_vllm and fake_vllm["kv_cache_dtype"] == "fp8"
     assert fake_vllm["kv_sharing_fast_prefill"] and fake_vllm["language_model_only"]
     assert fake_vllm["enable_prefix_caching"] and fake_vllm["max_model_len"] == 16384 and fake_vllm["env"] is None
     fake_vllm.clear()

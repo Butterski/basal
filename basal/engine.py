@@ -1535,7 +1535,8 @@ VLLM_PRESETS = {
     # --vllm-preset: (FP8 weights quantised at load time for a bf16 checkpoint, KV cache dtype, repeatable)
     "default": (False, "auto", False),       # the checkpoint's own weights (bf16, or a ModelOpt FP8 / NVFP4 port)
     "fp8": (True, "auto", False),            # FP8 weights: a -FP8 checkpoint as it is, a bf16 one quantised at load
-    "fp8-kv": (True, "fp8", False),          # "fp8" + the keys and values cached in FP8 (about twice the states)
+    "fp8-kv": (False, "fp8", False),         # keys and values cached in FP8 (twice the states), the checkpoint's own
+                                             # weights: FP8 weights and KV cache with a -FP8 checkpoint
     "deterministic": (False, "auto", True),  # batch-invariant kernels, no prefix cache: answers independent of load
 }
 
