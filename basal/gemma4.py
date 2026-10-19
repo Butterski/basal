@@ -1,5 +1,5 @@
 """The Gemma 4 (basal-omni) decoder forward of the eager backend (basal 2.2.1). It runs the layers of the transformers
-model (the same modules and weights) in its own loop, for what the transformers forward cannot do:
+model (the same modules and weights) in its own loop, for three things the transformers forward cannot do:
 
 - **SOAM (state once, ask many):** the prompts of a group (the option orders of a question; with SOAM every question
   and option order of a request) share a token prefix: the chat template, the state and, with media, the image /
@@ -8,9 +8,12 @@ model (the same modules and weights) in its own loop, for what the transformers 
   tokens only, so its readout equals the forward of its whole prompt (up to float rounding). Prefixes of several groups
   are batched together, a long one runs alone in CHUNK-token parts; a single prompt longer than CHUNK runs its parts
   the same way (the transformers path's chunked prefill). Sliding-window layers keep the last window - 1 keys of a
-  prefix only (the most a later token can see), global layers all of them. A prefix stops after the keys and values
-  of the last layer that has its own: Gemma 4 E2B / E4B reuse the keys and values of earlier layers in their last
-  layers (E4B: 18 of 42), so nothing after that layer is read from a prefix token.
+  prefix only (the most a later token can see), global layers all of them.
+- **Answer rows only (G1):** the layers from the last one with its own keys and values onwards matter only at the
+  readout positions: Gemma 4 E2B / E4B reuse the keys and values of earlier layers in their last layers (E4B: 18 of
+  42), so those layers produce nothing a later token reads. Such layers, and the attention and MLP of the last layer
+  with its own keys and values (on 12B / 31B the last layer), run at the answer rows only: one row per prompt, its
+  query attending the stored keys. A prefix stops after the keys and values of that layer. Same maths.
 - **Media once per request:** the image and audio towers run once for all prompts of a request (the prompts carry the
   same media), and the soft tokens are part of the shared prefix. On the larger Gemma 4 models
   (use_bidirectional_attention "vision") the soft tokens of one image attend to each other in the sliding-window
@@ -39,7 +42,7 @@ class Gemma4Forward:
     MAX_BATCH_TOKENS = 16384
     ATTN_PAIRS = 2048 * 16384
 
-    def __init__(self, model):
+    def __init__(self, model, answer_rows=True):
         self.model = model
         lm = self.lm = text_model(model)
         cfg = self.cfg = lm.config
@@ -56,6 +59,7 @@ class Gemma4Forward:
         self.ple = bool(getattr(cfg, "hidden_size_per_layer_input", 0))
         self.bidir = getattr(cfg, "use_bidirectional_attention", None) == "vision"
         self.rope = sys.modules[type(self.layers[0].self_attn).__module__].apply_rotary_pos_emb
+        self.answer_rows = answer_rows
         top = model.config
         self.media_ids = {k: getattr(top, f"{k}_token_id", None) for k in ("image", "video", "audio")}
         self.pad = cfg.pad_token_id
@@ -161,11 +165,14 @@ class Gemma4Forward:
         types = set(self.types)
         rope = {t: self.lm.rotary_emb(h, pos, t) for t in types}
         masks = {t: self._mask(t, pos, kpos[t][grp] if t in kpos else None, pos, valid, blk) for t in types}
-        new, kept = {}, {}
+        new, kept, sliced = {}, {}, False
+        rows = None if read is None else (torch.arange(B, device=pos.device), read)
+        # G1: the layers from the last one with its own keys and values on run at the answer rows only
+        cut = self.last_kv if self.answer_rows and read is not None and S > 1 else None
         for i, layer in enumerate(self.layers):
             a, t = layer.self_attn, self.types[i]
             x = layer.input_layernorm(h)
-            if self.own[i]:
+            if self.own[i]:  # every own layer comes before the cut: its keys and values at every position
                 k, v = self._kv(a, x, rope[t])
                 new[i] = (k, v)
                 if i in kv:
@@ -179,12 +186,18 @@ class Gemma4Forward:
                 k, v = kept[t]
             if read is None and i == self.last_kv:
                 break
+            if i == cut:
+                h, x = h[rows][:, None], x[rows][:, None]
+                pli = pli[rows][:, None] if pli is not None else None
+                rope = {t2: (c[rows][:, None], s[rows][:, None]) for t2, (c, s) in rope.items()}
+                masks = {t2: m[rows[0], :, rows[1]][:, :, None] for t2, m in masks.items()}
+                sliced = True
             q = self._q(a, x, rope[t])
             o = F.scaled_dot_product_attention(q, k, v, attn_mask=masks[t], scale=a.scaling, enable_gqa=True)
             h = self._rest(layer, h, o, pli[:, :, i] if pli is not None else None)
         if read is None:
             return new, None
-        return new, self.lm.norm(h[torch.arange(B, device=pos.device), read])
+        return new, self.lm.norm(h[:, 0] if sliced else h[rows])
 
     # -- scheduling ---------------------------------------------------------------------------------------------------
     def _vision(self, tok):

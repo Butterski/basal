@@ -1,5 +1,5 @@
-"""The eager backend's own Gemma 4 forward (basal/gemma4.py): shared prefixes once (SOAM), media towers once per
-request. Every readout equals the
+"""The eager backend's own Gemma 4 forward (basal/gemma4.py): shared prefixes once (SOAM), the layers from the last
+one with its own keys and values at the answer rows only, media towers once per request. Every readout equals the
 transformers forward of the whole prompt (fp32, tiny random models shaped like basal-omni: E4B-like with KV sharing
 and per-layer inputs, 31B-like with keys = values and no sharing, a MoE block, and a multimodal model with images,
 audio and the larger models' bidirectional image attention)."""
@@ -61,9 +61,10 @@ def last_hidden(m, t):
 
 
 @pytest.mark.parametrize("name", sorted(CONFIGS))
-def test_forward_equals_transformers(name):
+@pytest.mark.parametrize("answer_rows", [True, False])
+def test_forward_equals_transformers(name, answer_rows):
     m = tiny(name)
-    g = Gemma4Forward(m)
+    g = Gemma4Forward(m, answer_rows=answer_rows)
     g.CHUNK = 24  # the state and the long single run in parts
     groups = groups_of()
     for grp, hs in zip(groups, g.hidden(groups)):
@@ -76,19 +77,23 @@ def test_kv_sharing_layout():
     g = Gemma4Forward(tiny("e4b"))
     assert g.last_kv == 3 and g.src == {4: 3, 5: 2} and g.store == {2, 3}  # E4B: the last 18 of 42 layers share
     g = Gemma4Forward(tiny("31b"))
-    assert g.last_kv == 5 and g.src == {} and g.bidir
+    assert g.last_kv == 5 and g.src == {} and g.bidir  # 12B / 31B: the last layer at the answer rows only
 
 
-def test_prefix_stops_at_the_last_own_keys():
-    """A prefix runs the layers before the last one with its own keys and values (and that layer's keys and values);
-    the suffixes run every layer."""
+def test_answer_rows_skip_work():
+    """Layers after the last one with its own keys and values see one row per prompt; a prefix stops at that layer."""
     m = tiny("e4b")
     seen = []
     for i, layer in enumerate(m.model.layers):
         layer.mlp.register_forward_hook(lambda mod, inp, out, i=i: seen.append((i, inp[0].shape[1])))
-    Gemma4Forward(m).hidden([[list(range(1, 41)) + [5], list(range(1, 41)) + [6, 7]]])
-    assert [i for i, n in seen if n == 40] == [0, 1, 2]
-    assert [i for i, n in seen if n == 2] == list(range(6))
+    g = Gemma4Forward(m)
+    g.hidden([[list(range(1, 41)) + [5], list(range(1, 41)) + [6, 7]]])
+    prefix = [(i, n) for i, n in seen if n == 40]
+    assert [i for i, _ in prefix] == [0, 1, 2]  # the prefix: layers before the last own one (3), MLPs only there
+    assert all(n == 1 for i, n in seen if i >= 3)  # the suffix pass from layer 3 on: the answer row of each prompt
+    seen.clear()
+    Gemma4Forward(m, answer_rows=False).hidden([[list(range(1, 41)) + [5], list(range(1, 41)) + [6, 7]]])
+    assert all(n == 2 for i, n in seen if n != 40)  # without: every suffix token in every layer
 
 
 def test_budgets_split_forwards(monkeypatch):

@@ -8,7 +8,7 @@ A prompt is a string or a list of token ids (the server tokenizes once and passe
 
 Backends:
   EagerBackend      plain PyTorch forward (reference, any GPU, Apple MPS or CPU); Gemma 4 (basal-omni) through
-                    basal/gemma4.py: the shared prefix of a group once
+                    basal/gemma4.py: the shared prefix of a group once, the last layers at the answer rows only
   GraphBackend      static shapes + CUDA graphs, optional torch.compile, shared prefix for the two option orders,
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
