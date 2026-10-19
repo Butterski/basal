@@ -108,9 +108,13 @@ def test_budgets_split_forwards(monkeypatch):
     g.MAX_BATCH_TOKENS, g.ATTN_PAIRS = 40, 2000
     got = g.hidden(groups)
     assert max(s[0] * s[1] for s in calls) <= 40 and len(calls) > 8
-    for a, b in zip(ref, got):
-        for x, y in zip(a, b):
-            assert torch.allclose(x, y, atol=1e-5)
+    calls.clear()
+    g.MAX_BATCH_TOKENS, g.ATTN_PAIRS, g.KV_BYTES = 16384, 2048 * 16384, 60 * g.kv_row_bytes
+    assert g.hidden(groups[:1]) and [s[0] for s in calls[-2:]] == [1, 1]  # 3 suffixes over 50 keys: one per forward
+    got2 = g.hidden(groups)
+    for a, b, c in zip(ref, got, got2):
+        for x, y, z in zip(a, b, c):
+            assert torch.allclose(x, y, atol=1e-5) and torch.allclose(x, z, atol=1e-5)
 
 
 class Stub(EagerBackend):

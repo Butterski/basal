@@ -1,4 +1,4 @@
-"""The Gemma 4 (basal-omni) decoder forward of the eager backend (basal 2.2.1). It runs the layers of the transformers
+"""The Gemma 4 (basal-omni) decoder forward of the eager backend (basal 2.3). It runs the layers of the transformers
 model (the same modules and weights) in its own loop, for three things the transformers forward cannot do:
 
 - **SOAM (state once, ask many):** the prompts of a group (the option orders of a question; with SOAM every question
@@ -41,6 +41,10 @@ class Gemma4Forward:
     CHUNK = 2048
     MAX_BATCH_TOKENS = 16384
     ATTN_PAIRS = 2048 * 16384
+    # keys and values repeated per query head (the math kernel's GQA, the memory-efficient kernel's input) over the
+    # rows of a suffix forward: each row repeats the prefix keys, so 31B (32 heads x 512 in its global layers, 64 KB a
+    # row and key) with five questions over a 10k-token state would hold 3.2 GB per layer; at most KV_BYTES
+    KV_BYTES = 2 << 30
 
     def __init__(self, model, answer_rows=True):
         self.model = model
@@ -63,6 +67,9 @@ class Gemma4Forward:
         top = model.config
         self.media_ids = {k: getattr(top, f"{k}_token_id", None) for k in ("image", "video", "audio")}
         self.pad = cfg.pad_token_id
+        w = lm.embed_tokens.weight
+        self.kv_row_bytes = 2 * w.element_size() * max(cfg.num_attention_heads * layer.self_attn.head_dim
+                                                       for layer in self.layers)
 
     # -- embeddings ---------------------------------------------------------------------------------------------------
     def _embed(self, ids, media=None, offsets=None):
@@ -279,7 +286,7 @@ class Gemma4Forward:
 
     def _shared(self, jobs, groups, out, media=None):
         """A batch of jobs (group, prompt indices, prefix length): their prefixes once, then every suffix over them,
-        in forwards within MAX_BATCH_TOKENS tokens and ATTN_PAIRS query-key pairs."""
+        in forwards within MAX_BATCH_TOKENS tokens, ATTN_PAIRS query-key pairs and KV_BYTES of repeated keys."""
         ctx = self._prefix([groups[g][js[0]][:P] for g, js, P in jobs], media)
         Lc = max(p.shape[1] for p in ctx[1].values())
         rows = sorted(((b, g, j, P) for b, (g, js, P) in enumerate(jobs) for j in js),
@@ -288,7 +295,8 @@ class Gemma4Forward:
         for r in rows + [None]:
             if cur and r is not None:
                 n, S = len(cur) + 1, len(groups[r[1]][r[2]]) - r[3]
-                if n * S <= self.MAX_BATCH_TOKENS and n * S * (Lc + S) <= self.ATTN_PAIRS:
+                if (n * S <= self.MAX_BATCH_TOKENS and n * S * (Lc + S) <= self.ATTN_PAIRS
+                        and n * (Lc + S) * self.kv_row_bytes <= self.KV_BYTES):
                     cur.append(r)
                     continue
             if cur:

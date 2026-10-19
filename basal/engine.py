@@ -114,7 +114,7 @@ class EagerBackend:
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
             torch.backends.cuda.enable_cudnn_sdp(False)
-            # basal 2.2.1: the engine's own Gemma 4 forward (basal/gemma4.py) unless --eager-forward hf (or
+            # basal 2.3: the engine's own Gemma 4 forward (basal/gemma4.py) unless --eager-forward hf (or
             # BASAL_EAGER_FORWARD=hf), the transformers forward of 2.2.0
             import os
             forward = forward or os.environ.get("BASAL_EAGER_FORWARD") or "basal"
@@ -258,7 +258,7 @@ class EagerBackend:
 
     def run_shared(self, groups, policy=None):
         if self.g4 is not None:  # Gemma 4: the shared prefix of each group once (SOAM)
-            with self.lock:
+            with self.lock, torch.no_grad():
                 hid = self.g4.hidden([self.encode(g[0]) for g in groups])
                 flat = self._codes(torch.stack([h for g in hid for h in g]).float(), [x for g in groups for x in g[1]])
         else:
