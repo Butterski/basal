@@ -1532,11 +1532,11 @@ class MPSBackend(GraphBackend):
 
 
 VLLM_PRESETS = {
-    # --vllm-preset: (FP8 weights quantised at load time for a bf16 checkpoint, KV cache dtype, batch-invariant kernels)
+    # --vllm-preset: (FP8 weights quantised at load time for a bf16 checkpoint, KV cache dtype, repeatable)
     "default": (False, "auto", False),       # the checkpoint's own weights (bf16, or a ModelOpt FP8 / NVFP4 port)
     "fp8": (True, "auto", False),            # FP8 weights: a -FP8 checkpoint as it is, a bf16 one quantised at load
     "fp8-kv": (True, "fp8", False),          # "fp8" + the keys and values cached in FP8 (about twice the states)
-    "deterministic": (False, "auto", True),  # VLLM_BATCH_INVARIANT: answers independent of the other requests
+    "deterministic": (False, "auto", True),  # batch-invariant kernels, no prefix cache: answers independent of load
 }
 
 
@@ -1558,7 +1558,11 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
     if kv != "auto":
         kw["kv_cache_dtype"] = kv
     if invariant:
+        # batch-invariant kernels without the prefix cache: with it, a request's numbers depend on the states earlier
+        # requests left in the cache (the 31B FP8 port, 2,000 decisions at 32 in flight, two runs: 96.9% the same top
+        # answer with the prefix cache, 99.95% without)
         env["VLLM_BATCH_INVARIANT"] = "1"
+        kw["enable_prefix_caching"] = False
     if fast_prefill and text.get("num_kv_shared_layers"):
         kw["kv_sharing_fast_prefill"] = True
     if media:
@@ -1570,9 +1574,9 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
 
 
 class AsyncVLLM:
-    """vLLM's AsyncLLM on an event loop of its own (a daemon thread), with LLM.generate's call: every prompt is a request
-    of its own, so the prompts of several server calls share the engine's steps (continuous batching) instead of one
-    call waiting for the previous one to finish."""
+    """vLLM's AsyncLLM on an event loop of its own (a daemon thread), with LLM.generate's call: every prompt is a
+    request of its own, so the prompts of several server calls share the engine's steps (continuous batching) instead
+    of one call waiting for the previous one to finish."""
 
     def __init__(self, **kw):
         import asyncio
@@ -1642,9 +1646,9 @@ class VLLMBackend:
             make, self.lock, self.inflight = AsyncVLLM, contextlib.nullcontext(), self.ASYNC_INFLIGHT
         else:
             from vllm import LLM as make
-        self.llm = make(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
-                        enable_prefix_caching=True, logprobs_mode="processed_logprobs",
-                        max_logprobs=max(16, max_options), **kw)
+        self.llm = make(**{**dict(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
+                                  enable_prefix_caching=True, logprobs_mode="processed_logprobs",
+                                  max_logprobs=max(16, max_options)), **kw})
         self.context = max_len - 1  # longest prompt: max_model_len holds the one generated token too
         self.context_reason = f"vLLM's --max-len {max_len}"
 

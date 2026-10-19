@@ -24,7 +24,7 @@ def test_presets():
     assert vllm_args(TEXT) == ({}, {})                                              # default: as in 2.2
     assert vllm_args(TEXT, "fp8") == ({"quantization": "fp8"}, {})                  # bf16 weights quantised at load
     assert vllm_args(TEXT, "fp8-kv") == ({"quantization": "fp8", "kv_cache_dtype": "fp8"}, {})
-    assert vllm_args(TEXT, "deterministic") == ({}, {"VLLM_BATCH_INVARIANT": "1"})
+    assert vllm_args(TEXT, "deterministic") == ({"enable_prefix_caching": False}, {"VLLM_BATCH_INVARIANT": "1"})
     with pytest.raises(ValueError, match="unknown --vllm-preset 'nvfp4'"):
         vllm_args(TEXT, "nvfp4")
 
@@ -68,6 +68,7 @@ def test_backend_passes_the_preset_to_vllm(tmp_path, fake_vllm):
     fake_vllm.clear()
     VLLMBackend(tmp_path, preset="deterministic", fast_prefill=False)
     assert fake_vllm["env"] == "1" and "kv_sharing_fast_prefill" not in fake_vllm and "quantization" not in fake_vllm
+    assert fake_vllm["enable_prefix_caching"] is False  # the preset's value wins over the backend's default
 
 
 def test_bench_mode_with_a_preset(tmp_path, fake_vllm):

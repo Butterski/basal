@@ -1268,9 +1268,9 @@ def add_engine_args(ap):
     ap.add_argument("--vllm-preset", dest="vllm_preset", choices=list(VLLM_PRESETS), default="default",
                     help="--mode vllm: default = the checkpoint's own weights; fp8 = FP8 weights (a bf16 checkpoint "
                          "quantised at load time, a -FP8 checkpoint as it is); fp8-kv = fp8 + an FP8 KV cache (about "
-                         "twice the tokens of state); deterministic = batch-invariant kernels (VLLM_BATCH_INVARIANT: "
-                         "answers independent of the other requests, lower throughput). Loads CALIBRATION.vllm.<preset>"
-                         ".json when the model ships one, else CALIBRATION.vllm.json")
+                         "twice the tokens of state); deterministic = batch-invariant kernels and no prefix cache "
+                         "(VLLM_BATCH_INVARIANT: answers independent of the other requests, lower throughput). Loads "
+                         "CALIBRATION.vllm.<preset>.json when the model ships one, else CALIBRATION.vllm.json")
     ap.add_argument("--vllm-engine", dest="vllm_engine", choices=["offline", "async"], default="offline",
                     help="--mode vllm: offline = one vLLM call at a time (each takes the requests waiting); async = "
                          "vLLM's AsyncLLM, every prompt a request of its own and several calls in flight (continuous "
