@@ -49,8 +49,8 @@ Method (the one the shipped files were fitted with):
     once pooled over all types (thresholds[r].confidence, informational: basal-serve never applies it). A type
     without a certified threshold of its own ("confidence": null, or no entry) has every automatic action of act and
     tool with that max_error deferred ("no certified threshold for this type at this max_error"). A few hundred
-    decisions usually certify 5%; 1% needs at least 299 accepted FIT decisions without an error (about 1,000 items or
-    more);
+    decisions usually certify 5%; 1% needs at least 299 accepted FIT decisions of the type without an error (about
+    1,000 items of the type or more);
   * gates: ece_lofo per type, for every family the temperatures fitted on the FIT decisions of the other families and
     the ECE measured on its CERT decisions (mean and max over the families with at least --min-family CERT decisions
     of the type, and pooled over all of them), next to --reference (basal-1.5: the same statistic on our calibration

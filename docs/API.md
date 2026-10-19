@@ -161,8 +161,8 @@ certify your own thresholds on your data. The ports use per-engine files where t
 **Calibrate on your own data.** On your own domain, refit the temperatures and thresholds on your labelled requests
 with `basal-calibrate`. It runs the engine you serve, refits by the same procedure, and prints coverage and error at
 the shipped and the refitted thresholds on a held-out part of your items. A few hundred labelled items usually certify
-the 5% target; the 1% target needs at least 299 accepted decisions without an error in the fitting part, so in
-practice about 1,000 items or more. A target that cannot be certified is marked in the file, and `max_error` then
+the 5% target; the 1% target needs at least 299 accepted decisions without an error in the fitting part, per
+question type, so in practice about 1,000 items of each type or more. A target that cannot be certified is marked in the file, and `max_error` then
 defers every `act` / `tool` decision of that type. Input format and method: [CALIBRATION.md](CALIBRATION.md).
 
 ```bash

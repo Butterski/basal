@@ -233,9 +233,14 @@ The files that ship in a model's directory are not checked.
 
 For the **temperatures**, a few dozen labelled decisions of a type already help (`--min-blend`, above); 50 FIT
 decisions, about 72 labelled ones, fit it fully. For the **thresholds**, a few hundred labelled decisions usually certify the 5% target. The 1% target needs at least 299 accepted FIT
-decisions without an error (more with any error), so in practice about 1,000 items or more. With fewer, use the
-refitted temperatures and the 5% threshold, or route uncertain cases to a person. When no confidence meets a bound,
-the type's entry has `"confidence": null` and a `reason` for that target; `act` and `tool` questions of that type
+decisions without an error (473 with one error, 628 with two), so in practice about 1,000 labelled decisions of a
+type or more. The thresholds are certified per question type, so these numbers hold for each type on its own: 299
+accepted `noul` decisions without an error, and again 299 `choice` decisions, not 299 in total. An error made with
+very high confidence is accepted at every threshold below it and raises the count for its type. On one external set
+of 1,254 Polish business decisions (FIT: 462 `noul`, 371 `choice`) no type of five basal-2.0 and basal-omni models
+was certified at 1%: the lowest bound of any type was 1.2%, and for the basal-omni models a few errors at confidence
+0.997–0.999 set that floor. With fewer, use the refitted temperatures and the 5% threshold, or route uncertain cases
+to a person. When no confidence meets a bound, the type's entry has `"confidence": null` and a `reason` for that target; `act` and `tool` questions of that type
 with that `max_error` then defer every decision (the defer action, the `refused` one named, `"deferred": true` and
 `"max_error": "no certified threshold for this type at this max_error"`), and `basal-calibrate` warns about it. With fewer than 200
 decisions it warns that the bounds are loose.
