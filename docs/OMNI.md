@@ -92,6 +92,7 @@ F16 file, without an importance matrix.
 | max | GGUF Q8_0 | 12.7 GB | Metal | 0.9950 | 1.0000 | +0.0 pt | +0.013 | 0.4 | (3) |
 | max | MLX `mlx-q8` | 14 GB | Metal | 0.9875 | 0.9973 | +0.8 pt | +0.008 | 0.3 | pass (4) |
 | max | MLX 8-bit port (`-MLX`) | 13.6 GB | Metal | 0.989 | 1.000 | -0.1 pt | +0.002 | 0.25 | pass (5) |
+| 1.1-max | MLX 8-bit port (`-MLX`) | 13.6 GB | Metal | 0.984 | 0.999 | +0.6 pt | -0.003 | 0.27 | pass (6) |
 
 (1) On the 24 GB Mac, 191 of the 300 longest prompts (27-255 options) ran out of GPU memory with bf16 weights; the
 2-10-option items the gate reads all ran. (2) 300 items with 2-10 options, one request at a time (Ollama returns at
@@ -103,6 +104,11 @@ longest prompts ran out of GPU memory on the 24 GB Mac; accuracy and ECE are clo
 (5) [`Remek/basal-omni-1.0-max-MLX`](https://huggingface.co/Remek/basal-omni-1.0-max-MLX) on the same M4 Pro (24 GB),
 8 in flight: one question takes 453 ms; long prompts can run out of GPU memory at 24 GB. Its own
 `CALIBRATION.mlx.json` automates 36% of decisions at `max_error` 1% and 85% at 5%.
+(6) [`Remek/basal-omni-1.1-max-MLX`](https://huggingface.co/Remek/basal-omni-1.1-max-MLX), against basal-omni-1.1-max
+bf16, on the same M4 Pro (24 GB), 8 in flight, 18-19 Oct: every 8th development decision (1,261 of 1,325 ran; 1,039
+with 2-10 options). One question takes 525 ms; long prompts can run out of GPU memory at 24 GB. Its own
+`CALIBRATION.mlx.json` (calibration run on every 2nd item, 4,280 test decisions) automates 35% of decisions at
+`max_error` 1% and 80% at 5%.
 For comparison on the same GPU: eager bf16 985 s (mini) and 2,157 s (max) for the 10,606 decisions at 8 in flight, vLLM
 bf16 415 s and 840 s; GGUF Q8_0 646 s and 1,186 s at 16. Use Q8_0 (or Q6_K where memory is short); Q5_K_M and Q4_K_M
 move too many close decisions.
