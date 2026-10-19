@@ -24,7 +24,8 @@ def test_presets():
     assert vllm_args(TEXT) == ({}, {})                                              # default: as in 2.2
     assert vllm_args(TEXT, "fp8") == ({"quantization": "fp8"}, {})                  # bf16 weights quantised at load
     assert vllm_args(TEXT, "fp8-kv") == ({"kv_cache_dtype": "fp8"}, {})            # the checkpoint's own weights
-    assert vllm_args(TEXT, "deterministic") == ({"enable_prefix_caching": False}, {"VLLM_BATCH_INVARIANT": "1"})
+    assert vllm_args(TEXT, "deterministic") == ({"enable_prefix_caching": False, "attention_backend": "TRITON_ATTN"},
+                                                {"VLLM_BATCH_INVARIANT": "1"})
     with pytest.raises(ValueError, match="unknown --vllm-preset 'nvfp4'"):
         vllm_args(TEXT, "nvfp4")
 

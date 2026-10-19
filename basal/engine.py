@@ -1561,9 +1561,10 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
     if invariant:
         # batch-invariant kernels without the prefix cache: with it, a request's numbers depend on the states earlier
         # requests left in the cache (the 31B FP8 port, 2,000 decisions at 32 in flight, two runs: 96.9% the same top
-        # answer with the prefix cache, 99.95% without)
+        # answer with the prefix cache, 99.95% without). Triton attention: vLLM's batch-invariant FlashAttention is
+        # FlashAttention 2, which takes heads up to 256 wide (Gemma 4's global layers: 512; vLLM 0.31)
         env["VLLM_BATCH_INVARIANT"] = "1"
-        kw["enable_prefix_caching"] = False
+        kw.update(enable_prefix_caching=False, attention_backend="TRITON_ATTN")
     if fast_prefill and text.get("num_kv_shared_layers"):
         kw["kv_sharing_fast_prefill"] = True
     if media:
