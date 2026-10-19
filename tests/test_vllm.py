@@ -194,3 +194,38 @@ def test_media_prompt_over_the_context(monkeypatch):
     be = media_backend(monkeypatch, generate)
     with pytest.raises(ValueError, match="the prompt with its media is 20000 tokens, more than the 16383 tokens"):
         be.run_media([[{"role": "user", "content": "a"}]], [[10, 11]], ["IMG"], [], 280, 16383)
+
+
+def test_async_engine(monkeypatch, tmp_path):
+    """--vllm-engine async: vLLM's AsyncLLM on a loop of its own; outputs in the order of the prompts, several server
+    calls in flight and no lock around them."""
+    import asyncio
+    made = {}
+
+    class Engine:
+        async def generate(self, r, sp, rid):
+            await asyncio.sleep(0.01 * (3 - r))  # later prompts finish first
+            yield f"partial {r}"
+            yield f"out {r} {rid.startswith('basal-')}"
+
+    class AsyncLLM:
+        @staticmethod
+        def from_engine_args(args):
+            made.update(args)
+            return Engine()
+    vllm = type(sys)("vllm")
+    vllm.AsyncEngineArgs = lambda **kw: kw
+    mod = type(sys)("vllm.v1.engine.async_llm")
+    mod.AsyncLLM = AsyncLLM
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.async_llm", mod)
+    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda *_: None)
+    (tmp_path / "config.json").write_text(json.dumps(TEXT))
+    be = VLLMBackend(tmp_path, preset="fp8", engine="async")
+    assert made["quantization"] == "fp8" and made["disable_log_stats"] and made["enable_prefix_caching"]
+    assert be.inflight == VLLMBackend.ASYNC_INFLIGHT > 1 and VLLMBackend.inflight == 1
+    assert be.llm.generate([0, 1, 2], [None] * 3) == ["out 0 True", "out 1 True", "out 2 True"]
+    with be.lock, be.lock:  # no lock: calls overlap
+        pass
+    assert parser().parse_args(["--vllm-engine", "async"]).vllm_engine == "async"
+    assert parser().parse_args([]).vllm_engine == "offline"

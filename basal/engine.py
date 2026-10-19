@@ -1569,6 +1569,39 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
     return kw, env
 
 
+class AsyncVLLM:
+    """vLLM's AsyncLLM on an event loop of its own (a daemon thread), with LLM.generate's call: every prompt is a request
+    of its own, so the prompts of several server calls share the engine's steps (continuous batching) instead of one
+    call waiting for the previous one to finish."""
+
+    def __init__(self, **kw):
+        import asyncio
+        import itertools
+        from vllm import AsyncEngineArgs
+        from vllm.v1.engine.async_llm import AsyncLLM
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True, name="vllm-async").start()
+
+        async def make():  # the engine's output handler runs on this loop
+            return AsyncLLM.from_engine_args(AsyncEngineArgs(disable_log_stats=True, **kw))
+        self.engine = asyncio.run_coroutine_threadsafe(make(), self.loop).result()
+        self.ids = itertools.count()
+
+    def generate(self, reqs, sps, use_tqdm=False):
+        """[RequestOutput] in the order of reqs (the final output of each request)."""
+        import asyncio
+
+        async def one(r, sp):
+            out = None
+            async for out in self.engine.generate(r, sp, f"basal-{next(self.ids)}"):
+                pass
+            return out
+
+        async def every():
+            return await asyncio.gather(*[one(r, sp) for r, sp in zip(reqs, sps)])
+        return asyncio.run_coroutine_threadsafe(every(), self.loop).result()
+
+
 class VLLMBackend:
     """vLLM backend: bf16 checkpoints and the ModelOpt FP8 / NVFP4 ports, with the engine settings of a --vllm-preset
     (VLLM_PRESETS, vllm_args). One generated token restricted to the option letters; with
@@ -1582,11 +1615,12 @@ class VLLMBackend:
     CUDA (processed log-probabilities) are exactly the allowed codes."""
 
     LOGPROB_TOKEN_IDS = 128  # longest logprob_token_ids list vLLM accepts
-    lock = threading.Lock()  # one vLLM call at a time (text batches and media requests); a class default for tests
-    media_kinds, max_audio_s = (), None
+    ASYNC_INFLIGHT = 8  # --vllm-engine async: server calls in flight at once
+    lock = threading.Lock()  # offline engine: one vLLM call at a time (text batches, media requests); a class default
+    media_kinds, max_audio_s, inflight = (), None, 1
 
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
-                 fast_prefill=True, media=False):
+                 fast_prefill=True, media=False, engine="offline"):
         import os
         cfg_file = Path(model_dir) / "config.json"
         cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
@@ -1600,13 +1634,17 @@ class VLLMBackend:
             pc = Path(model_dir) / "processor_config.json"
             self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
         os.environ.update(env)  # before vLLM starts its engine process, which reads it
-        from vllm import LLM
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.prefill = PREFILL
         self.preset, self.engine_args, self.lock = preset, kw, threading.Lock()
-        self.llm = LLM(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
-                       enable_prefix_caching=True, logprobs_mode="processed_logprobs",
-                       max_logprobs=max(16, max_options), **kw)
+        if engine == "async":  # several server calls at once, each prompt a request of its own (AsyncVLLM)
+            import contextlib
+            make, self.lock, self.inflight = AsyncVLLM, contextlib.nullcontext(), self.ASYNC_INFLIGHT
+        else:
+            from vllm import LLM as make
+        self.llm = make(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
+                        enable_prefix_caching=True, logprobs_mode="processed_logprobs",
+                        max_logprobs=max(16, max_options), **kw)
         self.context = max_len - 1  # longest prompt: max_model_len holds the one generated token too
         self.context_reason = f"vLLM's --max-len {max_len}"
 

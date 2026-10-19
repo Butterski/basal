@@ -645,7 +645,8 @@ class Server:
             self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options,
                                        preset=getattr(a, "vllm_preset", "default"),
                                        fast_prefill=getattr(a, "vllm_fast_prefill", "auto") == "auto",
-                                       media=getattr(a, "media", "off") == "on")
+                                       media=getattr(a, "media", "off") == "on",
+                                       engine=getattr(a, "vllm_engine", "offline"))
         elif kind == "sglang":
             self.backend = SGLangBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len)
         elif kind == "mlx":
@@ -1270,6 +1271,10 @@ def add_engine_args(ap):
                          "twice the tokens of state); deterministic = batch-invariant kernels (VLLM_BATCH_INVARIANT: "
                          "answers independent of the other requests, lower throughput). Loads CALIBRATION.vllm.<preset>"
                          ".json when the model ships one, else CALIBRATION.vllm.json")
+    ap.add_argument("--vllm-engine", dest="vllm_engine", choices=["offline", "async"], default="offline",
+                    help="--mode vllm: offline = one vLLM call at a time (each takes the requests waiting); async = "
+                         "vLLM's AsyncLLM, every prompt a request of its own and several calls in flight (continuous "
+                         "batching across requests)")
     ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="auto",
                     help="--mode vllm: auto = layers that reuse earlier layers' keys and values (Gemma 4 E2B / E4B) "
                          "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill)")
