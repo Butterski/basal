@@ -173,6 +173,10 @@ def test_without_force_lang_the_language_is_detected():
     assert multi["lang"] == "pl" and multi["branches"] == [("Co widać?\nCzy dotyczy: „kot”?", ["Tak", "Nie"])]
     qs = {"cat": {"type": "noul", "instructions": "Is it a cat?"}}
     assert to_items("Kot śpi.", qs) == to_items("Kot śpi.", qs, force_lang=None)
+    # a Polish state decides every question; an English one leaves it to each question's own text
+    mixed = {"a": {"type": "noul", "instructions": "Is it a cat?"}, "b": {"type": "noul", "instructions": "Czy śpi?"}}
+    assert [q["lang"] for q in to_items("Kot śpi.", mixed)] == ["pl", "pl"]
+    assert [q["lang"] for q in to_items("The cat sleeps.", mixed)] == ["en", "pl"]
 
 
 def test_request_lang_reaches_the_prompt():

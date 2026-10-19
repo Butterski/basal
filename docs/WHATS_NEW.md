@@ -51,6 +51,10 @@
 - Measured on public sets the models were not trained on, with basal-omni-1.0-max: see
   [TASKS.md](TASKS.md#results). Experimental: the API may change, and the `automated` flag of a task answer needs
   thresholds fitted for that task.
+- The prompt language is detected from the state once per request in task expansion and once in question
+  preparation, not once per question: an English state was re-scanned for Polish diacritics for every question (a
+  40k-character `compress` request with 326 questions: 509 ms, now 2 ms; 50 task questions: 79 ms, now 2 ms in task
+  expansion). Same languages as before.
 - Every other request takes the same code path as in v2.0.0 (on basal-omni-1.0-max, 23,276 of 23,278 served-check
   answers were the same; the two others were near-ties).
 
