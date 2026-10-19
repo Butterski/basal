@@ -1,4 +1,4 @@
-# What is new in basal 2.2.1 (not released yet)
+# What is new in basal 2.3 (not released yet)
 
 - **Faster preparation of large requests.** The prompt language is detected from the state once per request in task
   expansion and once in question preparation, not once per question: an English state was re-scanned for Polish
