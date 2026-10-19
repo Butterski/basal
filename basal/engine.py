@@ -600,18 +600,43 @@ class GraphBackend(EagerBackend):
         with its own keys and values (Gemma 4: per layer type; its KV-shared layers read those of an earlier layer)."""
         if self.gemma is not None:
             self.kv_shapes = list(self.gemma.kv_shapes)
+            self._fit_grid()
         else:
             cfg = self.model.config
             H = cfg.num_key_value_heads
             D = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
             self.kv_shapes = [(H, D)] * len(self.model.model.layers)
         self.kv_shape = self.kv_shapes[0]
-        n = max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1], self.TREE_ROWS[-1] * self.LENS[-1])
+        n = self._kv_tokens()
         dt = self._dtype
         # zeros, not empty: below a cached root the masked tail of its rows is never written, and a masked NaN still
         # poisons the readout (0 x NaN)
         self._kv = [tuple(torch.zeros(n * H * D, dtype=dt, device=self.dev) for _ in "kv") for H, D in self.kv_shapes] \
             if self.shared else None
+
+    KV_SHARE = 0.25  # Gemma 4: the most of the free GPU memory (after the weights) its key / value buffers may take
+
+    def _fit_grid(self):
+        """Gemma 4: every layer with its own keys and values keeps them for every token (31B: 0.9 MB per token in
+        bf16, 12B: 0.34 MB), so buffers for the largest graph shapes could leave the activations no room next to the
+        weights. Its pass-2 graphs are captured only where pass 1 can fill them (rows x root length within
+        TOKEN_BUDGET; warm), so the buffers hold max(TOKEN_BUDGET, PLAIN_LENS[-1]) tokens, and both shrink until they
+        take at most KV_SHARE of the free memory; longer units run without a graph, as beyond PLAIN_LENS."""
+        if self.dev.type != "cuda" or not self.shared:
+            return
+        per = sum(2 * H * D for H, D in self.kv_shapes) * self._dtype.itemsize
+        cap = int(self.KV_SHARE * torch.cuda.mem_get_info(self.dev)[0] / per)
+        if max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1]) > cap:
+            self.TOKEN_BUDGET = min(self.TOKEN_BUDGET, max(cap // 512 * 512, 1024))
+            self.PLAIN_LENS = [x for x in self.PLAIN_LENS if x <= max(cap, self.PLAIN_LENS[0])]
+            self.LENS = [x for x in self.LENS if x <= self.PLAIN_LENS[-1]]
+
+    def _kv_tokens(self):
+        """Tokens of the key / value buffer: the largest plain graph and the largest pass-2 graph's rows over the
+        longest root (Gemma 4: within TOKEN_BUDGET, see _fit_grid)."""
+        if self.gemma is not None:
+            return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1])
+        return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1], self.TREE_ROWS[-1] * self.LENS[-1])
 
     def _kv_new(self, L):
         """Fresh per-layer (K, V) buffers [1, kv heads, L, head size] (a root longer than the largest graph)."""
@@ -684,7 +709,7 @@ class GraphBackend(EagerBackend):
             for b in self.TREE_ROWS:
                 for L in self.LENS:
                     for S in self.SUFFIX_LENS:
-                        if b * S <= self.TOKEN_BUDGET:
+                        if b * S <= self.TOKEN_BUDGET and (self.gemma is None or b * L <= self.TOKEN_BUDGET):
                             self._graph_sfx(b, S, L)
             if self.prefix:  # pass 2 of short requests over a cached template prefix
                 for L in (x for x in self.LENS if x <= self.PREFIX_ROOT):
@@ -735,7 +760,7 @@ class GraphBackend(EagerBackend):
     @torch.no_grad()
     def _forward(self, ids, kv=None, ro=None):
         """Plain causal forward; kv: per-layer (K, V) buffers [rows, kv heads, length, head dim] it fills (pass 1).
-        Gemma 4: uncompiled, the math kernel; ro [rows, R]: the readout positions -> [rows, R, D]."""
+        Gemma 4: uncompiled; ro [rows, R]: the readout positions -> [rows, R, D]."""
         if self.gemma is not None:
             return self.gemma.forward(ids, kv, ro, compiled=False)
         return self.model.model(input_ids=ids, use_cache=False, basal_kv=kv).last_hidden_state
@@ -779,7 +804,8 @@ class GraphBackend(EagerBackend):
     @torch.no_grad()
     def _forward_suffix(self, ids, mask, pos, prefix, ro=None):
         """Pass 2: rows that continue computed prefixes (per-layer (K, V) [rows, kv heads, prefix length, head dim]);
-        mask [rows, 1, length, prefix length + length]. Gemma 4: uncompiled, the math kernel; ro as in _forward."""
+        mask [rows, 1, length, prefix length + length] (Gemma 4 with flex: a TreeMask). Gemma 4: uncompiled; ro as in
+        _forward."""
         if self.gemma is not None:
             return self.gemma.forward_suffix(ids, mask, pos, prefix, ro, compiled=False)
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
@@ -789,7 +815,7 @@ class GraphBackend(EagerBackend):
     def _forward_layered(self, ids, kv=None, between=None):
         """The plain causal forward (`_forward`, uncompiled) one decoder layer at a time, calling between(i) before
         layer i (the long lane gives the GPU to the main lane there): the transformers model's own loop, the same
-        modules with the same arguments, so the same result. Gemma 4: its own forward, uncompiled (the math kernel)."""
+        modules with the same arguments, so the same result. Gemma 4: its own forward, uncompiled."""
         if self.gemma is not None:
             return self.gemma.forward(ids, kv, between=between, compiled=False)
         from transformers.masking_utils import create_causal_mask
@@ -1108,7 +1134,8 @@ class GraphBackend(EagerBackend):
                 kv = self._kv_new(L)
             else:
                 L = self._bucket(max(P), self.PLAIN_LENS)
-                kv = self._kv_views(max(b, self._bucket(b, rows) if L <= self.LENS[-1] else b), L)
+                B = max(b, self._bucket(b, rows) if L <= self.LENS[-1] else b)
+                kv = self._kv_views(B if B * L <= self._kv_tokens() else b, L)  # the rows of a pass-2 graph if any
             same = {}  # rows with the same cached root (a template prefix): one broadcast copy per layer
             for r, e in enumerate(hits):
                 same.setdefault(id(e), (e, P[r], []))[2].append(r)
@@ -1171,25 +1198,26 @@ class GraphBackend(EagerBackend):
             sel += [(1, r, i if self.gemma is None else 0) if i < p else (2, r, i - p) for i in last]
         # FlexAttention only in the pass-2 graphs captured at start-up: an uncaptured shape (long roots, many or long
         # branches) runs the dense pass 2 uncompiled, as without flex. The compiled flex layer specialises on shape
-        # classes, and a request of a new class compiled for 1-4 s (SPEED.md sections 6 and 11)
-        if self.flex and graph is not None:  # the trie as FlexAttention's mask: root tokens, blocks, ancestors
+        # classes, and a request of a new class compiled for 1-4 s (SPEED.md sections 6 and 11). Gemma 4: its flex
+        # kernel takes the TreeMask in uncaptured shapes too (one compiled flex_attention of dynamic shapes)
+        if self.flex and (graph is not None or self.gemma is not None):  # root tokens, blocks, ancestors
             tm = self._tree_mask(seg2, par2, P + [0] * (B - b), S)
-            g2, s_ids, s_mask, s_pos, _, h2 = graph
-            s_ids.copy_(self._to_dev(ids2), non_blocking=True)
-            s_pos.copy_(self._to_dev(pos2), non_blocking=True)
-            for dst, src in zip(s_mask, tm):
-                dst.copy_(src)
-            g2.replay()
+            if graph is None:
+                h2, sel = self._gemma_suffix(ids2, tm, pos2, kv, sel, B)
+            else:
+                g2, s_ids, s_mask, s_pos, _, h2 = graph
+                s_ids.copy_(self._to_dev(ids2), non_blocking=True)
+                s_pos.copy_(self._to_dev(pos2), non_blocking=True)
+                for dst, src in zip(s_mask, tm):
+                    dst.copy_(src)
+                g2.replay()
         else:
             m2 = self._mask_from_seg(self._to_dev(seg2), par2)                             # [B, 1, S, S]
             Pr = self._to_dev(torch.tensor(P + [0] * (B - b)))
             root = Pr[:, None] > torch.arange(L, device=self.dev)[None]                     # [B, L]
             pre = torch.where(root, 0.0, torch.finfo(m2.dtype).min).to(m2.dtype)[:, None, None].expand(B, 1, S, L)
-            if graph is None and self.gemma is not None:  # uncompiled, at the readout positions only
-                ro2, slot = self._readout_slots(sel, B)
-                h2 = self._forward_suffix(self._to_dev(ids2), torch.cat([pre, m2], -1), self._to_dev(pos2), kv,
-                                          self._to_dev(ro2))
-                sel = [(x[0], x[1], slot[n]) if x[0] == 2 else x for n, x in enumerate(sel)]
+            if graph is None and self.gemma is not None:
+                h2, sel = self._gemma_suffix(ids2, torch.cat([pre, m2], -1), pos2, kv, sel, B)
             elif graph is None:
                 fwd = self._forward_suffix if self.flex else self.fwd_sfx
                 h2 = fwd(self._to_dev(ids2), torch.cat([pre, m2], -1), self._to_dev(pos2), kv)
@@ -1208,6 +1236,13 @@ class GraphBackend(EagerBackend):
                 cols = self._to_dev(torch.tensor([sel[n][2] for n in j]))
                 out[self._to_dev(torch.tensor(j))] = h[rows, cols]
         return out
+
+    def _gemma_suffix(self, ids2, mask, pos2, kv, sel, B):
+        """Gemma 4, pass 2 without a graph: uncompiled, the layers from the last own-key one on at the readout rows
+        only. -> (hidden states [B, R, D], sel with each pass-2 readout's slot in its row)."""
+        ro2, slot = self._readout_slots(sel, B)
+        h2 = self._forward_suffix(self._to_dev(ids2), mask, self._to_dev(pos2), kv, self._to_dev(ro2))
+        return h2, [(x[0], x[1], slot[n]) if x[0] == 2 else x for n, x in enumerate(sel)]
 
     @staticmethod
     def _readout_slots(sel, B):

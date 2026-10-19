@@ -112,3 +112,26 @@ def test_readout_slots():
     sel = [(2, 0, 5), (1, 1, 0), (2, 1, 3), (2, 0, 9), (2, 0, 5), (2, 1, 7)]
     ro, slot = GraphBackend._readout_slots(sel, 3)
     assert ro.tolist() == [[5, 9], [3, 7], [0, 0]] and slot == [0, None, 0, 1, 0, 1]
+
+
+@pytest.mark.parametrize("L", [1, 129, 300, 1000])
+@pytest.mark.parametrize("W", [None, 5, 128, 200, 512])
+def test_plain_block_mask_is_the_causal_window(L, W):
+    """The block mask of plain rows (built from block arithmetic): full blocks + the mask inside partial blocks give
+    exactly the causal (sliding-window) mask."""
+    g = Gemma4Graph(tiny("e4b"))
+    g.window = W or 1
+    bm = g._plain_block(L, "sliding_attention" if W else "full_attention", "cpu")
+    q, k = torch.arange(L)[:, None], torch.arange(L)[None]
+    true = (k <= q) & ((q - k < W) if W else True)
+    got = torch.zeros(L, L, dtype=torch.bool)
+    B = g.BLOCK
+    for i in range(-(-L // B)):
+        rows = slice(i * B, (i + 1) * B)
+        for c in range(int(bm.full_kv_num_blocks[0, 0, i])):
+            j = int(bm.full_kv_indices[0, 0, i, c])
+            got[rows, j * B: (j + 1) * B] = True
+        for c in range(int(bm.kv_num_blocks[0, 0, i])):
+            j = int(bm.kv_indices[0, 0, i, c])
+            got[rows, j * B: (j + 1) * B] = true[rows, j * B: (j + 1) * B]
+    assert torch.equal(got, true)

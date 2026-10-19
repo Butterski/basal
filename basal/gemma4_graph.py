@@ -55,6 +55,19 @@ def supports(model):
 
 
 KERNELS = ("math", "flex", "fa3")
+_FLEX = []
+
+
+def _flex_attention():
+    """flex_attention as it is inside the compiled forward (Inductor generates its kernel there); from uncompiled code
+    (fast-nocompile, shapes without a graph, the long lane) one compiled instance with dynamic shapes, since
+    uncompiled flex_attention is a slow reference implementation."""
+    from torch.nn.attention.flex_attention import flex_attention
+    if torch.compiler.is_compiling():
+        return flex_attention
+    if not _FLEX:
+        _FLEX.append(torch.compile(flex_attention, dynamic=True))
+    return _FLEX[0]
 
 
 class Gemma4Graph:
@@ -96,9 +109,8 @@ class Gemma4Graph:
         if kernels.get("full_attention") == "fa3":
             raise ValueError("fa3 runs the sliding-window layers only (FlashAttention 3 takes heads up to 256 wide)")
         self.flex = any(k != "math" for k in kernels.values())  # fa3 is flex where a mask is needed
-        if self.flex and not compile:
-            raise ValueError("the flex and fa3 kernels need the compiled engine (--mode fast)")
-        self._bm = {}  # block masks of the plain rows per (length, layer type)
+        self._bm = {}  # block masks of the plain rows per (length, layer type), for graph_lens
+        self.graph_lens = set()  # the lengths of the plain graphs (GraphBackend sets them)
         self.qkv, self.gu = {}, {}  # merged projections per layer: (linear, output sizes)
         self.merged = self._merge() if merge else 0
         if compile:
@@ -214,11 +226,10 @@ class Gemma4Graph:
     def _flex(q, k, v, bm):
         """FlexAttention with a block mask. The 512-wide global heads take 32 x 32 tiles: Inductor's default tiles
         need more shared memory than an H100 has (Triton "out of resource", 2026-10-20)."""
-        from torch.nn.attention.flex_attention import flex_attention
         opts = {"FORCE_USE_FLEX_ATTENTION": True}
         if q.shape[-1] > 256:
             opts.update(BLOCK_M=32, BLOCK_N=32)
-        o = flex_attention(q, k, v, block_mask=bm, scale=1.0, enable_gqa=True, kernel_options=opts)
+        o = _flex_attention()(q, k, v, block_mask=bm, scale=1.0, enable_gqa=True, kernel_options=opts)
         return o.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
 
     @staticmethod
@@ -267,19 +278,33 @@ class Gemma4Graph:
 
     def _plain_block(self, L, t, dev):
         """FlexAttention block mask of a plain causal row of length L for layer type t (no batch dimension: the same
-        for every row; cached, built outside any graph)."""
+        for every row), built from block arithmetic (create_block_mask evaluates all L x L pairs: 2.5 GB at 50k
+        tokens): key block j is visible from query block i when 0 <= i - j <= dmax (the window), and full (no mask
+        evaluated) when 1 <= i - j <= fmax. Cached for the graph lengths."""
         key = (L, t)
-        if key not in self._bm:
-            from torch.nn.attention.flex_attention import create_block_mask
-            W = self._window(t)
-            if W:
-                def mod(b, h, q, kv):
-                    return (q >= kv) & (q - kv < W)
-            else:
-                def mod(b, h, q, kv):
-                    return q >= kv
-            self._bm[key] = create_block_mask(mod, None, None, L, L, device=dev, BLOCK_SIZE=self.BLOCK)
-        return self._bm[key]
+        if key in self._bm:
+            return self._bm[key]
+        from torch.nn.attention.flex_attention import BlockMask
+        W, Bk = self._window(t), self.BLOCK
+        n = -(-L // Bk)
+        dmax, fmax = ((W + Bk - 2) // Bk, (W - Bk) // Bk) if W else (n, n)
+        width = min(dmax, n - 1) + 1
+        d = torch.arange(width, device=dev)[None]
+        j = torch.arange(n, device=dev)[:, None] - d                  # [n, width]: key blocks i, i - 1, ...
+        full = (j >= 0) & (d >= 1) & (d <= fmax)
+        part = (j >= 0) & ~full
+
+        def pack(sel):  # selected key blocks first, ascending; one column per key block (BlockMask's layout)
+            idx = torch.where(sel, j, n).sort(1).values.clamp(max=n - 1)
+            idx = torch.cat([idx, idx[:, -1:].expand(n, n - width)], 1)
+            return sel.sum(1).to(torch.int32)[None, None], idx.to(torch.int32)[None, None].contiguous()
+
+        def mod(b, h, q, kv):
+            return (q >= kv) & (q - kv < W) if W else q >= kv
+        bm = BlockMask.from_kv_blocks(*pack(part), *pack(full), BLOCK_SIZE=Bk, mask_mod=mod, seq_lengths=(L, L))
+        if L in self.graph_lens:
+            self._bm[key] = bm
+        return bm
 
     def _dense_block(self, B, Lq, Lk, mod, dev):
         """A block mask that visits every (query block, key block) pair, each evaluated with mod: its block lists do
@@ -396,10 +421,10 @@ class Gemma4Graph:
             h = self._rest(i, layer, h, o, pli[:, :, i] if pli is not None else None)
         return self.lm.norm(h)
 
-    def _kernels(self, compiled, dense=False):
-        """The kernels of a call: compiled forwards (the graphs) use the configured ones; uncompiled ones (shapes
-        without a graph, the long lane) the math kernel, as does pass 2 with a dense mask (flex takes a TreeMask)."""
-        if compiled and not (dense and self.flex):
+    def _kernels(self, dense=False):
+        """The kernels of a call: the configured ones, or the math kernel for pass 2 with a dense mask (flex takes the
+        trie as a TreeMask)."""
+        if not (dense and self.flex):
             return self.kernels
         return {t: "math" for t in self.kernels}
 
@@ -408,11 +433,11 @@ class Gemma4Graph:
         """Plain causal rows [b, L] from position 0 (right padding cannot reach a real token); kv: per own layer
         (K, V) buffers [b, kv heads, L, d] that receive the keys and values (pass 1); ro [b, R]: readout positions ->
         [b, R, D] (None: [b, L, D]); between(i) before layer i (the long lane: uncompiled, one layer at a time).
-        compiled: through the compiled forward (when the engine compiles) with the configured kernels."""
+        compiled: through the compiled forward (when the engine compiles; shapes without a graph run uncompiled)."""
         L = ids.shape[1]
         pos = torch.arange(L, device=ids.device)[None].expand(ids.shape[0], L)
         compiled = compiled and between is None
-        m_all, m_ro = self._masks(self._kernels(compiled), L, pos, None, None, ro)
+        m_all, m_ro = self._masks(self.kernels, L, pos, None, None, ro)
         return (self.run if compiled else self._run)(ids, pos, m_all, m_ro, kv=kv, ro=ro, between=between)
 
     @torch.no_grad()
@@ -420,6 +445,6 @@ class Gemma4Graph:
         """Pass 2: rows [b, S] at positions pos over per own layer prefix (K, V) [b, kv heads, P, d], with the trie
         mask (additive [b, 1, S, P + S], 0 = visible; a TreeMask for flex) -> [b, R, D] at ro [b, R] (None: all)."""
         from .lean import TreeMask
-        kernels = self._kernels(compiled, dense=not isinstance(mask, TreeMask))
+        kernels = self._kernels(dense=not isinstance(mask, TreeMask))
         m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro)
         return (self.run if compiled else self._run)(ids, pos, m_all, m_ro, prefix=prefix, ro=ro)
