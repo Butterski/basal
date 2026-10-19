@@ -7,7 +7,8 @@
 A prompt is a string or a list of token ids (the server tokenizes once and passes ids).
 
 Backends:
-  EagerBackend      plain PyTorch forward (reference, any GPU, Apple MPS or CPU)
+  EagerBackend      plain PyTorch forward (reference, any GPU, Apple MPS or CPU); Gemma 4 (basal-omni) through
+                    basal/gemma4.py: the shared prefix of a group once
   GraphBackend      static shapes + CUDA graphs, optional torch.compile, shared prefix for the two option orders,
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
@@ -83,8 +84,9 @@ class EagerBackend:
     # processor's media memo); class defaults, so a backend built without __init__ (tests) has them too
     lock = threading.Lock()
     media_lock = threading.Lock()
+    g4 = None  # basal/gemma4.py: the own Gemma 4 forward (shared prefixes, answer rows), None = the transformers forward
 
-    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False):
+    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False, forward=None):
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.padding_side = "left"
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
@@ -112,6 +114,15 @@ class EagerBackend:
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
             torch.backends.cuda.enable_cudnn_sdp(False)
+            # basal 2.2.1: the engine's own Gemma 4 forward (basal/gemma4.py) unless --eager-forward hf (or
+            # BASAL_EAGER_FORWARD=hf), the transformers forward of 2.2.0
+            import os
+            forward = forward or os.environ.get("BASAL_EAGER_FORWARD") or "basal"
+            if forward not in EAGER_FORWARDS:
+                raise ValueError(f"eager forward {forward!r} (one of {', '.join(EAGER_FORWARDS)})")
+            if forward == "basal":
+                from .gemma4 import Gemma4Forward
+                self.g4 = Gemma4Forward(self.model)
         self.dev = dev
         self.prefill = PREFILL
         # option-code logits in fp32, as in GraphBackend._rows: the output head's input (the normalised last hidden
@@ -143,6 +154,8 @@ class EagerBackend:
     MAX_BATCH_TOKENS = 16384
 
     def run(self, prompts, ids_list):
+        if self.g4 is not None:
+            return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
         with self.lock:
             return self._run(prompts, ids_list)
 
@@ -169,6 +182,12 @@ class EagerBackend:
                     raise ValueError(f"the prompt with its media is {ids.shape[0]} tokens, more than the {max_tokens} "
                                      "tokens of the context; send fewer or shorter media, or detail \"default\"")
                 encs.append((enc, int(ids.shape[0]), n_media))
+            if self.g4 is not None:  # the towers once, the prompts' shared prefix (template, media, state) once
+                with self.lock:
+                    feats = self.g4.media_features(encs[0][0])
+                    hid = self.g4.hidden([[e["input_ids"][0].tolist() for e, _, _ in encs]], media=feats)[0]
+                    ps = self._codes(torch.stack(hid).float(), ids_list)
+                return [(p, n, n_media) for p, (_, n, n_media) in zip(ps, encs)]
             out = []
             for (enc, n, n_media), lid in zip(encs, ids_list):
                 x = {k: (v.to(self.dev, self.model.dtype) if v.is_floating_point() else v.to(self.dev))
@@ -238,13 +257,19 @@ class EagerBackend:
         return out
 
     def run_shared(self, groups, policy=None):
-        flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])
+        if self.g4 is not None:  # Gemma 4: the shared prefix of each group once (SOAM)
+            with self.lock:
+                hid = self.g4.hidden([self.encode(g[0]) for g in groups])
+                flat = self._codes(torch.stack([h for g in hid for h in g]).float(), [x for g in groups for x in g[1]])
+        else:
+            flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])
         out, j = [], 0
         for g in groups:
             out.append(flat[j: j + len(g[0])]); j += len(g[0])
         return out
 
 
+EAGER_FORWARDS = ("basal", "hf")
 ATTN = ("auto", "fa2", "fa3", "fa4", "cudnn")
 _ATTN = {"impl": "fa2", "direct": None}  # the attention of causal forwards without a mask (process-wide)
 
