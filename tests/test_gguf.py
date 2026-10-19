@@ -124,6 +124,22 @@ def test_soam_nested_prefixes_equal_separate(backend):
     assert np.allclose(packed, separate, atol=5e-3)
 
 
+def test_context_takes_pytorchs_thread_count(model, monkeypatch):
+    """Not llama.cpp's default of 4: the count PyTorch runs with (physical cores, CPU affinity, OMP_NUM_THREADS)."""
+    import llama_cpp as C
+    import torch
+
+    gguf_path, model_dir = model
+    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda _: Tok())
+    n = torch.get_num_threads()
+    torch.set_num_threads(3)
+    try:
+        be = GGUFBackend(model_dir, gguf_path, n_gpu_layers=0)
+    finally:
+        torch.set_num_threads(n)
+    assert (C.llama_n_threads(be.ctx), C.llama_n_threads_batch(be.ctx)) == (3, 3)
+
+
 def test_thread_count_does_not_change_probabilities(backend):
     """The context uses PyTorch's thread count; any count must give the same probabilities bit for bit (ggml computes
     each output element as one dot product in one thread)."""
