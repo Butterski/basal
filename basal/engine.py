@@ -12,7 +12,8 @@ Backends:
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
   MPSBackend        GraphBackend's shared prefix + token-budget batching on Apple MPS (PyTorch, no graphs)
-  VLLMBackend       vLLM, for ModelOpt FP8 / NVFP4 checkpoints (native low-precision kernels)
+  VLLMBackend       vLLM: bf16 checkpoints, ModelOpt FP8 / NVFP4 ports, presets (FP8 weights, FP8 KV cache,
+                    batch-invariant kernels)
   SGLangBackend     SGLang offline engine (1.5): the same letter readout from the log-probabilities of the option tokens
   MLXBackend        Apple Silicon, MLX / mlx-lm (1.5): MLX fp8 / fp4 exports or bf16 weights (optional 8-bit at load
                     time); shared-prefix KV cache
@@ -1529,8 +1530,43 @@ class MPSBackend(GraphBackend):
         return self._assemble(groups, units, probs)
 
 
+VLLM_PRESETS = {
+    # --vllm-preset: (FP8 weights quantised at load time for a bf16 checkpoint, KV cache dtype, batch-invariant kernels)
+    "default": (False, "auto", False),       # the checkpoint's own weights (bf16, or a ModelOpt FP8 / NVFP4 port)
+    "fp8": (True, "auto", False),            # FP8 weights: a -FP8 checkpoint as it is, a bf16 one quantised at load
+    "fp8-kv": (True, "fp8", False),          # "fp8" + the keys and values cached in FP8 (about twice the states)
+    "deterministic": (False, "auto", True),  # VLLM_BATCH_INVARIANT: answers independent of the other requests
+}
+
+
+def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
+    """vLLM engine arguments and environment of a --vllm-preset for a model's config.json -> (kwargs, env).
+    A checkpoint quantised already (ModelOpt FP8 / NVFP4: quantization_config) keeps its own weights. fast_prefill:
+    models whose last layers reuse earlier layers' keys and values (Gemma 4 E2B / E4B: num_kv_shared_layers) run those
+    layers at the answer position only during prefill (vLLM's kv_sharing_fast_prefill, YOCO); the generated token, the
+    only one basal reads, is the same, prompt log-probabilities would not be. Without media, a model with image / audio
+    encoders is loaded without them (more memory for the KV cache)."""
+    if preset not in VLLM_PRESETS:
+        raise ValueError(f"unknown --vllm-preset {preset!r} (one of: {', '.join(VLLM_PRESETS)})")
+    fp8, kv, invariant = VLLM_PRESETS[preset]
+    text = cfg.get("text_config") or cfg
+    kw, env = {}, {}
+    if fp8 and "quantization_config" not in cfg and "quantization_config" not in text:
+        kw["quantization"] = "fp8"
+    if kv != "auto":
+        kw["kv_cache_dtype"] = kv
+    if invariant:
+        env["VLLM_BATCH_INVARIANT"] = "1"
+    if fast_prefill and text.get("num_kv_shared_layers"):
+        kw["kv_sharing_fast_prefill"] = True
+    if not media and (cfg.get("vision_config") or cfg.get("audio_config")):
+        kw["language_model_only"] = True
+    return kw, env
+
+
 class VLLMBackend:
-    """vLLM backend for ModelOpt FP8 / NVFP4 checkpoints. One generated token restricted to the option letters; with
+    """vLLM backend: bf16 checkpoints and the ModelOpt FP8 / NVFP4 ports, with the engine settings of a --vllm-preset
+    (VLLM_PRESETS, vllm_args). One generated token restricted to the option letters; with
     logprobs_mode="processed_logprobs" the log-probabilities are computed after that restriction, so the softmax over
     the letters equals the readout of the other backends. Where vLLM supports it, logprob_token_ids asks for exactly
     the letter ids: vllm-metal ignores the logprobs mode and returns the top-k of the unrestricted vocabulary, which
@@ -1542,13 +1578,20 @@ class VLLMBackend:
 
     LOGPROB_TOKEN_IDS = 128  # longest logprob_token_ids list vLLM accepts
 
-    def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10):
+    def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
+                 fast_prefill=True):
+        import os
+        cfg_file = Path(model_dir) / "config.json"
+        kw, env = vllm_args(json.loads(cfg_file.read_text()) if cfg_file.exists() else {}, preset,
+                            fast_prefill=fast_prefill)
+        os.environ.update(env)  # before vLLM starts its engine process, which reads it
         from vllm import LLM
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.prefill = PREFILL
+        self.preset, self.engine_args = preset, kw
         self.llm = LLM(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
                        enable_prefix_caching=True, logprobs_mode="processed_logprobs",
-                       max_logprobs=max(16, max_options))
+                       max_logprobs=max(16, max_options), **kw)
         self.context = max_len - 1  # longest prompt: max_model_len holds the one generated token too
         self.context_reason = f"vLLM's --max-len {max_len}"
 

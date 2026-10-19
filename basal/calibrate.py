@@ -845,16 +845,16 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
     return dict(temperature_per_prim=temps, temperature_source=source, thresholds=thresholds, **extra), report
 
 
-def compared(md, kind, path, quant, orders, off):
+def compared(md, kind, path, quant, orders, off, preset=None):
     """The calibration to compare with and keep, as basal-serve would apply it with these option orders
     (server.load_calibration: the model's file for those orders when it ships one; a file fitted on other orders
     without its thresholds) -> (calibration, its file or None)."""
     if off or (md is None and not path):
         return {}, None
     if orders is None:  # a server that does not report its orders: the file as it is
-        f = calibration_file(md, kind, path, quant)
+        f = calibration_file(md, kind, path, quant, preset)
         return (json.loads(f.read_text()) if f.exists() else {}), f
-    data, f, why = load_calibration(md, kind, path, quant, orders)
+    data, f, why = load_calibration(md, kind, path, quant, orders, preset=preset)
     if why:
         print(f"warning: {why}: its thresholds are not compared or kept (as in basal-serve)", file=sys.stderr)
     return data, f if f.exists() else None
@@ -1090,10 +1090,10 @@ def regressions(report):
     return [t for t, g in ((report.get("gates") or {}).get("ece_lofo") or {}).items() if g.get("regression")]
 
 
-def engine_name(kind, quant):
+def engine_name(kind, quant, preset=None):
     """The engine a calibration file is for (its "engine" field): the name of its CALIBRATION.<engine>.json, else
     fast for the basal CUDA engine and the backend's own name (eager, mps, gguf)."""
-    return calibration_name(kind, quant) or {"graph": "fast", "exit": "fast"}.get(kind, kind or "unknown")
+    return calibration_name(kind, quant, preset) or {"graph": "fast", "exit": "fast"}.get(kind, kind or "unknown")
 
 
 def refit(a, targets, reference, reference_name):
@@ -1114,7 +1114,7 @@ def refit(a, targets, reference, reference_name):
     cal, report = fit(rows, baseline, targets, a.min_per_type, head["fmt"], a.min_family, reference, a.min_per_set,
                       a.min_blend)
     cal["gates"]["ece_reference"] = reference_name
-    cal["engine"] = engine_name(head["kind"], head["quant"])
+    cal["engine"] = engine_name(head["kind"], head["quant"], head.get("vllm_preset"))
     cal["fitted_on"] = dict(data=head["data"], decisions=sum(r["prim"] != "multi" for r in rows),
                             requests=head["requests"], fit=report["n_fit"], cert=report["n_cert"],
                             per_type={t: r["n"] for t, r in report["types"].items()},
@@ -1239,10 +1239,11 @@ def main(argv=None):
         model, engine = a.model or entry.get("name"), f"{mode} at {base}"
         orders = entry.get("orders")  # the server's option orders (servers before this field: unknown)
         kind, quant = MODES.get(mode, ("", None, False))[:2]
+        preset = entry.get("vllm_preset")  # --mode vllm: the server's preset (servers before 2.2.1: none)
         md = resolve(a.model, a.revision, metadata_only=True) if a.model else None
         revision = model_identity(a.model, md)[1] if md is not None else None
         fmt = entry.get("prompt_format") or (model_format(md) if md is not None else 1)
-        baseline, base_file = compared(md, kind, a.calibration, quant, orders, a.no_calibration)
+        baseline, base_file = compared(md, kind, a.calibration, quant, orders, a.no_calibration, preset)
         settle(asyncio.run(over_http(base + "/v1/systemone", bodies, a.concurrency)) if bodies else [])
         task_responses = []
     else:
@@ -1251,9 +1252,11 @@ def main(argv=None):
         srv = Server(argparse.Namespace(**{**vars(a), "mode": mode, "name": None, "calibration": None,
                                            "no_calibration": True, "log_decisions": None}))
         kind, quant, fmt, orders = srv.kind, a.quant or MODES[mode][1], srv.fmt, srv.orders
-        baseline, base_file = compared(srv.md, srv.kind, a.calibration, quant, orders, a.no_calibration)
+        preset = getattr(srv.backend, "preset", None)
+        baseline, base_file = compared(srv.md, srv.kind, a.calibration, quant, orders, a.no_calibration, preset)
         model, revision = a.model, model_identity(a.model, srv.md)[1]
-        engine = mode + (f" --quant {a.quant}" if a.quant else "") + (f" --gguf {Path(a.gguf).name}" if a.gguf else "")
+        engine = mode + (f" --quant {a.quant}" if a.quant else "") + (f" --gguf {Path(a.gguf).name}" if a.gguf else "") \
+            + (f" --vllm-preset {preset}" if preset not in (None, "default") else "")
         _, task_responses = asyncio.run(two_passes(srv, bodies, task_bodies, a.concurrency, settle))
     rows, failed, cal, report = fitted["rows"], fitted["failed"], fitted["cal"], fitted["report"]
     trows, tfailed = task_rows(units, task_responses) if units else ([], [])
@@ -1273,13 +1276,13 @@ def main(argv=None):
     if task_report:
         cal["task_gates"] = task_report
     if a.save_rows and rows:
-        head = dict(basal_calibrate_rows=1, fmt=fmt, kind=kind, quant=quant, model=str(model), engine=engine,
-                    data=Path(a.input).name, requests=len(bodies) - len(failed),
+        head = dict(basal_calibrate_rows=1, fmt=fmt, kind=kind, quant=quant, vllm_preset=preset, model=str(model),
+                    engine=engine, data=Path(a.input).name, requests=len(bodies) - len(failed),
                     baseline=str(base_file) if baseline else None, orders=orders)
         with open(a.save_rows, "w") as f:
             for x in [head] + rows:
                 f.write(json.dumps(x, ensure_ascii=False) + "\n")
-    cal["engine"] = engine_name(kind, quant)
+    cal["engine"] = engine_name(kind, quant, preset)
     cal["fitted_on"] = dict(data=Path(a.input).name, decisions=sum(r["prim"] != "multi" for r in rows),
                             requests=len(bodies) - len(failed),
                             fit=report["n_fit"] if report else 0, cert=report["n_cert"] if report else 0,
