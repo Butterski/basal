@@ -279,6 +279,50 @@ HTTP: `basal-loadtest` against `basal-serve --mode mlx` (default prompts of the 
   was measured back to back, the comparison below after a cool-down before every engine.
 - **Early exit** (`fast-exit`) and the `fp8` / `nvfp4` modes are CUDA-only.
 
+### Apple M5 Max (basal-1.0 and basal-2.0)
+
+Measured by Greg Brzezinka with `basal-bench` on the **44 bundled examples**, like the M4 Max table above and the
+Apple M5 Pro numbers in [#7](https://github.com/rkinas/basal/issues/7). Apple M5 Max (Mac17,6, 40-core GPU, 128 GB),
+macOS 27.0.1, Python 3.12.2, torch 2.14.1 (MPS), MLX 0.32.4, mlx-lm 0.32.2; on mains power, automatic power mode,
+modes measured back to back. Agreement with `eager-fp32` (PyTorch MPS, fp32) on the same machine; GB: peak memory
+(MLX: allocator peak, MPS: memory held by the Metal driver).
+
+**basal-1.0**, at commit `3fa2eea` (the commit of the M5 Pro measurement in #7, so the two chips compare one to one):
+
+| model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy | GB |
+|---|---|---|---|---|---|---|---|
+| basal-1.0-4.5B | `eager-fp32` | 312.8 | 185.9 | 2.8 | reference | 0.795 | 23.0 |
+| | `mps` (bf16) | 81.1 | 68.1 | 13.8 | 1.000 | 0.795 | 10.1 |
+| | `mlx` (bf16) | **65.7** | **62.3** | **15.6** | 1.000 | 0.795 | 10.1 |
+| | `mlx-q8` | 85.4 | 77.9 | 13.5 | 0.977 | 0.773 | 6.0 |
+| basal-1.0-1.5B | `eager-fp32` | 119.8 | 72.2 | 7.5 | reference | 0.727 | 10.2 |
+| | `mps` (bf16) | 34.8 | 31.5 | 37.3 | 0.977 | 0.750 | 4.1 |
+| | `mlx` (bf16) | **26.0** | **25.7** | **43.2** | 0.977 | 0.750 | 4.0 |
+| | `mlx-q8` | 32.7 | 30.6 | 38.2 | 1.000 | 0.727 | 2.6 |
+
+Two more runs of `--modes mps mlx` for the 4.5B: `mlx` 71.6 / 73.3 ms, `mps` 86.7 / 88.3 ms (2 orders).
+
+**basal-2.0**, at v2.2.0 (`e49665c`); `mps` in bf16, `mlx` with the `-MLX-8bit` ports (`basal-bench` takes one
+`--model`, so the `mlx` mode was run from the `-MLX-8bit` folder with the bf16 `eager-fp32` run as reference):
+
+| model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy | GB |
+|---|---|---|---|---|---|---|---|
+| basal-2.0-mini | `eager-fp32` | 104.3 | 66.4 | 9.1 | reference | 0.750 | 9.1 |
+| | `mps` (bf16) | **30.0** | **28.4** | **45.9** | 1.000 | 0.750 | 4.1 |
+| | `mlx` (`-MLX-8bit`) | 49.0 | 30.9 | 21.0 | 0.977 | 0.727 | 2.1 |
+| basal-2.0 (4.5B) | `eager-fp32` | 304.9 | 182.0 | 3.0 | reference | 0.795 | 21.1 |
+| | `mps` (bf16) | **72.5** | **68.0** | **15.4** | 1.000 | 0.795 | 10.1 |
+| | `mlx` (`-MLX-8bit`) | 130.0 | 74.6 | 7.6 | 0.955 | 0.795 | 5.2 |
+
+Two more runs for basal-2.0 (4.5B): `mlx` 133.8 / 134.6 ms, `mps` 72.6 / 72.5 ms (2 orders). With two option orders,
+`mlx` at v2.2.0 is slower than at `3fa2eea` on this machine (basal-1.0-4.5B: 115.6 vs 65.7 ms; one order: 68.0 vs
+62.3 ms), so on v2.2.0 `mps` is the faster route for two orders on the M5 Max.
+
+- **Same generation, twice the GPU cores** (M5 Max 40 vs M5 Pro 20, basal-1.0 at `3fa2eea`, 2 orders): bf16 and 8-bit
+  modes are 1.35–1.63× faster, `eager-fp32` 1.71–1.88×; the 1.5B gains less than the 4.5B.
+- **Same core count, newer generation** (M5 Max vs M4 Max, both 40 cores): bf16 modes are 2.8–4.1× faster,
+  `eager-fp32` 1.5–1.7×. On the M5 Max bf16 is 3.4–4.8× faster than fp32.
+
 #### Inference engines on Apple Silicon
 
 basal needs the next-token probabilities of the option letters after a prompt that ends in `{"answer": "`, not generated
