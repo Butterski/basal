@@ -174,7 +174,8 @@ def main(argv=None):
     ap.add_argument("--tree", choices=["dense", "flex"], default="dense", help="pass-2 mask with --lean on")
     ap.add_argument("--reference-lean", dest="reference_lean", choices=["on", "pass2", "off"], default=None,
                     help="the reference engine with or without the lean layer (built and freed first)")
-    ap.add_argument("--gemma-attn", dest="gemma_attn", choices=["auto", "math", "flex", "fa3"], default="auto",
+    ap.add_argument("--gemma-attn", dest="gemma_attn", choices=["auto", "math", "flex", "fa3", "fa3+math"],
+                    default="auto",
                     help="Gemma 4 models: the attention kernel of the engine under test (basal-serve --gemma-attn)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)

@@ -1,10 +1,16 @@
 # What is new in basal 2.3 (not released yet)
 
-- **basal-omni in the CUDA graph engine** (`--mode fast`, `fast-nocompile`). Gemma 4 runs through the engine's own
-  layer code: SOAM's packed row and two passes over its sliding-window and global layers (the window is a condition on
-  positions inside the trie mask), key / value buffers per layer type, E4B's KV-shared layers and the last own-key
-  layer at the answer rows only, the fp32 readout with the softcap; `--gemma-attn math | flex | fa3` picks the
-  attention kernel. Text only. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+- **basal-omni in the CUDA graph engine, 3.4-6x eager** (`--mode fast`, the default on CUDA; text). Gemma 4 runs
+  through the engine's own layer code: SOAM's packed row and two passes over its sliding-window and global layers (the
+  window is a condition on positions inside the trie mask), key / value buffers per layer type, E4B's KV-shared layers
+  and the last own-key layer at the answer rows only, the fp32 readout with the softcap. On Hopper: FlashAttention 3 in
+  the sliding layers, FlexAttention in the 512-wide global ones, merged projections, compact rows, compiled; elsewhere
+  the math kernel of `--mode eager` (`--gemma-attn`). One H100, against `--mode eager`: 1.1-max 16.2 vs 4.8 decisions
+  per second on single questions (vLLM bf16: 16.7) and 10.6 vs 0.7 questions per second with five questions over a long
+  state; mini 61.2 vs 10.0 and 21.4 vs 1.6. Same answers within bf16 rounding (dev v2: 0.999 of the top answers at
+  margin >= 0.2; automated share at 1% within 0.11 points). [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+- **Fewer CUDA-graph bytes for basal-omni:** 8 MB cuBLAS workspaces per captured graph (`CUBLAS_WORKSPACE_CONFIG`
+  unless set; 32 MB each by default) and no image / audio towers in the text-only graph engine.
 
 - **Faster preparation of large requests.** The prompt language is detected from the state once per request in task
   expansion and once in question preparation, not once per question: an English state was re-scanned for Polish

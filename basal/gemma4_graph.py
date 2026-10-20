@@ -31,6 +31,8 @@ What differs from Llama, layer by layer as transformers' Gemma4TextDecoderLayer 
 Attention is causal for text; the bidirectional attention of image tokens (use_bidirectional_attention "vision") is
 not used here, since this path takes text only (media run in the eager backend).
 """
+from collections import namedtuple
+
 import torch
 import torch.nn.functional as F
 
@@ -81,6 +83,70 @@ def _flex_attention():
     return _FLEX[0]
 
 
+LayerC = namedtuple("LayerC", "heads kv_heads d eps sizes")  # constants of a layer (sizes: of a merged q / k / v)
+
+
+def _rms(x, w, eps):
+    """Gemma4RMSNorm: in fp32, x * (mean(x^2) + eps)^-0.5, times the weight (None: the values' norm), back to x's
+    dtype."""
+    xf = x.float()
+    y = xf * torch.pow(xf.pow(2).mean(-1, keepdim=True) + eps, -0.5)
+    return (y * w.float() if w is not None else y).type_as(x)
+
+
+def _rot(x, cos, sin):
+    """apply_rotary_pos_emb of Gemma 4 on [b, L, heads, d] with cos / sin [b, L, d]."""
+    cos, sin = cos[:, :, None], sin[:, :, None]
+    h = x.shape[-1] // 2
+    return x * cos + torch.cat((-x[..., h:], x[..., :h]), -1) * sin
+
+
+def _pre(h, P, C, cos, sin, kb=None, vb=None, pk=None, pv=None):
+    """A decoder layer up to attention: the input norm and the projections -> (q [b, L, heads x d] as projected,
+    k, v [b, kv heads, P + L, d]: normed, keys rotated, written to kb / vb and after the prefix pk / pv; None for a
+    KV-shared layer). transformers' Gemma4TextAttention, with attention_k_eq_v (values = the key projection)."""
+    from .lean import linear
+    x = _rms(h, P["ln_in"], C.eps)
+    if C.sizes is not None:
+        q, k, *v = linear(x, P["qkv"]).split(C.sizes, -1)
+        v = v[0] if v else k
+    else:
+        q = linear(x, P["q"])
+        if not C.kv_heads:
+            return q, None, None
+        k = linear(x, P["k"])
+        v = linear(x, P["v"]) if "v" in P else k
+    b, L = x.shape[:2]
+    k = _rot(_rms(k.view(b, L, C.kv_heads, C.d), P["k_norm"], C.eps), cos, sin).transpose(1, 2)
+    v = _rms(v.view(b, L, C.kv_heads, C.d), None, C.eps).transpose(1, 2)
+    if kb is not None:
+        kb.copy_(k)
+        vb.copy_(v)
+    if pk is not None:
+        k, v = torch.cat([pk, k], 2), torch.cat([pv, v], 2)
+    return q, k, v
+
+
+def _post(h, q, k, v, P, C, cos, sin, mask, pli):
+    """The rest of a decoder layer (transformers' Gemma4TextDecoderLayer): queries normed and rotated, attention
+    with the kernel of the mask, o_proj, the four norms around attention and MLP, the per-layer input, the layer
+    scalar."""
+    from .lean import linear
+    b, L = h.shape[:2]
+    q = _rot(_rms(q.view(b, L, C.heads, C.d), P["q_norm"], C.eps), cos, sin).transpose(1, 2)
+    h = h + _rms(linear(Gemma4Graph._attend(q, k, v, mask), P["o"]), P["ln_attn"], C.eps)
+    x = _rms(h, P["ln_pre"], C.eps)
+    if "gu" in P:
+        g, u = linear(x, P["gu"]).chunk(2, -1)
+    else:
+        g, u = linear(x, P["gate"]), linear(x, P["up"])
+    h = h + _rms(linear(F.gelu(g, approximate="tanh") * u, P["down"]), P["ln_ff"], C.eps)
+    if pli is not None:
+        g = F.gelu(linear(h, P["ple_gate"]), approximate="tanh") * pli
+        h = h + _rms(linear(g, P["ple_proj"]), P["ln_ple"], C.eps)
+    return (h * P["scalar"]).to(h.dtype)  # in place in transformers (h *= scalar): the same rounding
+
+
 class Gemma4Graph:
     # "math": queries per SDPA call, so that the scores (rows x heads x queries x keys, fp32) stay within SCORES
     # elements: in CUDA graphs every captured shape keeps its own peak in the graph pool (1.1-max with 2,048-query
@@ -109,8 +175,8 @@ class Gemma4Graph:
         self.kv_shapes = [(a.k_proj.out_features // a.head_dim, a.head_dim)
                           for a in (layer.self_attn for layer in self.layers[: self.n_kv])]
         self.ple = bool(getattr(cfg, "hidden_size_per_layer_input", 0))
-        if kernels == "fa3":  # FlashAttention 3 in the sliding-window layers, flex in the 512-wide global ones
-            kernels = {"sliding_attention": "fa3", "full_attention": "flex"}
+        if kernels in ("fa3", "fa3+math"):  # FlashAttention 3 in the sliding-window layers; flex or math in the
+            kernels = {"sliding_attention": "fa3", "full_attention": "flex" if kernels == "fa3" else "math"}  # global
         if isinstance(kernels, str):
             kernels = {t: kernels for t in set(self.types)}
         for k in kernels.values():
@@ -125,10 +191,13 @@ class Gemma4Graph:
         if compile:
             import torch._dynamo as dynamo
             dynamo.config.cache_size_limit = 64
-        # automatic dynamic shapes (a static compile, then the dimensions that change, rows and tokens): with every
-        # dimension symbolic (dynamic=True) the head sizes and buffer shapes went symbolic too and tracing the 42 E4B
-        # layers did not finish in 12 minutes (sympy floor divisions in every view, 2026-10-20)
-        self.run = torch.compile(self._run) if compile else self._run
+        self.args = self._layer_args()
+        # one compiled function per layer part, with automatic dynamic shapes (a static compile, then the dimensions
+        # that change: rows and tokens). The whole forward compiled as one graph took 15+ minutes of start-up on mini
+        # (each recompile of 42 layers; and with dynamic=True every dimension went symbolic and tracing did not end)
+        self.compiled = compile
+        if compile:
+            self.pre, self.post, self.embed = torch.compile(_pre), torch.compile(_post), torch.compile(self._embed)
 
     @staticmethod
     def _fuse(mods):
@@ -177,55 +246,56 @@ class Gemma4Graph:
         s = getattr(r, f"{t}_attention_scaling")
         return (e.cos() * s).to(dtype), (e.sin() * s).to(dtype)
 
-    @staticmethod
-    def _rot(x, cos, sin):
-        """apply_rotary_pos_emb of Gemma 4 on [b, L, heads, d] with cos / sin [b, L, d]."""
-        cos, sin = cos[:, :, None], sin[:, :, None]
-        h = x.shape[-1] // 2
-        return x * cos + torch.cat((-x[..., h:], x[..., :h]), -1) * sin
+    def _layer_args(self):
+        """Per layer: its weights as tensors (lean.py's linear parameters: bf16, torchao or FP8Linear) and its
+        constants. The layer functions take them as arguments, so one compiled function serves every layer of a kind
+        (a module argument would be guarded by identity: a compile per layer)."""
+        from .lean import _params
+        eps = self.cfg.rms_norm_eps
+        out = []
+        for i, layer in enumerate(self.layers):
+            a, m = layer.self_attn, layer.mlp
+            P = dict(ln_in=layer.input_layernorm.weight, q_norm=a.q_norm.weight, o=_params(a.o_proj),
+                     ln_attn=layer.post_attention_layernorm.weight, ln_pre=layer.pre_feedforward_layernorm.weight,
+                     ln_ff=layer.post_feedforward_layernorm.weight, down=_params(m.down_proj),
+                     scalar=layer.layer_scalar)
+            sizes = None
+            if i in self.qkv:
+                P["qkv"], sizes = _params(self.qkv[i][0]), tuple(self.qkv[i][1])
+            else:
+                P["q"] = _params(a.q_proj)
+                if self.own[i]:
+                    P["k"] = _params(a.k_proj)
+                    if a.v_proj is not None:
+                        P["v"] = _params(a.v_proj)
+            if self.own[i]:
+                P["k_norm"] = a.k_norm.weight
+            if i in self.gu:
+                P["gu"] = _params(self.gu[i][0])
+            else:
+                P["gate"], P["up"] = _params(m.gate_proj), _params(m.up_proj)
+            if self.ple:
+                P.update(ple_gate=_params(layer.per_layer_input_gate), ple_proj=_params(layer.per_layer_projection),
+                         ln_ple=layer.post_per_layer_input_norm.weight)
+            heads = a.q_proj.out_features // a.head_dim
+            kv_heads = self.kv_shapes[i][0] if self.own[i] else 0
+            out.append((P, LayerC(heads, kv_heads, a.head_dim, eps, sizes)))
+        return out
 
-    def _qkv(self, i, a, x):
-        """The q, k and v projections of an own-key layer, [b, L, heads x d] (v None with attention_k_eq_v)."""
-        if i in self.qkv:
-            lin, sizes = self.qkv[i]
-            q, k, *v = lin(x).split(sizes, -1)
-            return q, k, v[0] if v else None
-        return a.q_proj(x), a.k_proj(x), a.v_proj(x) if a.v_proj is not None else None
-
-    def _kv(self, a, k, v, cs):
-        """Keys and values of one own-key layer from its projections: [b, kv heads, L, d] each."""
-        shape = (*k.shape[:2], -1, a.head_dim)
-        k = k.view(shape)
-        v = v.view(shape) if v is not None else k
-        return self._rot(a.k_norm(k), *cs).transpose(1, 2), a.v_norm(v).transpose(1, 2)
-
-    def _q(self, a, q, cs):
-        q = a.q_norm(q.view(*q.shape[:2], -1, a.head_dim))
-        return self._rot(q, *cs).transpose(1, 2)
-
-    def _mlp(self, i, m, x):
-        if i in self.gu:
-            g, u = self.gu[i][0](x).chunk(2, -1)
-            return m.down_proj(m.act_fn(g) * u)
-        return m(x)
-
-    def _rest(self, i, layer, h, o, pli):
-        """The decoder layer after attention: o_proj, MLP, per-layer input, layer scalar."""
-        h = h + layer.post_attention_layernorm(layer.self_attn.o_proj(o))
-        h = h + layer.post_feedforward_layernorm(self._mlp(i, layer.mlp, layer.pre_feedforward_layernorm(h)))
-        if pli is not None:
-            g = layer.act_fn(layer.per_layer_input_gate(h)) * pli
-            h = h + layer.post_per_layer_input_norm(layer.per_layer_projection(g))
-        return (h * layer.layer_scalar).to(h.dtype)  # in place in transformers (h *= scalar): the same rounding
+    def _embed(self, ids):
+        """Token embeddings (scaled) and, on E2B / E4B, the per-layer inputs [b, L, layers, 256]."""
+        h = self.lm.embed_tokens(ids)
+        return h, self.lm.project_per_layer_inputs(h, self.lm.get_per_layer_inputs(ids, None)) if self.ple else None
 
     # -- attention ----------------------------------------------------------------------------------------------------
+    @staticmethod
     @torch.compiler.disable
-    def _math(self, q, k, v, m):
+    def _math(q, k, v, m):
         """SDPA's math kernel: q [b, H, Lq, d], k / v [b, Hkv, Lk, d], m bool [b, 1, Lq, Lk] (True = attend) ->
         [b, Lq, H * d]. Long rows in parts of queries (SCORES). Outside the compiled graph (the reference kernel)."""
         from torch.nn.attention import SDPBackend, sdpa_kernel
         b, H, Lq, _ = q.shape
-        n = max(16, self.SCORES // (b * H * k.shape[2]))
+        n = max(16, Gemma4Graph.SCORES // (b * H * k.shape[2]))
         outs = []
         with sdpa_kernel([SDPBackend.MATH]):
             for s in range(0, Lq, n):
@@ -254,13 +324,28 @@ class Gemma4Graph:
         o = o[0] if isinstance(o, (tuple, list)) else o
         return o.reshape(q.shape[0], q.shape[2], -1)
 
-    def _attend(self, q, k, v, m):
-        """Attention with the kernel the mask is for: a boolean mask (math), a block mask (flex) or ("fa3", window)."""
+    @staticmethod
+    def _fa3_varlen(q, k, v, W, cu):
+        """FlashAttention 3's varlen kernel over compact rows (prompts back to back in one row [1, T], cu: cumulative
+        token counts, int32), causal with a window of W tokens within each prompt -> [1, T, H * d]."""
+        import flash_attn_interface as fa3
+        T = q.shape[2]
+        o = fa3.flash_attn_varlen_func(q[0].transpose(0, 1), k[0].transpose(0, 1), v[0].transpose(0, 1), cu, cu, T, T,
+                                       softmax_scale=1.0, causal=True, window_size=(W - 1 if W else -1, 0))
+        o = o[0] if isinstance(o, (tuple, list)) else o
+        return o.reshape(1, T, -1)
+
+    @staticmethod
+    def _attend(q, k, v, m):
+        """Attention with the kernel the mask is for: a boolean mask (math), a block mask (flex), ("fa3", window) or
+        ("fa3v", window, cu) (compact rows)."""
         if isinstance(m, tuple):
-            return self._fa3(q, k, v, m[1])
+            if m[0] == "fa3v":
+                return Gemma4Graph._fa3_varlen(q, k, v, m[1], m[2])
+            return Gemma4Graph._fa3(q, k, v, m[1])
         if isinstance(m, torch.Tensor):
-            return self._math(q, k, v, m)
-        return self._flex(q, k, v, m)
+            return Gemma4Graph._math(q, k, v, m)
+        return Gemma4Graph._flex(q, k, v, m)
 
     # -- masks --------------------------------------------------------------------------------------------------------
     def _window(self, t):
@@ -320,37 +405,92 @@ class Gemma4Graph:
         idx = torch.arange(nk, dtype=torch.int32, device=dev).expand(B, 1, nq, nk).contiguous()
         return BlockMask.from_kv_blocks(num, idx, BLOCK_SIZE=self.BLOCK, mask_mod=mod, seq_lengths=(Lq, Lk))
 
-    def _rows_block(self, ro, L, t):
-        """Block mask of the readout rows ro [b, R] of plain causal rows of length L."""
-        W, R = self._window(t), ro.shape[1]
+    def _pads(self, pos, mask, ro):
+        """The index tensors the flex masks read, each padded by a block: flex evaluates a mask on whole blocks, so
+        query (and branch key) indices run up to a block past the rows; padded copies keep every read in bounds. Made
+        outside the compiled forward and passed in (a clamp of the index in the mask broke Inductor's flex template,
+        "XBLOCK is not defined", and tensors made inside it cannot be read by a mask: "'function' object has no
+        attribute 'graph'", 2026-10-20)."""
+        from .lean import TreeMask
+        if not self.flex:
+            return {}
+        Bk, out = self.BLOCK, {}
+        if ro is not None:
+            out["ro"] = F.pad(ro, (0, Bk))
+        if isinstance(mask, TreeMask):  # padding tokens are block S, which sees nothing but itself
+            out["s"] = F.pad(mask.s, (0, Bk), value=pos.shape[1])
+            out["pos"] = F.pad(pos, (0, Bk))
+        return out
 
-        def mod(b, h, q, kv):  # indices past the end (the last block's padding) are clamped, their result unused
-            p = ro[b, q.clamp(max=R - 1)]
-            return (p >= kv) & (p - kv < W) if W else p >= kv
-        return self._dense_block(ro.shape[0], R, L, mod, ro.device)
-
-    def _tree_block(self, tm, pos, P, t, ro=None):
-        """Block mask of pass 2 (the TreeMask of basal/lean.py: root tokens per row, block of every branch token,
-        ancestors per block) with the window on positions in sliding layers; ro: the readout rows only."""
-        from .lean import tree_mask_mod
+    def _rows_block(self, rop, R, L, t):
+        """Block mask of the readout rows (rop: their positions, padded) of plain causal rows of length L."""
         W = self._window(t)
-        base = tree_mask_mod(tm, P)
-        S = pos.shape[1]
 
         def mod(b, h, q, kv):
-            qq = ro[b, q.clamp(max=ro.shape[1] - 1)] if ro is not None else q.clamp(max=S - 1)
-            ok = base(b, h, qq, kv)
+            p = rop[b, q]
+            return (p >= kv) & (p - kv < W) if W else p >= kv
+        return self._dense_block(rop.shape[0], R, L, mod, rop.device)
+
+    def _tree_block(self, tm, pads, S, P, t, R=None):
+        """Block mask of pass 2 (the TreeMask of basal/lean.py: root tokens per row, block of every branch token,
+        ancestors per block; lean.tree_mask_mod's mask) with the window on positions in sliding layers; R: the
+        readout rows only (pads["ro"])."""
+        W = self._window(t)
+        sp, posp, rop = pads["s"], pads["pos"], pads.get("ro") if R is not None else None
+
+        def mod(b, h, q, kv):
+            qq = rop[b, q] if rop is not None else q
+            j = kv - P                                  # the branch token a key is (negative: a root key)
+            jj = j * (j >= 0)
+            tree = (j >= 0) & ((tm.anc[b, sp[b, qq], sp[b, jj]] & (jj <= qq)) | (jj == qq))
+            ok = (kv < tm.pr[b]) | tree
             if W:
-                kp = torch.where(kv < P, kv, pos[b, (kv - P).clamp(min=0, max=S - 1)])
-                ok = ok & (pos[b, qq] - kp < W)
+                ok = ok & (posp[b, qq] - torch.where(j >= 0, posp[b, jj], kv) < W)
             return ok
-        Lq = S if ro is None else ro.shape[1]
-        return self._dense_block(pos.shape[0], Lq, P + S, mod, pos.device)
+        return self._dense_block(sp.shape[0], S if R is None else R, P + S, mod, sp.device)
 
     # -- the forward --------------------------------------------------------------------------------------------------
-    def _masks(self, kernels, L, pos, prefix, mask, ro):
+    def _compact_masks(self, kernels, T, cu, ro, pads):
+        """Masks of compact rows: each prompt attends to itself only. Sliding layers: FlashAttention 3's varlen kernel
+        with the window; global layers: a flex block mask that visits, for each query block, the key blocks from the
+        start of its first query's prompt on (the prompts are contiguous); the readout rows: a dense block mask over
+        the row (one query per prompt)."""
+        from torch.nn.attention.flex_attention import BlockMask
+        Bk, dev = self.BLOCK, cu.device
+        tok = torch.arange(T, device=dev)
+        doc = torch.bucketize(tok, cu[1:], right=True)                 # the prompt of every token
+        start = cu[doc]                                                  # its prompt's first token
+        n = -(-T // Bk)
+        qb = torch.arange(n, device=dev)
+        lo = start[qb * Bk] // Bk                                        # first key block of each query block
+        idx = torch.minimum(lo[:, None] + qb[None], qb[:, None]).to(torch.int32)
+        num = (qb - lo + 1).to(torch.int32)
+        docp, rop = pads["doc"], pads["ro"]
+
+        m_all, m_ro = {}, {}
+        for t in set(self.types):
+            W = self._window(t)
+
+            def same(b, h, q, kv, W=W):  # the same prompt, causal (and the window: positions advance with indices)
+                ok = (docp[q] == docp[kv]) & (q >= kv)
+                return ok & (q - kv < W) if W else ok
+            if kernels[t] == "fa3":
+                m_all[t] = ("fa3v", W, cu)
+            else:
+                m_all[t] = BlockMask.from_kv_blocks(num[None, None], idx[None, None].contiguous(), BLOCK_SIZE=Bk,
+                                                    mask_mod=same, seq_lengths=(T, T))
+
+            def rows(b, h, q, kv, W=W):
+                p = rop[0, q]
+                ok = (docp[p] == docp[kv]) & (p >= kv)
+                return ok & (p - kv < W) if W else ok
+            m_ro[t] = self._dense_block(1, ro.shape[1], T, rows, dev)
+        return m_all, m_ro
+
+    def _masks(self, kernels, L, pos, prefix, mask, ro, pads):
         """The attention masks of one forward per layer type, for every query and for the readout rows ro: boolean
-        masks for "math", block masks for "flex", ("fa3", window) for FlashAttention 3 over plain rows."""
+        masks for "math", block masks for "flex" (reading pads), ("fa3", window) for FlashAttention 3 over plain
+        rows."""
         from .lean import TreeMask
         dev, types = pos.device, set(self.types)
         math = [t for t in types if kernels[t] == "math"]
@@ -363,7 +503,7 @@ class Gemma4Graph:
             for t in flex:
                 m_all[t] = ("fa3", self._window(t)) if kernels[t] == "fa3" else self._plain_block(L, t, dev)
                 if ro is not None:
-                    m_ro[t] = self._rows_block(ro, L, t)
+                    m_ro[t] = self._rows_block(pads["ro"], ro.shape[1], L, t)
             return m_all, m_ro
         P = prefix[0][0].shape[2]
         if isinstance(mask, TreeMask):
@@ -377,54 +517,51 @@ class Gemma4Graph:
         if flex and not isinstance(mask, TreeMask):
             raise ValueError("the flex kernel takes the trie of pass 2 as a TreeMask")
         for t in flex:
-            m_all[t] = self._tree_block(mask, pos, P, t)
+            m_all[t] = self._tree_block(mask, pads, L, P, t)
             if ro is not None:
-                m_ro[t] = self._tree_block(mask, pos, P, t, ro)
+                m_ro[t] = self._tree_block(mask, pads, L, P, t, ro.shape[1])
         return m_all, m_ro
 
-    def _run(self, kernels, ids, pos, kv=None, prefix=None, mask=None, ro=None, between=None):
+    def _run(self, kernels, ids, pos, kv=None, prefix=None, mask=None, ro=None, between=None, pads=None,
+             compiled=False, cu=None):
         """kernels: per layer type; ids / pos [b, L]; kv: per own layer (K, V) buffers [b, kv heads, L, d] that receive
         this pass's keys and values (pass 1); prefix: per own layer (K, V) [b, kv heads, P, d] the rows continue (pass
         2) with mask (the trie: additive, or a TreeMask for flex); ro [b, R]: readout positions -> final hidden states
-        [b, R, D] (None: every position, [b, L, D]); between(i) is called before layer i (the long lane). The masks
-        of every query and of the readout rows are built here (_masks; the kernel follows the mask)."""
-        m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro)
-        h = self.lm.embed_tokens(ids)
-        pli = self.lm.project_per_layer_inputs(h, self.lm.get_per_layer_inputs(ids, None)) if self.ple else None
+        [b, R, D] (None: every position, [b, L, D]); between(i) is called before layer i (the long lane); pads: the
+        padded index tensors of the flex masks (_pads); compiled: the compiled layer functions. The masks of every
+        query and of the readout rows are built here (_masks; the kernel follows the mask). A layer is two functions
+        (_pre, _post), so the rows-only layers can split after the keys and values; a shared layer's keys and values
+        are those its source layer kept."""
+        if cu is not None:  # compact rows (forward_compact)
+            m_all, m_ro = self._compact_masks(kernels, ids.shape[1], cu, ro, pads)
+        else:
+            m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro, pads or {})
+        pre, post, embed = (self.pre, self.post, self.embed) if compiled else (_pre, _post, self._embed)
+        h, pli = embed(ids)
         types = set(self.types)
         cs = {t: self._rope(pos, t, h.dtype) for t in types}
         masks, kept = m_all, {}
-        for i, layer in enumerate(self.layers):
+        for i, (P, C) in enumerate(self.args):
             if between is not None:
                 between(i)
-            a, t = layer.self_attn, self.types[i]
-            x = layer.input_layernorm(h)
-            q = None
+            t = self.types[i]
+            buf = kv[i] if kv is not None and self.own[i] else (None, None)
+            pre_kv = prefix[i] if prefix is not None and self.own[i] else (None, None)
+            q, k, v = pre(h, P, C, *cs[t], *buf, *pre_kv)
             if self.own[i]:
-                q, k, v = self._qkv(i, a, x)
-                k, v = self._kv(a, k, v, cs[t])
-                if kv is not None:
-                    kv[i][0].copy_(k)
-                    kv[i][1].copy_(v)
-                if prefix is not None:
-                    k, v = torch.cat([prefix[i][0], k], 2), torch.cat([prefix[i][1], v], 2)
                 if i in self.store:
                     kept[t] = (k, v)
             else:
                 k, v = kept[t]
             if ro is not None and i == self.last_kv:  # from here on, the readout rows only
                 g = ro[:, :, None]
-                h, x = h.gather(1, g.expand(-1, -1, h.shape[-1])), x.gather(1, g.expand(-1, -1, x.shape[-1]))
+                h, q = h.gather(1, g.expand(-1, -1, h.shape[-1])), q.gather(1, g.expand(-1, -1, q.shape[-1]))
                 if pli is not None:
                     pli = pli.gather(1, ro[:, :, None, None].expand(-1, -1, *pli.shape[2:]))
                 cs = {u: tuple(c.gather(1, g.expand(-1, -1, c.shape[-1])) for c in cs[u]) for u in types}
-                if q is not None:
-                    q = q.gather(1, g.expand(-1, -1, q.shape[-1]))
                 masks = m_ro
-            q = self._q(a, q if q is not None else a.q_proj(x), cs[t])
-            o = self._attend(q, k, v, masks[t])
-            h = self._rest(i, layer, h, o, pli[:, :, i] if pli is not None else None)
-        return self.lm.norm(h)
+            h = post(h, q, k, v, P, C, *cs[t], masks[t], pli[:, :, i] if pli is not None else None)
+        return _rms(h, self.lm.norm.weight, self.cfg.rms_norm_eps)
 
     def _kernels(self, dense=False):
         """The kernels of a call: the configured ones, or the math kernel for pass 2 with a dense mask (flex takes the
@@ -442,7 +579,20 @@ class Gemma4Graph:
         L = ids.shape[1]
         pos = torch.arange(L, device=ids.device)[None].expand(ids.shape[0], L)
         compiled = compiled and between is None
-        return (self.run if compiled else self._run)(self.kernels, ids, pos, kv=kv, ro=ro, between=between)
+        return self._run(self.kernels, ids, pos, kv=kv, ro=ro, between=between, pads=self._pads(pos, None, ro),
+                         compiled=compiled and self.compiled)
+
+    @torch.no_grad()
+    def forward_compact(self, ids, pos, cu, ro, compiled=True):
+        """Compact rows (--batches compact, with the fa3 kernels): single prompts packed back to back in one row
+        [1, T] (positions from 0 per prompt, cu: cumulative token counts [prompts + 2], int32; the padding after the
+        last prompt is one more prompt nobody reads) -> final hidden states at ro [R] (one readout per prompt): [R, D].
+        No padding of rows to graph lengths or of row counts."""
+        T = ids.shape[1]
+        doc = torch.bucketize(torch.arange(T, device=ids.device), cu[1:], right=True)
+        pads = dict(ro=F.pad(ro[None], (0, self.BLOCK)), doc=F.pad(doc, (0, self.BLOCK), value=-1))
+        out = self._run(self.kernels, ids, pos, ro=ro[None], pads=pads, compiled=compiled and self.compiled, cu=cu)
+        return out[0]
 
     @torch.no_grad()
     def forward_suffix(self, ids, mask, pos, prefix, ro=None, compiled=True):
@@ -450,4 +600,5 @@ class Gemma4Graph:
         mask (additive [b, 1, S, P + S], 0 = visible; a TreeMask for flex) -> [b, R, D] at ro [b, R] (None: all)."""
         from .lean import TreeMask
         kernels = self._kernels(dense=not isinstance(mask, TreeMask))
-        return (self.run if compiled else self._run)(kernels, ids, pos, prefix=prefix, mask=mask, ro=ro)
+        return self._run(kernels, ids, pos, prefix=prefix, mask=mask, ro=ro, pads=self._pads(pos, mask, ro),
+                         compiled=compiled and self.compiled)
