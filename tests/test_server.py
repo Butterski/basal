@@ -477,3 +477,29 @@ def test_viz_packing_and_served_comparison():
     out = compare_served(res, served)
     assert abs(out["questions"][0]["served_max_diff"] - 0.05) < 1e-9
     assert abs(out["questions"][1]["served_max_diff"] - 0.025) < 1e-9 and out["served"] is served["answers"]
+
+
+def test_out_of_memory_frees_the_failed_forward():
+    """An out-of-memory error's frames are cleared before the requests get it: the failed forward's tensors are freed at
+    once, not at a later garbage collection (until then the next requests ran out of memory too; ultra eager, 20 Oct)."""
+    import weakref
+
+    import torch
+    from basal.server import _fail
+    held = []
+
+    def forward():
+        t = torch.zeros(4)
+        held.append(weakref.ref(t))
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    async def main():
+        fut = asyncio.get_running_loop().create_future()
+        try:
+            forward()
+        except Exception as e:  # noqa: BLE001
+            _fail([fut], e)
+        assert held[0]() is None
+        with pytest.raises(torch.OutOfMemoryError):
+            await fut
+    asyncio.run(main())

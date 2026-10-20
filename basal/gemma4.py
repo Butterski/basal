@@ -145,6 +145,9 @@ class Gemma4Forward:
     # rows of a suffix forward: each row repeats the prefix keys, so 31B (32 heads x 512 in its global layers, 64 KB a
     # row and key) with five questions over a 10k-token state would hold 3.2 GB per layer; at most KV_BYTES
     KV_BYTES = 2 << 30
+    # an attention call past those budgets (a state over 16k tokens) runs as calls of at most SCORES scores (query heads
+    # x queries x keys; fp32 in the math kernel: 256 MB), as the graph engine's math kernel (Gemma4Graph.SCORES)
+    SCORES = 2 ** 26
 
     def __init__(self, model, answer_rows=True, attn=None):
         self.model = model
@@ -267,24 +270,22 @@ class Gemma4Forward:
 
     def _split(self, a, q, k, v, mask):
         """An SDPA call past the budgets of a forward over a 16k-token context (ATTN_PAIRS query-key pairs, KV_BYTES of
-        keys and values repeated per query head; only states over 16k tokens reach them) as calls within them: query
-        heads in groups whose repeated keys stay within those of all heads over 16k keys, query rows within
-        ATTN_PAIRS pairs. Each call is the same kernel on its rows and heads (keys and values per query head copied,
-        enable_gqa's repetition). Without it 2,048 queries of ultra over a 76k-token state were one math-kernel call
-        of 32 heads x 2,048 x 76k scores (fp32: 20 GB)."""
+        keys and values repeated per query head; only states over 16k tokens reach them) as calls of SCORES scores:
+        per KV head, its query heads folded into one block of queries over its keys and values (nothing repeated per
+        query head), in parts of queries. Without it the 2,048 queries of a part of ultra over a 76k-token state were
+        one math-kernel call of 32 heads x 2,048 x 76k scores (fp32: 20 GB) over keys and values repeated 8x."""
         B, H, Sq, d = q.shape
         G, Lk = k.shape[1], k.shape[2]
         r = H // G
-        hc = max([c for c in range(1, H + 1) if H % c == 0 and (r % c == 0 or c % r == 0)
-                  and B * c * Lk <= H * (self.ATTN_PAIRS // self.CHUNK)] or [1])
-        n = max(1, self.ATTN_PAIRS // (B * Lk))
+        n = max(1, self.SCORES // (B * r * Lk))  # queries per call
         out = q.new_empty(B, H, Sq, d)
-        for h0 in range(0, H, hc):
-            kk, vv = (x[:, h0 // r: (h0 + hc - 1) // r + 1].repeat_interleave(min(r, hc), 1) for x in (k, v))
+        for j in range(G):
             for s0 in range(0, Sq, n):
-                out[:, h0: h0 + hc, s0: s0 + n] = F.scaled_dot_product_attention(
-                    q[:, h0: h0 + hc, s0: s0 + n], kk, vv, attn_mask=mask[:, :, s0: s0 + n], scale=a.scaling)
-            del kk, vv
+                qs = q[:, j * r: (j + 1) * r, s0: s0 + n]
+                m = qs.shape[2]
+                o = F.scaled_dot_product_attention(qs.reshape(B, 1, r * m, d), k[:, j: j + 1], v[:, j: j + 1],
+                                                   attn_mask=mask[:, :, s0: s0 + m].repeat(1, 1, r, 1), scale=a.scaling)
+                out[:, j * r: (j + 1) * r, s0: s0 + m] = o.view(B, r, m, d)
         return out
 
     def _attend(self, kind, a, q, k, v, mask, kval, qval, window):
@@ -339,7 +340,8 @@ class Gemma4Forward:
         tokens, kv {own layer: (K, V) [G, kv heads, Lc, d]}, kpos {layer type: positions [G, Lc]}; row b continues
         ctx row grp[b]. read [B]: the index of each row's readout token, or None for a prefix part (it stops after the
         keys and values of the last layer that has its own).
-        -> ({own layer: (K, V) of this pass's tokens}, final hidden state at `read` [B, D] or None)."""
+        -> ({own layer: (K, V) of this pass's tokens}, final hidden state at `read` [B, D] or None). A readout pass
+        keeps no keys and values ({}): nothing reads them, and ultra's of a 16k-token batch were 14 GB."""
         B, S = valid.shape
         kv, kpos = ctx if ctx is not None else ({}, {})
         if ctx is not None and grp is None:
@@ -361,7 +363,8 @@ class Gemma4Forward:
             x = layer.input_layernorm(h)
             if self.own[i]:  # every own layer comes before the cut: its keys and values at every position
                 k, v = self._kv(a, x, rope[t])
-                new[i] = (k, v)
+                if read is None:
+                    new[i] = (k, v)
                 if i in kv:
                     K, V = kv[i]
                     K = K.expand(B, -1, -1, -1) if K.shape[0] == 1 else K.index_select(0, grp)

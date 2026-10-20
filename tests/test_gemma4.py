@@ -217,26 +217,29 @@ def test_budgets_split_forwards(monkeypatch):
             assert torch.allclose(x, y, atol=1e-5) and torch.allclose(x, z, atol=1e-5)
 
 
-@pytest.mark.parametrize("chunk,heads", [(8, 4), (16, 2), (32, 1)])
-def test_split_attention_equals_one_call(chunk, heads, monkeypatch):
-    """An SDPA call past the budgets of a 16k-token context (ATTN_PAIRS // CHUNK keys; only states over 16k tokens
-    reach them) runs as calls by query heads and rows; together they equal the one call (fp32)."""
+@pytest.mark.parametrize("B,per_call", [(1, 10), (2, 3), (1, 1000)])
+def test_split_attention_equals_one_call(B, per_call, monkeypatch):
+    """An SDPA call past the budgets of a 16k-token context (only states over 16k tokens reach them) runs per KV head,
+    its query heads folded into one block of queries, in parts within SCORES scores; together they equal the one call
+    (fp32, a random mask)."""
     g = Gemma4Forward(tiny("31b"))
     a = g.layers[2].self_attn  # a global layer
     torch.manual_seed(2)
-    B, H, G, Sq, Lk, d = 1, 4, 2, 37, 90, 32
+    H, G, Sq, Lk, d = 4, 2, 37, 90, 32
     q, k, v = torch.randn(B, H, Sq, d), torch.randn(B, G, Lk, d), torch.randn(B, G, Lk, d)
-    mask = (torch.arange(Lk)[None, None, :] <= torch.arange(Lk - Sq, Lk)[None, :, None])[:, None]
+    mask = torch.rand(B, 1, Sq, Lk) < 0.6
+    mask[..., -1] = True  # no empty row
     calls, sdpa = [], gemma4.F.scaled_dot_product_attention
     monkeypatch.setattr(gemma4.F, "scaled_dot_product_attention",
                         lambda q, *x, **kw: calls.append(q.shape) or sdpa(q, *x, **kw))
     one = g._attend("sdpa", a, q, k, v, mask, None, None, None)
     assert calls == [q.shape]
     calls.clear()
-    g.ATTN_PAIRS, g.CHUNK = 10 * Lk, chunk  # 10 query rows a call; heads within H x ATTN_PAIRS // CHUNK keys
+    g.ATTN_PAIRS, g.SCORES = 10, B * (H // G) * Lk * per_call  # past the budget; per_call queries a call
     split = g._attend("sdpa", a, q, k, v, mask, None, None, None)
-    assert len(calls) == H // heads * 4 and {c[1] for c in calls} == {heads} and max(c[2] for c in calls) == 10
-    torch.testing.assert_close(split, one, atol=1e-6, rtol=1e-6)
+    n = min(per_call, Sq)
+    assert len(calls) == G * -(-Sq // n) and all(c[1] == 1 and c[2] <= (H // G) * n for c in calls)
+    torch.testing.assert_close(split, one, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("name", sorted(CONFIGS))

@@ -33,6 +33,7 @@ import math
 import os
 import re
 import threading
+import traceback
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -379,6 +380,18 @@ def deterministic_setup(kind):
 def _answer(fut, res):
     if not fut.done():
         fut.set_result(res)
+
+
+def _fail(futs, e):
+    """Requests of a failed engine call get its error. Out of GPU memory: the frames of the failed forward are cleared
+    first; through the traceback (and the futures that hold it, a reference cycle) they kept its tensors alive until
+    a garbage collection, so the handler's empty_cache could not return them and the next requests ran out of memory
+    too (ultra in eager: a 2k-token request right after an 82k-token one, 20 Oct)."""
+    if isinstance(e, torch.OutOfMemoryError):
+        traceback.clear_frames(e.__traceback__)
+    for f in futs:
+        if not f.done():
+            f.set_exception(e)
 
 
 class LaneGate:
@@ -999,9 +1012,7 @@ class Server:
                     _answer(e[2], o)
                 self.long_rate = 0.8 * self.long_rate + 0.2 * (time.perf_counter() - t0) / max(total, 1)
             except Exception as ex:  # noqa: BLE001
-                for e in batch:
-                    if not e[2].done():
-                        e[2].set_exception(ex)
+                _fail([e[2] for e in batch], ex)
 
     def lane_of(self, branches, longest, cut):
         """--long-lane: a request whose longest prompt has more than --long-tokens tokens goes to the long lane, unless
@@ -1035,9 +1046,7 @@ class Server:
                 for i, o in zip(ix, out):
                     _answer(batch[i][2], o)
         except Exception as e:  # noqa: BLE001
-            for b in batch:
-                if not b[2].done():
-                    b[2].set_exception(e)
+            _fail([b[2] for b in batch], e)
         finally:
             slots.release()
             if getattr(self, "gate", None) is not None:
