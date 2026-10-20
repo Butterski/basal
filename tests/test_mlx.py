@@ -240,6 +240,12 @@ def test_mlx_packed_rows_equal_kv_cache(tmp_path):
     assert calls == [3, 1, 1, 1]
     assert max(abs(a - b) for g, h in zip(got, alone) for x, y in zip(g, h) for a, b in zip(x, y)) < 1e-5
     calls.clear()
+    be.PACK_BUDGET = MLXBackend.PACK_BUDGET
+    be.PACK_TOKENS = 64  # between q2's packed row (35 tokens) and the others (over 120): q2 packs, the rest fall back
+    mixed = be.run_shared(groups)
+    assert calls == [1]
+    assert max(abs(a - b) for g, h in zip(got, mixed) for x, y in zip(g, h) for a, b in zip(x, y)) < 1e-5
+    calls.clear()
     be.PACK_TOKENS = 0
     cached = be.run_shared(groups)
     assert calls == []  # PACK_TOKENS = 0: every group through _group (_shared_len, KV cache)
