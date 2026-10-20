@@ -13,7 +13,10 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 
 - **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), since v2.1.0 `vllm` (text only;
   faster, with prefix caching and FlashAttention) and, since 2.3, `fast` / `fast-nocompile` (text only; the CUDA
-  graph engine, below). The `-FP8` checkpoints (mini, max, ultra) run on `--mode vllm` only.
+  graph engine, below). Without `--mode`, basal-omni runs `fast` on Hopper GPUs with the `flash_attn_3` package (the
+  configuration its gate passed) and `eager` on other GPUs until they pass theirs (2.2.0 had no working default for
+  basal-omni on CUDA: `fast` stopped while loading the model). The `-FP8` checkpoints (mini, max, ultra) run on `--mode vllm`;
+  basal-omni-1.0-mini-FP8 also on `--mode fast` (its port gate below).
   With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max and the `-FP8` checkpoints) uses
   it; the others use their `CALIBRATION.json`.
 - **Repeatable answers with vLLM:** vLLM's numbers depend on what the server computed before (prefix cache,
@@ -30,10 +33,40 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 
 ## What the engine does differently for Gemma 4
 
-- **Attention kernel:** SDPA runs on the math kernel only. The memory-efficient kernel returned wrong attention on
-  real Gemma 4 activations in some shapes, and FlashAttention does not take Gemma's 512-wide global heads.
-- **Padding:** left-padded prompts in a batch read at their own positions, so a padded prompt gives the same answer as
-  the prompt alone.
+- **`eager` (basal 2.3):** Gemma 4 runs through the engine's own forward (`basal/gemma4.py`: transformers' modules and
+  weights in the engine's loop; `--eager-forward hf` keeps the transformers forward of 2.2):
+  - **The state once (SOAM).** The prompts of a request share their beginning: chat template, media and state (with
+    `--soam on`, the default, every question and option order of the request). It runs once into keys and values, and
+    every question then runs over them, positions continuing after the state. Sliding-window layers keep only the last
+    511 (mini) or 1,023 (max, ultra) keys of the state, all that a later token can see.
+  - **Answer rows only.** mini reuses the keys and values of earlier layers in its last 18 of 42 layers, so those
+    layers matter only where the answer is read. They run at that one position per prompt, and so do the attention
+    and MLP of the last layer with its own keys and values (on max and ultra, the last layer); a state stops after
+    that layer's keys and values.
+  - **Media once per request.** The image and audio encoders run once per request and the soft tokens are part of the
+    shared beginning. The soft tokens of one image attend to each other as transformers builds the masks: on max and
+    1.1-max (Gemma 4 unified) in every layer, on ultra in the sliding-window layers within the window.
+  - **Attention kernel:** SDPA's math kernel, as in 2.2. The memory-efficient kernel returned wrong attention in 2.2's
+    transformers forward of max: it was given an expanded (zero-stride) view of the one global key / value head, which
+    torch before 2.14.1 reads wrong at query lengths = 1 mod 32 (pytorch/pytorch#191937). Since 2.3 `--mode eager`
+    runs the transformers forward of every model without that kernel on such torch versions.
+  - **Padding:** the prompts of a batch are padded on the right and read at their last real token, so a padded prompt
+    gives the answer it gives alone.
+
+  Measured 2026-10-20 on one H100 against `--eager-forward hf` of the same engine (dev v2, 10,606 decisions, one
+  option order; automated share at 1% on the calibration test split, each forward with its own calibration fit,
+  paired bootstrap; `basal-loadtest` at 16 in flight: one question over a ~1.5k-token state, and five questions over
+  3k-10k-token states):
+
+  | model | agreement (all / at margin >= 0.2) | accuracy | ECE | automated at 1% | decisions/s, one question | questions/s, five over a long state |
+  |---|---|---|---|---|---|---|
+  | mini | 0.9982 / 1.0000 | -0.06 pt | +0.001 | 41.82% (2.2: 41.99%) | 17.2 (2.2: 10.0) | 15.3 (2.2: 1.6) |
+  | max | 0.9994 / 0.9997 | -0.01 pt | +0.000 | 47.35% (2.2: 47.39%) | 5.0 (2.2: 4.8) | 4.5 (2.2: 0.7) |
+
+  With both option orders (`--orders 2`, every decision over the shared question) agreement is 0.9980 / 1.0000 on
+  mini and 0.9953 / 0.9999 on max. The disagreements are close calls (eager's margin under 0.05 on mini); the
+  transformers forward agrees with itself to 1.0000 when only its batching changes, and both forwards are equally far
+  from an fp32 forward (mini, 2,000 items: mean |Δp| 0.0036 and 0.0037).
 - **Code logits:** option codes are read in fp32 from the output head's input, with Gemma's final logit softcap
   applied in fp32. The model body runs in bf16.
 - **`fast` and `fast-nocompile` (basal 2.3, text):** the CUDA graph engine runs Gemma 4 through its own layer code
@@ -47,24 +80,50 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   - **Readout rows only.** Those KV-shared layers, and the attention and MLP of the last layer with its own keys and
     values, run at the answer positions only (they produce nothing a later token reads): same answers, ~40% less
     compute per decision on E4B.
-  - **Attention kernel** (`--gemma-attn`): `math` (default), the kernel of `--mode eager`, uncompiled; `flex`,
-    FlexAttention with block masks (the 512-wide heads on 32 x 32 tiles); `fa3`, FlashAttention 3 in the sliding
-    layers' plain rows and flex elsewhere (Hopper). flex and fa3 run compiled in `--mode fast`.
-  - Text only: `--media on` needs `--mode eager`. Each captured CUDA graph keeps its own cuBLAS workspace, so the
-    engine sets `CUBLAS_WORKSPACE_CONFIG=:4096:2` for Gemma 4 unless you set it (1.1-max ran out of GPU memory in
-    warm-up with the default; the smaller workspace did not change its forward time).
+  - **Attention kernel** (`--gemma-attn`): `auto` (default) is `fa3` in `--mode fast` on Hopper with the
+    `flash_attn_3` wheel (as `--attn auto`), else `math`. `fa3`: FlashAttention 3 with the window in the sliding layers,
+    FlexAttention in the 512-wide global layers (32 x 32 tiles: the default tiles need more shared memory than an
+    H100 has) and wherever the trie needs a mask; compiled, with merged q / k / v and gate / up (`--merge auto`) and
+    compact rows (`--batches auto`: prompts back to back in one row, no padding). `math`: the kernel of `--mode
+    eager`, uncompiled. Also `flex` (FlexAttention everywhere) and `fa3+math`. On Blackwell, `auto` is `math` until
+    FlexAttention there has its own identity gate.
+  - Text only: `--media on` needs `--mode eager`; the image and audio towers are not loaded. Each captured CUDA graph
+    keeps its own cuBLAS workspace, so the engine sets `CUBLAS_WORKSPACE_CONFIG=:4096:2` for Gemma 4 unless you set it
+    (1.1-max ran out of GPU memory in warm-up with the default; the smaller workspace did not change its forward
+    time). On 31B the graph grid shrinks to fit (key / value buffers within 15% of the free memory). A state beyond the
+    largest graph keeps only the last window of the sliding layers' keys and values (a question never reads further
+    back), also in the state cache: a fifth of the memory per token on 31B.
+  - `--mode fp8` / `nvfp4` (quantisation at load time) are refused for basal-omni: torchao FP8 on 1.1-max missed the
+    port gate (0.9892 at margin >= 0.2 on 2-10 options, bar 0.9893). Serve an `-FP8` checkpoint instead.
 
   Measured 2026-10-20 on one H100 against `--mode eager` of the same engine (the gate of the FP8 ports, as above;
-  dev v2, 10,606 decisions, one order; automated share at 1% on the calibration test split, each engine with its own
-  calibration fit, paired bootstrap; `basal-loadtest` at 16 in flight: one question over a ~1.5k-token state, and
-  five questions over 3k-10k-token states):
+  dev v2, 10,606 decisions, one order; automated share at 1% on the calibration test split with the calibration file
+  the mode loads, paired bootstrap, bar: 95% lower bound of the difference >= -0.5 points; `basal-loadtest` at 16 in
+  flight: one question over a ~1.5k-token state, and five questions over 3k-10k-token states):
 
-  | model | agreement (all / at margin >= 0.2) | accuracy | ECE | automated at 1% | decisions/s, one question | questions/s, five over a long state |
+  | model, configuration | agreement (all / at margin >= 0.2) | accuracy | ECE | automated at 1% (eager) | decisions/s, one question (eager) | questions/s, five over a long state (eager) |
   |---|---|---|---|---|---|---|
-  | mini, `fast` (math) | 0.9984 / 0.9997 | -0.02 pt | +0.000 | 41.83% (eager 41.99%) | 15.8 (eager 10.0) | 7.9 (eager 1.6) |
-  | 1.1-max, `fast` (math) | 0.9992 / 0.9997 | +0.01 pt | -0.000 | 47.04% (eager 47.10%) | 3.8 (eager 4.8) | 2.0 (eager 0.7) |
+  | mini, `fast` (auto: fa3, compact rows) | 0.9937 / 0.9994 | +0.00 pt | +0.000 | 41.97% (41.99%) | 61.2 (10.0) | 21.4 (1.6) |
+  | 1.1-max, `fast` (auto: fa3, compact rows) | 0.9891 / 0.9990 | +0.04 pt | -0.001 | 47.16% (47.10%) | 16.2 (4.8) | 10.6 (0.7) |
+  | mini, `fast --gemma-attn math` | 0.9984 / 0.9997 | -0.02 pt | +0.000 | | 15.8 | 7.9 |
+  | 1.1-max, `fast --gemma-attn math` | 0.9992 / 0.9997 | +0.01 pt | -0.000 | | 3.8 | 2.0 |
+  | ultra, `fast` (auto: fa3, compact rows) | 0.9918 / 0.9985 | -0.06 pt | +0.002 | 56.73% (56.82%) | 6.1 (2.0 at 4 in flight) | 4.8 (0.3 at 2 in flight) |
+  | mini-FP8 checkpoint, `fast` | 0.9635 / 0.9908 | -0.26 pt | +0.002 | 41.82% (41.99%) | 80.6 | 19.6 |
 
-  On 1.1-max the math kernel (fp32 scores, without tensor cores) dominates single questions.
+  `--mode fast` has no calibration file of its own (it never loads a `CALIBRATION.fast.json`): it loads the model's
+  `CALIBRATION.json`, fitted on eager readouts, and the automated shares above are measured with that file (mini-FP8:
+  the `-FP8` repository's `CALIBRATION.json`, fitted on vLLM FP8 readouts; at the 5% target it automates 63.5% against
+  eager's 77.4%). A calibration refitted on fast-mode readouts is not shipped: the refit moves the certified thresholds
+  by fit noise, not because the readouts differ (top answer 0.996-0.997 of the calibration test against eager's, no
+  mean shift of the confidence). Refits of four fast configurations of 1.1-max with equally close readouts automated
+  -0.49, -0.39, -0.05 and -0.11 points against eager's own fit at 1% (the default configuration: -0.11), ultra's -0.56
+  (its refit's yes / no temperature is 0.958 against 0.944, so fewer yes / no answers clear the threshold), and mini's
+  refit certifies choice questions only at confidence 0.9998 at the 5% target (32.7% automated instead of 77.4%). On
+  one 80 GB H100 ultra answers five questions over 3k-10k-token states at 4.8 per second (vLLM bf16 with `--max-len
+  8192`: 3.8). For comparison, vLLM bf16 on 1.1-max: 0.9866 / 0.9994, 16.7 decisions/s, 10.8 questions/s.
+  With the math kernel (fp32 scores, without tensor cores) 1.1-max's single questions are slower than eager's larger
+  batches. In fp32 every path of `fast` (fa3's compiled code with flex in place of FA3) gives the answers of separate
+  prompts (identity gate: max |dp| 1.6e-5). Start-up: about 5 minutes (compile and graph capture).
 - **Not yet for Gemma 4:** the engine's `nvfp4` mode and SGLang.
 
 ## GGUF (llama.cpp, Ollama) and MLX (text)
@@ -147,9 +206,14 @@ move too many close decisions.
 and its processor (install `basal[media]`: pillow, soundfile, scipy, torchvision matching torch). A request may then
 carry `"media": [{"type": "image" | "audio", "data": "<base64>"}]`, `"detail": "default" | "high"` (280 or 1,120
 image tokens) and `"lang": "pl" | "en"`; see `basal/media.py` for the formats and limits. The media go where the state
-text goes, before it (`prompt.media_messages`), the prompt the basal-omni evaluation reads media with. Each prompt
-runs alone (no batching); text requests on the same server take the unchanged text path. Answers carry
-`"calibration": "text"`, and `usage.media` counts the items and their tokens.
+text goes, before it (`prompt.media_messages`), the prompt the basal-omni evaluation reads media with. Since 2.3 the
+image and audio encoders run once per request and the media and state run once for all its questions (above).
+Answers carry `"calibration": "text"`, and `usage.media` counts the items and their tokens.
+
+Checked 2026-10-20 on one H100 against `--eager-forward hf` (150 images and 150 audio clips of omni-probe-pl, one
+question per request and three questions over the same media): the same top answer on every decision with a margin
+of at least 0.2 (mini and max), 1,199 of 1,200 overall on max and all on mini, largest |Δp| 0.036; median latency of a
+three-question request 328 -> 194 ms (mini), 204 -> 131 ms (max).
 
 Checked 2026-10-10 on Gemma 4 E4B and 12B: served answers against the fp32 readout of the same model
 on 1,800 text items, 120 prompts over 2,048 tokens, 310 images, 285 audio clips and their text twins; every split is
