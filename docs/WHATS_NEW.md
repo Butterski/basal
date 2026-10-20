@@ -1,3 +1,11 @@
+# What is new in basal 2.3.1 (not released yet)
+
+- **`--mode gguf` uses every physical core.** llama.cpp in process ran its own default of 4 threads; it now takes
+  PyTorch's thread count (the physical cores within the process's CPU affinity, or `OMP_NUM_THREADS` /
+  `torch.set_num_threads`). basal-2.0-mini Q8_0 on a 6-core CPU: 1.34× faster on 16 recorded requests, probabilities
+  bit-identical (each logit is still one dot product in one thread). Builds with every layer on Metal or CUDA are not
+  affected. Contributed by Milosz (@Butterski), [#20](https://github.com/rkinas/basal/pull/20).
+
 # What is new in basal 2.3
 
 - **vLLM: KV-sharing fast prefill for basal-omni-1.0-mini, 1.43x / 1.60x** (`--mode vllm`, on by default for Gemma 4
@@ -60,12 +68,6 @@
   diacritics for every question (a 40k-character `compress` request with 326 questions: 509 ms, now 2 ms; 50 task
   questions: 79 ms, now 2 ms in task expansion). Same languages as before. Contributed by Milosz (@Butterski),
   [#17](https://github.com/rkinas/basal/pull/17).
-- **`--mode gguf` uses every physical core.** llama.cpp in process ran its own default of 4 threads; it now takes
-  PyTorch's thread count (the physical cores within the process's CPU affinity, or `OMP_NUM_THREADS` /
-  `torch.set_num_threads`). basal-2.0-mini Q8_0 on a 6-core CPU: 1.34× faster on 16 recorded requests, probabilities
-  bit-identical (each logit is still one dot product in one thread). Builds with every layer on Metal or CUDA are not
-  affected. Contributed by Milosz (@Butterski),
-  [#20](https://github.com/rkinas/basal/pull/20).
 
 # What is new in basal 2.2
 
