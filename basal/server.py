@@ -40,7 +40,7 @@ from pathlib import Path
 import torch
 
 from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend,
-                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, attention_available,
+                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, gemma_fast_kernels,
                      resolve, set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
@@ -80,12 +80,12 @@ MODES = {
 
 def default_mode(model=None, revision=None):
     """fast on CUDA, mlx on Apple Silicon when mlx and mlx-lm are installed, mps otherwise there, tpu on a TPU VM
-    with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only where
-    the configuration its gate passed runs (FlashAttention 3: Hopper with flash_attn_3), eager on other GPUs until they
-    pass their own (2.2.0 had no working default for it there: fast stopped at "'Gemma4Model' object has no attribute
-    'layers'")."""
+    with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only on the
+    GPU classes where its fast configuration passed its gate (gemma_fast_kernels: Hopper with flash_attn_3, Blackwell
+    workstation GPUs), eager on other GPUs until they pass theirs (2.2.0 had no working default for it there: fast
+    stopped at "'Gemma4Model' object has no attribute 'layers'")."""
     if torch.cuda.is_available():
-        if model is not None and attention_available("fa3") is not None and _gemma4(model, revision):
+        if model is not None and gemma_fast_kernels() is None and _gemma4(model, revision):
             return "eager"
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
@@ -1327,7 +1327,7 @@ def add_engine_args(ap):
                          "trie), fa3 (FlashAttention 3 in the sliding-window layers' plain rows, flex elsewhere; "
                          "Hopper), fa3+math (FlashAttention 3 in the sliding layers, math in the global ones). auto: "
                          "fa3 in --mode fast where FlashAttention 3 runs (with merged projections and compact rows), "
-                         "else math")
+                         "flex on Blackwell workstation GPUs (sm_120), else math")
     ap.add_argument("--merge", choices=["auto", "on", "off"], default="auto",
                     help="CUDA graph engine: one q/k/v and one gate/up GEMM per layer (bf16: the same products; FP8 "
                          "checkpoints: the merged weights re-quantised per tensor). auto: on for bf16 weights, off for "
