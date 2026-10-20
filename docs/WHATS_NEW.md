@@ -1,3 +1,11 @@
+# What is new in basal 2.3.1 (not released yet)
+
+- **`--mode mps` on the CPU** (`--device cpu`, the default without Apple Silicon): the packed engine (SOAM) computes a
+  request's state once for all its questions and option orders, where `--mode eager` computes it once per prompt.
+  basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: three task requests (41, 24 and 10 prompts) 838 s -> 88 s, 9.6x,
+  the same top answer on 75 of 75 readouts (max |Δp| 4e-6); single questions as fast as in `eager`. `--device cuda` is
+  refused (that is `--mode fast`). Contributed by Milosz (@Butterski).
+
 # What is new in basal 2.3
 
 - **vLLM: KV-sharing fast prefill for basal-omni-1.0-mini, 1.43x / 1.60x** (`--mode vllm`, on by default for Gemma 4

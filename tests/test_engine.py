@@ -2,12 +2,18 @@
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from basal.engine import GraphBackend
+from basal.engine import GraphBackend, MPSBackend
 
 
 class Stub(GraphBackend):
     def __init__(self, model):  # no loading, no CUDA graphs
         self.model, self.dev, self._wrows = model, torch.device("cpu"), {}
+
+
+class MPSStub(MPSBackend):
+    def __init__(self, model):  # the real __init__ minus loading, on the CPU (--mode mps --device cpu)
+        self.model, self.dev, self._wrows, self.shared = model, torch.device("cpu"), {}, True
+        self.tok = type("Tok", (), {"pad_token_id": 0})()
 
 
 def tiny():
@@ -92,6 +98,24 @@ def test_soam_many_branches_equal_separate():
     res = GraphBackend._assemble([(toks[:4] + other, lids[:4] * 2)], units, [be._long(pk, ul) for pk, ul, *_ in units])[0]
     for r, e in zip(res, separate(m, toks[:4] + other, lids[:4] * 2)):
         assert torch.allclose(torch.tensor(r), e, atol=1e-5)
+
+
+def test_mps_backend_on_cpu_equals_separate():
+    """The packed engine without CUDA graphs (MPSBackend) run on the CPU: several requests in one call, rows padded on
+    the right to the longest, each request's state shared by its questions and option orders, and a request over the
+    largest length through the long path; every readout equals its prompt run alone."""
+    m = tiny()
+    be = MPSStub(m)
+    s1, s2 = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14], [2, 7, 8, 10, 15, 16]
+    g1 = ([s1 + [20 + q, 21, 30 + o, 31 - o, 40 + q] for q in range(3) for o in range(2)], [[7, 8]] * 6)
+    g2 = ([s2 + [22, 23, 24], s2 + [25, 26]], [[7, 8, 9], [7, 8]])
+    g3 = ([[3, 4, 5]], [[7, 8]])
+    groups = [g1, g2, g3]
+    for lens in ([64], [12]):  # 12: g1's packed row (34 tokens) is over the largest length and takes the long path
+        be.LENS = lens
+        for (toks, lids), res in zip(groups, be.run_shared(groups)):
+            for r, e in zip(res, separate(m, toks, lids)):
+                assert torch.allclose(torch.tensor(r), e, atol=1e-5), lens
 
 
 def test_row_only_readout_equals_full_softmax():

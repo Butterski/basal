@@ -654,6 +654,8 @@ class Server:
             raise SystemExit("--ple-offload on needs --mode eager")
         if getattr(a, "eager_attn", "math") != "math" and kind != "eager":
             raise SystemExit("--eager-attn needs --mode eager (the CUDA graph engine takes --attn)")
+        if kind == "mps" and a.device == "cuda":
+            raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
         if kind == "eager":
             self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on",
                                         forward=getattr(a, "eager_forward", None),
@@ -672,7 +674,7 @@ class Server:
         elif kind == "mlx":
             self.backend = MLXBackend(md, quant=quant)
         elif kind == "mps":
-            self.backend = MPSBackend(md, a.dtype, shared=shared)
+            self.backend = MPSBackend(md, a.dtype, shared=shared, device=a.device)
         elif kind == "gguf":
             self.backend = GGUFBackend(md, a.gguf)
         elif kind == "strix":
@@ -1284,7 +1286,9 @@ def add_engine_args(ap):
                     help="--mode eager with Gemma 4 E2B / E4B (basal-omni mini): keep the per-layer embedding table in "
                          "host memory and copy only the rows of each forward's tokens (E4B: 5.6 GB less GPU memory)")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
-                    help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu)")
+                    help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu) "
+                         "and --mode mps (mps or cpu; default: mps on Apple Silicon, else cpu: a request's state "
+                         "computed once for all its prompts, where eager computes it once per prompt)")
     ap.add_argument("--orders", type=orders_arg, default=None,
                     help="1 = the option order given; 2 = also the reversed order, averaged (shares the state); auto = "
                          "order 1, and the reversed order only where order 1 is uncertain (--auto-tau, --auto-band); "

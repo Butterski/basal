@@ -1732,13 +1732,16 @@ class ExitGraphBackend(GraphBackend):
 
 
 class MPSBackend(GraphBackend):
-    """Apple GPU through PyTorch MPS: the shared-prefix packing (prefix trie, SOAM) and token-budget batching of
-    GraphBackend, run as plain forwards (MPS has no CUDA graphs). Rows are padded on the right to the longest packed
-    row of the chunk."""
+    """The shared-prefix packing (prefix trie, SOAM) and token-budget batching of GraphBackend, run as plain forwards
+    without CUDA graphs: on the Apple GPU through PyTorch MPS, or on the CPU (no MPS, or device="cpu"), where a
+    request's state is then computed once instead of once per prompt as in EagerBackend. Rows are padded on the right
+    to the longest packed row of the chunk."""
 
     streams, inflight = False, 1  # its own run_shared: no early readouts, one call at a time
 
-    def __init__(self, model_dir, dtype="bfloat16", shared=True, device="mps"):
+    def __init__(self, model_dir, dtype="bfloat16", shared=True, device=None):
+        mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+        device = device or ("mps" if mps else "cpu")
         EagerBackend.__init__(self, model_dir, dtype, device)
         self.dev = torch.device(device)
         self.shared = shared
