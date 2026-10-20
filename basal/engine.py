@@ -309,6 +309,7 @@ class EagerBackend:
 EAGER_FORWARDS = ("basal", "hf")
 ATTN = ("auto", "fa2", "fa3", "fa4", "cudnn")
 _ATTN = {"impl": "fa2", "direct": None}  # the attention of causal forwards without a mask (process-wide)
+_VARLEN = {"impl": "fa3"}  # the kernel of compact rows: FlashAttention 3, or "torch" (torch's varlen_attn, off Hopper)
 
 
 def attention_available(impl):
@@ -394,14 +395,33 @@ def _direct_attention(impl):
     return None
 
 
+def torch_varlen_available(dtype):
+    """None if torch's varlen attention (torch.nn.attention.varlen.varlen_attn: torch's built-in FlashAttention 2 on
+    packed sequences, with GQA) can run compact rows here, else why not."""
+    if not torch.cuda.is_available():
+        return "needs CUDA"
+    if torch.cuda.get_device_capability()[0] < 8:
+        return "needs an sm80+ GPU"
+    if dtype not in (torch.bfloat16, torch.float16):
+        return "needs bf16 / fp16 activations"
+    try:
+        from torch.nn.attention.varlen import varlen_attn
+    except ImportError:
+        return "needs torch with torch.nn.attention.varlen"
+    import inspect
+    if "enable_gqa" not in inspect.signature(varlen_attn).parameters:
+        return "this torch's varlen_attn has no enable_gqa"
+    return None
+
+
 def _varlen_attention(q, k, v, cu, scale, layer=0):
     """Causal attention of compact rows: [1, heads, T, d] in (prompts packed back to back, cu = their cumulative token
-    counts, int32, empty prompts at the end), [1, T, heads, d] out. FlashAttention 3's varlen kernel (a torch custom
-    op, so the compiled forward has no graph break): the same rows as the padded forward on an H100.
+    counts, int32, empty prompts at the end), [1, T, heads, d] out. FlashAttention 3's varlen kernel, or with
+    _VARLEN["impl"] == "torch" torch's varlen_attn (torch's FlashAttention 2, any sm80+ GPU); both are torch custom
+    ops, so the compiled forward has no graph break. FA3: the same rows as the padded forward on an H100.
     With a template prefix cu = (cu_q, cu_k, gather, prefix): every prompt's keys / values are its template prefix's
     (prefix[layer] = (K, V) [prefix tokens, kv heads, d], computed at start-up) followed by its own; gather picks them
     from prefix + own tokens, and the queries (own tokens) attend bottom-right causally."""
-    import flash_attn_interface as fa3
     T = q.shape[2]
     k, v = k[0].transpose(0, 1), v[0].transpose(0, 1)
     if isinstance(cu, tuple):
@@ -411,6 +431,11 @@ def _varlen_attention(q, k, v, cu, scale, layer=0):
         v = torch.cat([pv, v]).index_select(0, gather)
     else:
         cu_k = cu
+    if _VARLEN["impl"] == "torch":
+        from torch.nn.attention.varlen import varlen_attn
+        return varlen_attn(q[0].transpose(0, 1), k, v, cu, cu_k, T, k.shape[0], scale=scale, window_size=(-1, 0),
+                           enable_gqa=True)[None]
+    import flash_attn_interface as fa3
     o = fa3.flash_attn_varlen_func(q[0].transpose(0, 1), k, v, cu, cu_k, T, k.shape[0], softmax_scale=scale,
                                    causal=True)
     return (o[0] if isinstance(o, (tuple, list)) else o)[None]
@@ -597,14 +622,18 @@ class GraphBackend(EagerBackend):
         self._wrows = {}
         if batches == "fine":
             self.BATCHES = self.FINE_BATCHES
-        # compact rows need FlashAttention 3's varlen kernel (Hopper); auto: compact where it runs. Gemma 4: with its
-        # fa3 kernels (FA3 varlen in the sliding layers, a flex block mask per prompt in the 512-wide global ones)
-        self.compact = batches in ("compact", "auto") and self.attn == "fa3" and self.dev.type == "cuda" \
-            and (self.gemma is None or self.gemma.kernels.get("sliding_attention") == "fa3"
-                 and self.gemma.kernels.get("full_attention") != "math")
+        # compact rows need a varlen kernel: FlashAttention 3's (Hopper; auto: compact where it runs; Gemma 4 with its
+        # fa3 kernels: FA3 varlen in the sliding layers, a flex block mask per prompt in the 512-wide global ones), or,
+        # with --batches compact on other GPUs, torch's varlen_attn (its FlashAttention 2, sm80+; Llama models)
+        fa3 = self.attn == "fa3" and (self.gemma is None or self.gemma.kernels.get("sliding_attention") == "fa3"
+                                      and self.gemma.kernels.get("full_attention") != "math")
+        why = torch_varlen_available(getattr(torch, dtype)) if self.gemma is None else "Gemma 4 needs --gemma-attn fa3"
+        torch_varlen = not fa3 and batches == "compact" and why is None
+        self.compact = batches in ("compact", "auto") and (fa3 or torch_varlen) and self.dev.type == "cuda"
+        _VARLEN["impl"] = "torch" if torch_varlen else "fa3"
         if batches == "compact" and not self.compact:
             raise ValueError("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper; Gemma 4: "
-                             "--gemma-attn fa3)")
+                             f"--gemma-attn fa3) or torch's varlen attention ({why})")
         if self.compact and self.gemma is not None:  # its forward reads out at one row per prompt
             self.fwd_c, self.readout_layer = self.gemma.forward_compact, True
         elif self.compact:
