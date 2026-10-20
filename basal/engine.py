@@ -945,6 +945,25 @@ class GraphBackend(EagerBackend):
             root = [self.tok.pad_token_id] * n
             self.run_shared([([root + [5]], [[10, 11]])] + ([([root + [5, 6], root + [6, 5]], [[10, 11], [10, 11]])]
                                                              if self.shared else []))
+            if self.gemma is not None and self.flex and self.shared:
+                self._warm_pass2(n)
+
+    def _warm_pass2(self, n):
+        """Gemma 4: pass 2 without a graph calls one compiled flex_attention, which compiles anew for each shape class
+        it has not seen (one row or several, fresh key / value buffers or the graphs', readout rows or all, a second
+        size of a dimension makes it dynamic): 1.8-2.4 s each, under the launch lock, the first time a class came up
+        under load (nsys, 20 Oct: 4-5 such stalls in the first multi-question run on mini and 1.1-max). The classes
+        run here once: branched units of five 64-token branches over a root beyond the largest graph (fresh buffers)
+        and over a root of the plain graphs (their buffers), one and two units per forward."""
+        pad = self.tok.pad_token_id
+
+        def unit(L):  # five branches of 64 tokens below an L-token root
+            return ([[pad] * L + [5 + k] + [7] * 63 for k in range(5)], [[10, 11]] * 5)
+        L = self.LENS[-1] + 64
+        if 2 * self._bucket(L, self.PLAIN_LENS) <= self.TOKEN_BUDGET:
+            self.run_shared([unit(L)])
+            self.run_shared([unit(L), unit(L)])
+        self.run_shared([unit(n)])
 
     # -- helpers -------------------------------------------------------------------------------------------------
     def _bucket(self, n, xs):

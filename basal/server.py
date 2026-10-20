@@ -26,6 +26,7 @@ branch over the state; the state is computed once per request. `act`, `multi` an
 import argparse
 import asyncio
 import functools
+import gc
 import hashlib
 import json
 import sys
@@ -1590,6 +1591,11 @@ def main():
     rows = getattr(srv.backend, "compact_kernel", None)  # compact rows: their kernel, and the template prefix with them
     info = (f" attention {attn}" if attn else "") + (f" compact rows {rows}" if rows else "") \
         + (" template prefix" if rows and getattr(srv.backend, "template", None) else "")
+    # everything built so far (weights, graphs, compiled code) lives as long as the server: out of the garbage
+    # collector's sight, so a full collection no longer walks it (up to 1.4 s each at the end of start-up on 4.5B, and
+    # a 2.9 s stall of one request under nsys, 20 Oct)
+    gc.collect()
+    gc.freeze()
     print(f"basal: model {a.model} mode {a.mode}{info} ready in {time.time() - t0:.0f}s on port {a.port}", flush=True)
 
     mcp = None
