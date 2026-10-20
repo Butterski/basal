@@ -217,3 +217,28 @@ def test_gemma4_per_layer_config_override():
     o = mlx_config_overrides({"model_type": "gemma4", "text_config": t})
     assert o["text_config"]["global_head_dim"] == 512 and o["text_config"]["head_dim"] == 256
     assert mlx_config_overrides({"text_config": {**t, "global_head_dim": 512}}) == {}
+
+
+def test_mlx_packed_rows_equal_kv_cache(tmp_path):
+    """Llama: a group whose prefix and suffixes fit in PACK_TOKENS runs as one packed row (explicit positions, block
+    mask), several groups of different lengths in one padded batch; the readouts equal the KV-cache path (PACK_TOKENS
+    = 0) and the PyTorch readout. Gemma 4 keeps the KV-cache path."""
+    pytest.importorskip("mlx.core")
+    m = tiny_llama(tmp_path)
+    be = mlx_stub(tmp_path)
+    assert be.packed
+    q2 = [list(range(30, 60)) + [4, 10, 11], list(range(30, 60)) + [4, 11, 10]]  # a shorter question, two orders
+    groups = [(TOKS, LIDS), (q2, LIDS[:2]), (TOKS[2:4], LIDS[2:4])]
+    calls = []
+    packed_fwd = be._packed
+    be._packed = lambda g: calls.append(len(g)) or packed_fwd(g)
+    got = be.run_shared(groups)
+    assert calls == [3]  # one forward for the three groups
+    be.PACK_TOKENS = 0
+    cached = be.run_shared(groups)
+    for (toks, lids), g, c in zip(groups, got, cached):
+        for r, x, y in zip(reference(m, toks, lids), g, c):
+            assert max(abs(a - b) for a, b in zip(x, y)) < 1e-5
+            assert max(abs(a - b) for a, b in zip(r, x)) < 2e-4
+    tiny_gemma4(tmp_path / "g4")
+    assert not mlx_stub(tmp_path / "g4").packed
