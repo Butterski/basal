@@ -92,3 +92,29 @@ def test_cached_states_through_pass2_graphs():
     n = len(used)
     check(be, [g for s in states for g in requests(rnd, s)])
     assert be.state_cache.stats()["hits"] == 6 and len(used) > n
+
+
+def test_longest_prefix_extends_and_diverges():
+    """longest(): a state that extends a cached one shares all of it, an edited one up to the edit (also inside a
+    block); fewer than one common block is a miss; an entry that replaces the one it extends drops it from the
+    index; eviction drops an entry's blocks."""
+    import torch
+    from basal.engine import StateCache
+    B = StateCache.BLOCK
+    kv = [(torch.zeros(1, 4, 2), torch.zeros(1, 4, 2))]
+    c = StateCache(1 << 20)
+    base = list(range(3 * B + 10))
+    c.put(c.key(base), kv, tokens=base)
+    key, _, m, n = c.longest(base + [7, 8, 9])
+    assert key == c.key(base) and m == n == len(base)
+    edited = base[: 2 * B + 5] + [-1] + base[2 * B + 6:]
+    assert c.longest(edited)[2] == 2 * B + 5
+    assert c.longest(base[: B - 1] + [1]) is None
+    longer = base + [7, 8, 9]
+    c.put(c.key(longer), kv, tokens=longer, replaces=c.key(base))
+    assert not c.has(c.key(base)) and c.longest(base)[0] == c.key(longer)
+    small = StateCache(2 * sum(k.numel() * k.element_size() * 2 for k, _ in kv))
+    for i in range(3):
+        t = [i] + base
+        small.put(small.key(t), kv, tokens=t)
+    assert small.stats()["evictions"] == 1 and small.longest([0] + base) is None

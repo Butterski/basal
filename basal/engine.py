@@ -463,13 +463,58 @@ def causal_sdpa(model):
 class StateCache:
     """Keys and values of request states (the root of a unit cut at the state boundary: template and state), keyed by a
     hash of their token ids, kept on the GPU within a byte budget with least-recently-used eviction. A request whose
-    state is cached runs only its questions and options (pass 2 over the cached keys and values)."""
+    state is cached runs only its questions and options (pass 2 over the cached keys and values). An entry stored with
+    its token ids is also found by a state that only begins with it (a growing agent trace or chat history, or an edited
+    one): longest() finds the cached state sharing the longest prefix, through chained hashes of 256-token blocks."""
+
+    BLOCK = 256  # tokens per block of the prefix index
 
     def __init__(self, budget_bytes, salt=b""):
         from collections import OrderedDict
         self.budget, self.used, self.salt = int(budget_bytes), 0, salt
         self.entries, self.lock = OrderedDict(), threading.Lock()
-        self.hits = self.misses = self.evictions = 0
+        self.index = {}  # chained hash of a state's first i blocks -> the key of an entry beginning with them
+        self.hits = self.misses = self.evictions = self.prefix_hits = 0
+
+    def _blocks(self, tokens):
+        """Chained hashes of the full BLOCK-token blocks of tokens: the i-th covers tokens[: BLOCK * (i + 1)]."""
+        import hashlib
+        a, h, out = np.asarray(tokens, dtype=np.int64), b"", []
+        for i in range(len(a) // self.BLOCK):
+            h = hashlib.blake2b(h + a[i * self.BLOCK: (i + 1) * self.BLOCK].tobytes(), digest_size=16,
+                                key=self.salt).digest()
+            out.append(h)
+        return out
+
+    def longest(self, tokens):
+        """The cached state sharing the longest prefix with tokens -> (its key, its keys / values, the length of the
+        common prefix, its length), or None (no common full block). Found by the longest common block, then extended
+        token by token: a state that extends a cached one shares all of it, an edited one up to the edit."""
+        blocks = self._blocks(tokens)
+        with self.lock:
+            for i in range(len(blocks) - 1, -1, -1):
+                key = self.index.get(blocks[i])
+                if key in self.entries and self.entries[key][2] is not None:
+                    break
+            else:
+                return None
+            kv, _, own = self.entries[key]
+            t, n = np.asarray(tokens, dtype=np.int64), min(len(own), len(tokens))
+            m = (i + 1) * self.BLOCK
+            diff = np.nonzero(own[m:n] != t[m:n])[0]
+            m = m + int(diff[0]) if len(diff) else n
+            self.entries.move_to_end(key)
+            self.prefix_hits += 1
+            return key, kv, m, len(own)
+
+    def _drop(self, key):
+        """Removes an entry and its blocks from the index (lock held)."""
+        _, size, own = self.entries.pop(key)
+        self.used -= size
+        if own is not None:
+            for h in self._blocks(own):
+                if self.index.get(h) == key:
+                    del self.index[h]
 
     def key(self, tokens):
         import hashlib
@@ -490,24 +535,31 @@ class StateCache:
         with self.lock:
             return key in self.entries
 
-    def put(self, key, kv):
+    def put(self, key, kv, tokens=None, replaces=None):
+        """Stores a state's keys / values; with its token ids (tokens) it is also found by states that begin with it.
+        replaces: the key of an entry this one extends to its end (an agent loop keeps one entry, not one per step)."""
         size = sum(k.numel() * k.element_size() + v.numel() * v.element_size() for k, v in kv)
         if size > self.budget:
             return
         with self.lock:
+            if replaces in self.entries:
+                self._drop(replaces)
             if key in self.entries:
                 return
-            self.entries[key] = (kv, size)
+            own = None if tokens is None else np.asarray(tokens, dtype=np.int64)
+            self.entries[key] = (kv, size, own)
             self.used += size
+            if own is not None:
+                for h in self._blocks(own):
+                    self.index[h] = key
             while self.used > self.budget:
-                _, (_, s) = self.entries.popitem(last=False)
-                self.used -= s
+                self._drop(next(iter(self.entries)))
                 self.evictions += 1
 
     def stats(self):
         with self.lock:
             return dict(entries=len(self.entries), used_bytes=self.used, budget_bytes=self.budget, hits=self.hits,
-                        misses=self.misses, evictions=self.evictions)
+                        misses=self.misses, evictions=self.evictions, prefix_hits=self.prefix_hits)
 
 
 class GraphBackend(EagerBackend):
