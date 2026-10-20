@@ -352,6 +352,18 @@ def auto_attention(fp8=False):
     return "fa3" if attention_available("fa3") is None else "fa2"
 
 
+def gemma_fast_kernels():
+    """The kernels of basal-omni's (Gemma 4) compiled fast forward where it passed its gate on this GPU class, else None
+    (the math kernel, uncompiled; eager without --mode): fa3 where FlashAttention 3 runs (Hopper; E3, 20 Oct), flex on
+    Blackwell workstation GPUs (sm_120: FlexAttention with the smaller tiles of 99 KB of shared memory per block; RTX
+    PRO 6000, 20 Oct)."""
+    if attention_available("fa3") is None:
+        return "fa3"
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
+        return "flex"
+    return None
+
+
 def set_attention(choice="auto", fp8=False):
     """Choose the kernel of the causal forwards without a mask (plain prompts and the root pass of branched units):
     fa2 = torch SDPA's built-in FlashAttention 2, fa3 = FlashAttention 3 in SDPA's flash slot (torch's registry),
@@ -687,8 +699,9 @@ class GraphBackend(EagerBackend):
         auto (--gemma-attn, --merge): the configuration gated on an H100 (E3, 20 Oct: dev v2 against eager bf16,
         mini 0.9933 / 1.1-max 0.9891 of top answers equal, 0.9990-0.9998 at margin >= 0.2; automated at 1% within
         -0.11 points, each engine its own calibration; 1.1-max 3.4x eager's decisions/s, mini 6.1x): fa3 kernels,
-        merged projections and (--batches auto) compact rows where FlashAttention 3 runs and the engine compiles;
-        else the math kernel, uncompiled (E2's gate) - Blackwell's flex awaits its own identity gate."""
+        merged projections and (--batches auto) compact rows where FlashAttention 3 runs and the engine compiles; flex
+        and merged projections on Blackwell workstation GPUs (gemma_fast_kernels); else the math kernel, uncompiled
+        (E2's gate)."""
         from . import gemma4_graph
         why = gemma4_graph.supports(self.model)
         if why:
@@ -702,7 +715,7 @@ class GraphBackend(EagerBackend):
             raise ValueError(f"--mode {quant} quantisation at load time is not available for basal-omni (Gemma 4); "
                              "serve its -FP8 checkpoint instead")
         if kernels == "auto":
-            kernels = "fa3" if compile and attention_available("fa3") is None else "math"
+            kernels = (gemma_fast_kernels() if compile else None) or "math"
         if merge == "auto":
             merge = kernels != "math"
         if "fa3" in str(kernels) and attention_available("fa3"):
