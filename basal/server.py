@@ -1269,7 +1269,8 @@ def add_engine_args(ap):
                          "SDPA's math kernel, as --mode eager), flex (FlexAttention with block masks: sliding window, "
                          "trie), fa3 (FlashAttention 3 in the sliding-window layers' plain rows, flex elsewhere; "
                          "Hopper), fa3+math (FlashAttention 3 in the sliding layers, math in the global ones). auto: "
-                         "math")
+                         "fa3 in --mode fast where FlashAttention 3 runs (with merged projections and compact rows), "
+                         "else math")
     ap.add_argument("--merge", choices=["auto", "on", "off"], default="auto",
                     help="CUDA graph engine: one q/k/v and one gate/up GEMM per layer (bf16: the same products; FP8 "
                          "checkpoints: the merged weights re-quantised per tensor). auto: on for bf16 weights, off for "
