@@ -58,7 +58,9 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   - Text only: `--media on` needs `--mode eager`; the image and audio towers are not loaded. Each captured CUDA graph
     keeps its own cuBLAS workspace, so the engine sets `CUBLAS_WORKSPACE_CONFIG=:4096:2` for Gemma 4 unless you set it
     (1.1-max ran out of GPU memory in warm-up with the default; the smaller workspace did not change its forward
-    time). On 31B the graph grid shrinks to fit (key / value buffers within 15% of the free memory).
+    time). On 31B the graph grid shrinks to fit (key / value buffers within 15% of the free memory). A state beyond the
+    largest graph keeps only the last window of the sliding layers' keys and values (a question never reads further
+    back), also in the state cache: a fifth of the memory per token on 31B.
   - `--mode fp8` / `nvfp4` (quantisation at load time) are refused for basal-omni: torchao FP8 on 1.1-max missed the
     port gate (0.9892 at margin >= 0.2 on 2-10 options, bar 0.9893). Serve an `-FP8` checkpoint instead.
 
@@ -73,13 +75,16 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   | 1.1-max, `fast` (auto: fa3, compact rows) | 0.9891 / 0.9990 | +0.04 pt | -0.001 | 47.00% (47.10%) | 16.2 (4.8) | 10.6 (0.7) |
   | mini, `fast --gemma-attn math` | 0.9984 / 0.9997 | -0.02 pt | +0.000 | 41.83% (41.99%) | 15.8 | 7.9 |
   | 1.1-max, `fast --gemma-attn math` | 0.9992 / 0.9997 | +0.01 pt | -0.000 | 47.04% (47.10%) | 3.8 | 2.0 |
-  | ultra, `fast` (auto: fa3, compact rows) | 0.9909 / 0.9983 | +0.05 pt | +0.001 | | 6.0 (2.0 at 4 in flight) | out of memory |
+  | ultra, `fast` (auto: fa3, compact rows) | 0.9918 / 0.9985 | -0.06 pt | +0.002 | 56.26% (56.82%) | 6.1 (2.0 at 4 in flight) | 4.8 (0.3 at 2 in flight) |
   | mini-FP8 checkpoint, `fast` | 0.9635 / 0.9908 | -0.26 pt | +0.002 | | 80.6 | 19.6 |
 
   The automated shares are each engine's own calibration fit; served with the shipped `CALIBRATION.json` (what
-  `--mode fast` loads) the fast engine automates 41.97% (mini) and 47.16% (1.1-max) at 1%. Ultra on one 80 GB H100
-  fits single questions; states of 3k-10k tokens with five questions ran out of GPU memory (vLLM bf16 serves them with
-  `--max-len 8192`). For comparison, vLLM bf16 on 1.1-max: 0.9866 / 0.9994, 16.7 decisions/s, 10.8 questions/s.
+  `--mode fast` loads) the fast engine automates 41.97% (mini), 47.16% (1.1-max) and 56.73% (ultra) at 1%. On ultra
+  the fast engine's own fit misses the automation bar (-0.56 points, 95% interval -0.76 to -0.36) although its readouts
+  are as close to eager's as on the other tiers (top answer 0.997 of the calibration test, mean confidence +0.0001):
+  the refit's yes / no temperature (0.958 against 0.944) certifies fewer answers; serve it with the shipped file. On
+  one 80 GB H100 ultra answers five questions over 3k-10k-token states at 4.8 per second (vLLM bf16 with `--max-len
+  8192`: 3.8). For comparison, vLLM bf16 on 1.1-max: 0.9866 / 0.9994, 16.7 decisions/s, 10.8 questions/s.
   With the math kernel (fp32 scores, without tensor cores) 1.1-max's single questions are slower than eager's larger
   batches. In fp32 every path of `fast` (fa3's compiled code with flex in place of FA3) gives the answers of separate
   prompts (identity gate: max |dp| 1.6e-5). Start-up: about 5 minutes (compile and graph capture).

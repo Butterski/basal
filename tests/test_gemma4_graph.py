@@ -157,6 +157,28 @@ def test_state_cache_second_round_equals_separate():
     assert s["entries"] == 1 and s["hits"] == 1 and s["misses"] == 1
 
 
+def test_long_state_keeps_the_window_of_sliding_layers():
+    """A root longer than the largest graph gets fresh key / value buffers whose sliding layers keep its last `window`
+    tokens only (pass 2 reads no further back). A state cached that way by the long lane is reused by the main lane
+    over a graph's buffers, its sliding layers' keys placed where the root ends. Both equal separate prompts."""
+    from basal.engine import StateCache
+    m = tiny("e4b", torch.float32)
+    be = Stub(m)
+    assert [k.shape[2] for k, _ in be._kv_new(12)] == [5, 5, 12, 5]  # own layers: sliding, sliding, global, sliding
+    be.state_cache = StateCache(1 << 30)
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
+    first = [state + [20, 21, 30 + o, 31 - o] for o in range(2)]
+    second = [state + [22, 23, 24, 30 + o] for o in range(2)]
+    lids = [[7, 8], [7, 8]]
+    for r, e in zip(be.run_long([(first, lids, len(state))])[0], separate(m, first, lids)):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+    be.PLAIN_LENS = be.LENS = [16]  # the state now fits the graphs' buffers: the main lane's pass 2 over them
+    for r, e in zip(be.run_shared([(second, lids, len(state))])[0], separate(m, second, lids)):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+    s = be.state_cache.stats()
+    assert s["entries"] == 1 and s["hits"] == 1
+
+
 def test_long_lane_equals_separate():
     """The long lane (run_long): every unit alone, one decoder layer at a time (between(i) before layer i)."""
     m = tiny("31b", torch.float32)
