@@ -135,6 +135,15 @@ def test_attention_plan(monkeypatch):
             gemma4.attention_plan(bad)
 
 
+def test_helpers_for_other_backends():
+    """text_model and is_gemma4 are imported by the CUDA graph engine's Gemma 4 path (keep their names)."""
+    m = tiny("e4b")
+    assert gemma4.text_model(m) is m.model and gemma4.is_gemma4(m)
+    mm = tiny_mm(False, 2, 8)
+    assert gemma4.text_model(mm) is mm.model.language_model and gemma4.is_gemma4(mm)
+    assert not gemma4.is_gemma4(type("M", (), {"config": type("C", (), {"model_type": "llama"})()})())
+
+
 def test_kv_sharing_layout():
     g = Gemma4Forward(tiny("e4b"))
     assert g.last_kv == 3 and g.src == {4: 3, 5: 2} and g.store == {2, 3}  # E4B: the last 18 of 42 layers share

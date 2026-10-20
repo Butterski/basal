@@ -91,6 +91,11 @@ def text_model(model):
     return getattr(model.model, "language_model", model.model)
 
 
+def is_gemma4(model):
+    """A loaded Gemma 4 model (basal-omni): model types gemma4, gemma4_text, gemma4_unified, ..."""
+    return str(getattr(model.config, "model_type", "")).startswith("gemma4")
+
+
 class HostRows(torch.nn.Module):
     """Gemma 4's per-layer embedding table in host memory (G3, --ple-offload on): E2B / E4B look up 256 extra numbers
     per layer for every token in a table of 262,144 rows (E4B: x 42 layers = 10,752 columns, 5.6 GB in bf16, a third

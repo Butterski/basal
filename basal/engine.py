@@ -114,7 +114,8 @@ class EagerBackend:
             if not offload_ple(self.model):
                 raise SystemExit("--ple-offload on: the model has no per-layer embeddings (Gemma 4 E2B / E4B)")
         self.model = self.model.to(dev).eval()
-        if str(getattr(self.model.config, "model_type", "")).startswith("gemma4"):
+        from .gemma4 import is_gemma4
+        if is_gemma4(self.model):
             # Gemma 4 (basal-omni): SDPA's memory-efficient kernel returned wrong attention on real activations in some
             # shapes (omni kernel check 2026-10-07); the math kernel equals eager attention there
             torch.backends.cuda.enable_flash_sdp(False)
