@@ -20,14 +20,14 @@ TEXT = {"architectures": ["LlamaForCausalLM"], "num_hidden_layers": 32}
 
 
 def test_presets():
-    assert list(VLLM_PRESETS) == ["default", "fp8", "fp8-kv", "deterministic"]
+    assert list(VLLM_PRESETS) == ["default", "fp8-kv", "deterministic"]          # no load-time FP8 weights
     assert vllm_args(TEXT) == ({}, {})                                              # default: as in 2.2
-    assert vllm_args(TEXT, "fp8") == ({"quantization": "fp8"}, {})                  # bf16 weights quantised at load
     assert vllm_args(TEXT, "fp8-kv") == ({"kv_cache_dtype": "fp8"}, {})            # the checkpoint's own weights
     assert vllm_args(TEXT, "deterministic") == ({"enable_prefix_caching": False, "attention_backend": "TRITON_ATTN"},
                                                 {"VLLM_BATCH_INVARIANT": "1"})
-    with pytest.raises(ValueError, match="unknown --vllm-preset 'nvfp4'"):
-        vllm_args(TEXT, "nvfp4")
+    for name in ("nvfp4", "fp8"):
+        with pytest.raises(ValueError, match=f"unknown --vllm-preset '{name}'"):
+            vllm_args(TEXT, name)
 
 
 def test_fp8_kv_cache_with_shared_keys_and_values():
@@ -37,10 +37,7 @@ def test_fp8_kv_cache_with_shared_keys_and_values():
 
 
 def test_fp8_checkpoint_keeps_its_own_weights():
-    assert "quantization" not in vllm_args(FP8_PORT, "fp8")[0]
     assert vllm_args(FP8_PORT, "fp8-kv")[0] == {"kv_cache_dtype": "fp8"}
-    nested = {"text_config": {"quantization_config": {"quant_method": "fp8"}}}
-    assert vllm_args(nested, "fp8") == ({}, {})
 
 
 def test_text_only_and_kv_shared_layers():
@@ -79,7 +76,7 @@ def test_backend_passes_the_preset_to_vllm(tmp_path, fake_vllm):
 def test_bench_mode_with_a_preset(tmp_path, fake_vllm):
     from basal.bench import build
     (tmp_path / "config.json").write_text(json.dumps(TEXT))
-    assert build("vllm@fp8", tmp_path, fmt=2).preset == "fp8" and fake_vllm["quantization"] == "fp8"
+    assert build("vllm@fp8-kv", tmp_path, fmt=2).preset == "fp8-kv" and fake_vllm["kv_cache_dtype"] == "fp8"
     assert fake_vllm["max_logprobs"] == 255
 
 
@@ -88,13 +85,14 @@ def test_flags():
     assert a.vllm_preset == "default" and a.vllm_fast_prefill == "off"   # off until its gate passes
     a = parser().parse_args(["--mode", "vllm", "--vllm-preset", "fp8-kv", "--vllm-fast-prefill", "auto"])
     assert a.vllm_preset == "fp8-kv" and a.vllm_fast_prefill == "auto"
-    with pytest.raises(SystemExit):
-        parser().parse_args(["--mode", "vllm", "--vllm-preset", "nvfp4"])  # no NVFP4 preset
+    for name in ("nvfp4", "fp8"):  # no NVFP4 preset; load-time FP8 weights failed the automation gate
+        with pytest.raises(SystemExit):
+            parser().parse_args(["--mode", "vllm", "--vllm-preset", name])
 
 
 @pytest.mark.parametrize("mode", ["fast", "eager", "sglang"])
 def test_preset_needs_vllm(monkeypatch, mode):
-    monkeypatch.setattr(sys, "argv", ["basal-serve", "--mode", mode, "--vllm-preset", "fp8"])
+    monkeypatch.setattr(sys, "argv", ["basal-serve", "--mode", mode, "--vllm-preset", "fp8-kv"])
     monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
     with pytest.raises(SystemExit, match="--vllm-preset needs --mode vllm"):
         server_module.main()
@@ -135,8 +133,7 @@ def test_preset_reported_and_named():
 
 def test_media_engine_args():
     assert vllm_args(E4B, media=True)[0] == {"limit_mm_per_prompt": {"image": 8, "audio": 8, "video": 0}}
-    assert vllm_args(BF16, "fp8", media=True)[0] == {"quantization": "fp8",  # ultra: images, no audio encoder
-                                                     "limit_mm_per_prompt": {"image": 8, "audio": 0, "video": 0}}
+    assert vllm_args(BF16, media=True)[0] == {"limit_mm_per_prompt": {"image": 8, "audio": 0, "video": 0}}  # ultra
 
 
 def test_media_needs_an_encoder(tmp_path, fake_vllm):
@@ -199,38 +196,3 @@ def test_media_prompt_over_the_context(monkeypatch):
     be = media_backend(monkeypatch, generate)
     with pytest.raises(ValueError, match="the prompt with its media is 20000 tokens, more than the 16383 tokens"):
         be.run_media([[{"role": "user", "content": "a"}]], [[10, 11]], ["IMG"], [], 280, 16383)
-
-
-def test_async_engine(monkeypatch, tmp_path):
-    """--vllm-engine async: vLLM's AsyncLLM on a loop of its own; outputs in the order of the prompts, several server
-    calls in flight and no lock around them."""
-    import asyncio
-    made = {}
-
-    class Engine:
-        async def generate(self, r, sp, rid):
-            await asyncio.sleep(0.01 * (3 - r))  # later prompts finish first
-            yield f"partial {r}"
-            yield f"out {r} {rid.startswith('basal-')}"
-
-    class AsyncLLM:
-        @staticmethod
-        def from_engine_args(args):
-            made.update(args)
-            return Engine()
-    vllm = type(sys)("vllm")
-    vllm.AsyncEngineArgs = lambda **kw: kw
-    mod = type(sys)("vllm.v1.engine.async_llm")
-    mod.AsyncLLM = AsyncLLM
-    monkeypatch.setitem(sys.modules, "vllm", vllm)
-    monkeypatch.setitem(sys.modules, "vllm.v1.engine.async_llm", mod)
-    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda *_: None)
-    (tmp_path / "config.json").write_text(json.dumps(TEXT))
-    be = VLLMBackend(tmp_path, preset="fp8", engine="async")
-    assert made["quantization"] == "fp8" and made["disable_log_stats"] and made["enable_prefix_caching"]
-    assert be.inflight == VLLMBackend.ASYNC_INFLIGHT > 1 and VLLMBackend.inflight == 1
-    assert be.llm.generate([0, 1, 2], [None] * 3) == ["out 0 True", "out 1 True", "out 2 True"]
-    with be.lock, be.lock:  # no lock: calls overlap
-        pass
-    assert parser().parse_args(["--vllm-engine", "async"]).vllm_engine == "async"
-    assert parser().parse_args([]).vllm_engine == "offline"

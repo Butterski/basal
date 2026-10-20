@@ -12,8 +12,8 @@ Backends:
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
   MPSBackend        GraphBackend's shared prefix + token-budget batching on Apple MPS (PyTorch, no graphs)
-  VLLMBackend       vLLM: bf16 checkpoints, ModelOpt FP8 / NVFP4 ports, presets (FP8 weights, FP8 KV cache,
-                    batch-invariant kernels)
+  VLLMBackend       vLLM: bf16 checkpoints, ModelOpt FP8 / NVFP4 ports, presets (FP8 KV cache, batch-invariant
+                    kernels), basal-omni media
   SGLangBackend     SGLang offline engine (1.5): the same letter readout from the log-probabilities of the option tokens
   MLXBackend        Apple Silicon, MLX / mlx-lm (1.5): MLX fp8 / fp4 exports or bf16 weights (optional 8-bit at load
                     time); shared-prefix KV cache
@@ -1532,18 +1532,18 @@ class MPSBackend(GraphBackend):
 
 
 VLLM_PRESETS = {
-    # --vllm-preset: (FP8 weights quantised at load time for a bf16 checkpoint, KV cache dtype, repeatable)
-    "default": (False, "auto", False),       # the checkpoint's own weights (bf16, or a ModelOpt FP8 / NVFP4 port)
-    "fp8": (True, "auto", False),            # FP8 weights: a -FP8 checkpoint as it is, a bf16 one quantised at load
-    "fp8-kv": (False, "fp8", False),         # keys and values cached in FP8 (twice the states), the checkpoint's own
-                                             # weights: FP8 weights and KV cache with a -FP8 checkpoint
-    "deterministic": (False, "auto", True),  # batch-invariant kernels, no prefix cache: answers independent of load
+    # --vllm-preset: (KV cache dtype, repeatable); the weights are always the checkpoint's own (bf16, or a ModelOpt
+    # FP8 / NVFP4 port): bf16 weights quantised to FP8 at load time cost basal-omni 0.5-9.5 points of automation at 1%
+    "default": ("auto", False),
+    "fp8-kv": ("fp8", False),          # keys and values cached in FP8: twice the states (with a -FP8 checkpoint: FP8
+                                       # weights and KV cache)
+    "deterministic": ("auto", True),   # batch-invariant kernels, no prefix cache: answers independent of load
 }
 
 
 def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
     """vLLM engine arguments and environment of a --vllm-preset for a model's config.json -> (kwargs, env).
-    A checkpoint quantised already (ModelOpt FP8 / NVFP4: quantization_config) keeps its own weights. fast_prefill:
+    fast_prefill:
     models whose last layers reuse earlier layers' keys and values (Gemma 4 E2B / E4B: num_kv_shared_layers) run those
     layers at the answer position only during prefill (vLLM's kv_sharing_fast_prefill, YOCO); the generated token, the
     only one basal reads, is the same, prompt log-probabilities would not be. media (--media on): at most
@@ -1552,11 +1552,9 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
     (FlashAttention instead of Triton + FlashAttention) and keeps fewer KV tokens (mini: 911k instead of 978k)."""
     if preset not in VLLM_PRESETS:
         raise ValueError(f"unknown --vllm-preset {preset!r} (one of: {', '.join(VLLM_PRESETS)})")
-    fp8, kv, invariant = VLLM_PRESETS[preset]
+    kv, invariant = VLLM_PRESETS[preset]
     text = cfg.get("text_config") or cfg
     kw, env = {}, {}
-    if fp8 and "quantization_config" not in cfg and "quantization_config" not in text:
-        kw["quantization"] = "fp8"
     if kv != "auto":
         kw["kv_cache_dtype"] = kv
         if text.get("attention_k_eq_v"):  # Gemma 4 12B / 31B (values = keys): vLLM 0.31's FlashAttention with an FP8
@@ -1576,39 +1574,6 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
     return kw, env
 
 
-class AsyncVLLM:
-    """vLLM's AsyncLLM on an event loop of its own (a daemon thread), with LLM.generate's call: every prompt is a
-    request of its own, so the prompts of several server calls share the engine's steps (continuous batching) instead
-    of one call waiting for the previous one to finish."""
-
-    def __init__(self, **kw):
-        import asyncio
-        import itertools
-        from vllm import AsyncEngineArgs
-        from vllm.v1.engine.async_llm import AsyncLLM
-        self.loop = asyncio.new_event_loop()
-        threading.Thread(target=self.loop.run_forever, daemon=True, name="vllm-async").start()
-
-        async def make():  # the engine's output handler runs on this loop
-            return AsyncLLM.from_engine_args(AsyncEngineArgs(disable_log_stats=True, **kw))
-        self.engine = asyncio.run_coroutine_threadsafe(make(), self.loop).result()
-        self.ids = itertools.count()
-
-    def generate(self, reqs, sps, use_tqdm=False):
-        """[RequestOutput] in the order of reqs (the final output of each request)."""
-        import asyncio
-
-        async def one(r, sp):
-            out = None
-            async for out in self.engine.generate(r, sp, f"basal-{next(self.ids)}"):
-                pass
-            return out
-
-        async def every():
-            return await asyncio.gather(*[one(r, sp) for r, sp in zip(reqs, sps)])
-        return asyncio.run_coroutine_threadsafe(every(), self.loop).result()
-
-
 class VLLMBackend:
     """vLLM backend: bf16 checkpoints and the ModelOpt FP8 / NVFP4 ports, with the engine settings of a --vllm-preset
     (VLLM_PRESETS, vllm_args). One generated token restricted to the option letters; with
@@ -1622,12 +1587,11 @@ class VLLMBackend:
     CUDA (processed log-probabilities) are exactly the allowed codes."""
 
     LOGPROB_TOKEN_IDS = 128  # longest logprob_token_ids list vLLM accepts
-    ASYNC_INFLIGHT = 8  # --vllm-engine async: server calls in flight at once
-    lock = threading.Lock()  # offline engine: one vLLM call at a time (text batches, media requests); a class default
-    media_kinds, max_audio_s, inflight = (), None, 1
+    lock = threading.Lock()  # one vLLM call at a time (text batches and media requests); a class default for tests
+    media_kinds, max_audio_s = (), None
 
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
-                 fast_prefill=False, media=False, engine="offline"):
+                 fast_prefill=False, media=False):
         import os
         cfg_file = Path(model_dir) / "config.json"
         cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
@@ -1644,14 +1608,10 @@ class VLLMBackend:
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.prefill = PREFILL
         self.preset, self.engine_args, self.lock = preset, kw, threading.Lock()
-        if engine == "async":  # several server calls at once, each prompt a request of its own (AsyncVLLM)
-            import contextlib
-            make, self.lock, self.inflight = AsyncVLLM, contextlib.nullcontext(), self.ASYNC_INFLIGHT
-        else:
-            from vllm import LLM as make
-        self.llm = make(**{**dict(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
-                                  enable_prefix_caching=True, logprobs_mode="processed_logprobs",
-                                  max_logprobs=max(16, max_options)), **kw})
+        from vllm import LLM
+        self.llm = LLM(**{**dict(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
+                                 enable_prefix_caching=True, logprobs_mode="processed_logprobs",
+                                 max_logprobs=max(16, max_options)), **kw})
         self.context = max_len - 1  # longest prompt: max_model_len holds the one generated token too
         self.context_reason = f"vLLM's --max-len {max_len}"
 

@@ -619,8 +619,7 @@ class Server:
         if getattr(a, "batches", "default") not in ("default", "auto") and kind not in ("graph", "exit"):
             raise SystemExit("--batches needs the CUDA graph engine (fast, fast-nocompile, fast-exit, fp8, nvfp4)")
         if getattr(a, "vllm_preset", "default") != "default" and kind != "vllm":
-            raise SystemExit("--vllm-preset needs --mode vllm (the CUDA graph engine has --quant fp8 and "
-                             "--deterministic)")
+            raise SystemExit("--vllm-preset needs --mode vllm (the CUDA graph engine has --deterministic)")
         attn = getattr(a, "attn", "auto")
         if attn not in ("auto", "fa2") and kind not in ("graph", "exit"):
             raise SystemExit(f"--attn {attn} needs the CUDA graph engine (--mode fast, fast-nocompile, fast-exit, fp8, "
@@ -645,8 +644,7 @@ class Server:
             self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options,
                                        preset=getattr(a, "vllm_preset", "default"),
                                        fast_prefill=getattr(a, "vllm_fast_prefill", "off") == "auto",
-                                       media=getattr(a, "media", "off") == "on",
-                                       engine=getattr(a, "vllm_engine", "offline"))
+                                       media=getattr(a, "media", "off") == "on")
         elif kind == "sglang":
             self.backend = SGLangBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len)
         elif kind == "mlx":
@@ -1266,16 +1264,11 @@ def add_engine_args(ap):
                     help="on = the whole request (every question and option order) is one packed row over the state")
     ap.add_argument("--gpu-memory", dest="gpu_memory", type=float, default=0.6, help="vLLM memory fraction")
     ap.add_argument("--vllm-preset", dest="vllm_preset", choices=list(VLLM_PRESETS), default="default",
-                    help="--mode vllm: default = the checkpoint's own weights; fp8 = FP8 weights (a bf16 checkpoint "
-                         "quantised at load time, a -FP8 checkpoint as it is); fp8-kv = an FP8 KV cache (twice the "
-                         "tokens of state) on the checkpoint's own weights (with a -FP8 checkpoint: FP8 weights and KV "
-                         "cache); deterministic = batch-invariant kernels and no prefix cache "
+                    help="--mode vllm: default = as 2.2; fp8-kv = an FP8 KV cache (twice the tokens of state; with "
+                         "a -FP8 checkpoint: FP8 weights and KV cache); deterministic = batch-invariant kernels and no "
+                         "prefix cache "
                          "(VLLM_BATCH_INVARIANT: answers independent of the other requests, lower throughput). Loads "
                          "CALIBRATION.vllm.<preset>.json when the model ships one, else CALIBRATION.vllm.json")
-    ap.add_argument("--vllm-engine", dest="vllm_engine", choices=["offline", "async"], default="offline",
-                    help="--mode vllm: offline = one vLLM call at a time (each takes the requests waiting); async = "
-                         "vLLM's AsyncLLM, every prompt a request of its own and several calls in flight (continuous "
-                         "batching across requests)")
     ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="off",
                     help="--mode vllm: auto = layers that reuse earlier layers' keys and values (Gemma 4 E2B / E4B) "
                          "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill; off by "
