@@ -87,6 +87,14 @@ the basal-1.5 benchmark table ([v1.5.0 README](https://github.com/rkinas/basal/t
 the GPU of an Apple Silicon Mac (install `basal[mlx]`). The state of a request is computed once into a KV cache shared
 by all its questions and option orders.
 
+`--mlx-packed` (opt-in, off by default) runs a group of a Llama model (basal-1.x, 2.x) whose state and option orders fit
+in 512 tokens as one packed forward instead: the state once, then every option order, with explicit positions and a
+mask that lets each order see the state and itself only; several groups share one forward. Groups that do not fit,
+Gemma 4 (basal-omni) and RoPE variants whose frequencies depend on the sequence length (dynamic, yarn, longrope) keep
+the KV cache. In fp32 the decisions equal the KV-cache path; in bf16 and 8-bit the probabilities move slightly (a
+different summation order), and the shipped `CALIBRATION.mlx.json` was fitted on the default path, so check
+`--mlx-packed` against it before relying on the calibrated thresholds.
+
 - `-MLX-8bit`: affine 8-bit decoder weights (group 64, a bf16 scale and bias per group);
 - `-MLX-fp4`: MLX `nvfp4` decoder weights (4-bit floating point E2M1, group 16, FP8 scales);
 - in both, the token embeddings and the output head stay in bf16, because the decision is read from the output head's
