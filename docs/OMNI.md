@@ -30,10 +30,40 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 
 ## What the engine does differently for Gemma 4
 
-- **Attention kernel:** SDPA runs on the math kernel only. The memory-efficient kernel returned wrong attention on
-  real Gemma 4 activations in some shapes, and FlashAttention does not take Gemma's 512-wide global heads.
-- **Padding:** left-padded prompts in a batch read at their own positions, so a padded prompt gives the same answer as
-  the prompt alone.
+- **`eager` (basal 2.3):** Gemma 4 runs through the engine's own forward (`basal/gemma4.py`: transformers' modules and
+  weights in the engine's loop; `--eager-forward hf` keeps the transformers forward of 2.2):
+  - **The state once (SOAM).** The prompts of a request share their beginning: chat template, media and state (with
+    `--soam on`, the default, every question and option order of the request). It runs once into keys and values, and
+    every question then runs over them, positions continuing after the state. Sliding-window layers keep only the last
+    511 (mini) or 1,023 (max, ultra) keys of the state, all that a later token can see.
+  - **Answer rows only.** mini reuses the keys and values of earlier layers in its last 18 of 42 layers, so those
+    layers matter only where the answer is read. They run at that one position per prompt, and so do the attention
+    and MLP of the last layer with its own keys and values (on max and ultra, the last layer); a state stops after
+    that layer's keys and values.
+  - **Media once per request.** The image and audio encoders run once per request and the soft tokens are part of the
+    shared beginning. The soft tokens of one image attend to each other as transformers builds the masks: on max and
+    1.1-max (Gemma 4 unified) in every layer, on ultra in the sliding-window layers within the window.
+  - **Attention kernel:** SDPA's math kernel, as in 2.2. The memory-efficient kernel returned wrong attention in 2.2's
+    transformers forward of max: it was given an expanded (zero-stride) view of the one global key / value head, which
+    torch before 2.14.1 reads wrong at query lengths = 1 mod 32 (pytorch/pytorch#191937). Since 2.3 `--mode eager`
+    runs the transformers forward of every model without that kernel on such torch versions.
+  - **Padding:** the prompts of a batch are padded on the right and read at their last real token, so a padded prompt
+    gives the answer it gives alone.
+
+  Measured 2026-10-20 on one H100 against `--eager-forward hf` of the same engine (dev v2, 10,606 decisions, one
+  option order; automated share at 1% on the calibration test split, each forward with its own calibration fit,
+  paired bootstrap; `basal-loadtest` at 16 in flight: one question over a ~1.5k-token state, and five questions over
+  3k-10k-token states):
+
+  | model | agreement (all / at margin >= 0.2) | accuracy | ECE | automated at 1% | decisions/s, one question | questions/s, five over a long state |
+  |---|---|---|---|---|---|---|
+  | mini | 0.9982 / 1.0000 | -0.06 pt | +0.001 | 41.82% (2.2: 41.99%) | 17.2 (2.2: 10.0) | 15.3 (2.2: 1.6) |
+  | max | 0.9994 / 0.9997 | -0.01 pt | +0.000 | 47.35% (2.2: 47.39%) | 5.0 (2.2: 4.8) | 4.5 (2.2: 0.7) |
+
+  With both option orders (`--orders 2`, every decision over the shared question) agreement is 0.9980 / 1.0000 on
+  mini and 0.9953 / 0.9999 on max. The disagreements are close calls (eager's margin under 0.05 on mini); the
+  transformers forward agrees with itself to 1.0000 when only its batching changes, and both forwards are equally far
+  from an fp32 forward (mini, 2,000 items: mean |Δp| 0.0036 and 0.0037).
 - **Code logits:** option codes are read in fp32 from the output head's input, with Gemma's final logit softcap
   applied in fp32. The model body runs in bf16.
 - **`fast` and `fast-nocompile` (basal 2.3, text):** the CUDA graph engine runs Gemma 4 through its own layer code
@@ -147,9 +177,14 @@ move too many close decisions.
 and its processor (install `basal[media]`: pillow, soundfile, scipy, torchvision matching torch). A request may then
 carry `"media": [{"type": "image" | "audio", "data": "<base64>"}]`, `"detail": "default" | "high"` (280 or 1,120
 image tokens) and `"lang": "pl" | "en"`; see `basal/media.py` for the formats and limits. The media go where the state
-text goes, before it (`prompt.media_messages`), the prompt the basal-omni evaluation reads media with. Each prompt
-runs alone (no batching); text requests on the same server take the unchanged text path. Answers carry
-`"calibration": "text"`, and `usage.media` counts the items and their tokens.
+text goes, before it (`prompt.media_messages`), the prompt the basal-omni evaluation reads media with. Since 2.3 the
+image and audio encoders run once per request and the media and state run once for all its questions (above).
+Answers carry `"calibration": "text"`, and `usage.media` counts the items and their tokens.
+
+Checked 2026-10-20 on one H100 against `--eager-forward hf` (150 images and 150 audio clips of omni-probe-pl, one
+question per request and three questions over the same media): the same top answer on every decision with a margin
+of at least 0.2 (mini and max), 1,199 of 1,200 overall on max and all on mini, largest |Δp| 0.036; median latency of a
+three-question request 328 -> 194 ms (mini), 204 -> 131 ms (max).
 
 Checked 2026-10-10 on Gemma 4 E4B and 12B: served answers against the fp32 readout of the same model
 on 1,800 text items, 120 prompts over 2,048 tokens, 310 images, 285 audio clips and their text twins; every split is

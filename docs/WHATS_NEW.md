@@ -1,5 +1,18 @@
 # What is new in basal 2.3 (not released yet)
 
+- **basal-omni in `--mode eager` computes a request's state once for all its questions.** The eager backend runs
+  Gemma 4 through the engine's own forward (`basal/gemma4.py`, transformers' modules and weights): a request's state
+  and media run once and every question and option order runs over them, the image and audio encoders once per
+  request, and mini's 18 KV-sharing layers only where the answer is read. On one H100 at 16 requests in flight, five
+  questions over a 3k-10k-token state: mini 1.6 -> 15.3 questions/s, max 0.7 -> 4.5; one question: mini 10.0 -> 17.2
+  decisions/s. Agreement with the 2.2 forward on dev v2: 1.000 (mini) and 0.9997 (max) on decisions with margin >=
+  0.2. `--eager-forward hf` keeps the 2.2 path. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+- **`--mode eager` avoids a torch attention bug.** Before torch 2.14.1, SDPA's memory-efficient kernel returns wrong
+  attention for keys and values expanded from one key / value head at some query lengths (pytorch/pytorch#191937):
+  transformers passes such a view with an attention mask, and basal-omni-1.0-max was off by 6.2 in code log-prob on a
+  1,857-token prompt. The eager backend now runs every model's transformers forward without that kernel on CUDA with
+  older torch (2.2 did so for Gemma 4 only).
+
 - **basal-omni in the CUDA graph engine** (`--mode fast`, `fast-nocompile`). Gemma 4 runs through the engine's own
   layer code: SOAM's packed row and two passes over its sliding-window and global layers (the window is a condition on
   positions inside the trie mask), key / value buffers per layer type, E4B's KV-shared layers and the last own-key
