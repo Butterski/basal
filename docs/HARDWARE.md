@@ -349,7 +349,14 @@ folder; agreement is therefore against the same bf16 reference as the other rows
 
 Two more runs for basal-2.0 (4.5B): `mlx` 133.8 / 134.6 ms, `mps` 72.6 / 72.5 ms (2 orders). With two option orders,
 `mlx` at v2.2.0 is slower than at `3fa2eea` on this machine (basal-1.0-4.5B: 115.6 vs 65.7 ms; one order: 68.0 vs
-62.3 ms), so on v2.2.0 `mps` is the faster route for two orders on the M5 Max.
+62.3 ms), so on v2.2.0 `mps` is the faster route for two orders on the M5 Max. Reproduced on an Apple M4 Pro
+(`basal-bench --modes mlx`, 2 orders, `3fa2eea` against v2.2.0 and 2.3.1): basal-1.0-1.5B 126 vs 149 ms (two runs each;
+one order 95-99 ms in both), basal-1.0-4.5B 388 vs 506 ms (one run; one order 295 vs 339 ms). The cause is the
+backend: when #4 was merged into basal 1.5 (`4c11a87`), the `mlx` backend of 1.5 replaced the one of #4. It runs the
+prefix that the two orders share as one forward into a KV cache and both option blocks as a second forward, where #4
+ran the prefix and both blocks as one packed forward, and every forward reads all the weights again. A packed forward
+for the Llama-based models brought the 1.5B back to 124 ms in a test, but it changed probabilities (up to 0.045 with
+8-bit weights) and was slower than two forwards for prompts over about 900 tokens, so 2.3.1 keeps the 1.5 backend.
 
 - **Same generation, twice the GPU cores** (M5 Max 40 vs M5 Pro 20, basal-1.0 at `3fa2eea`, 2 orders): bf16 and 8-bit
   modes are 1.35–1.63× faster, `eager-fp32` 1.71–1.88×; the 1.5B gains less than the 4.5B.
