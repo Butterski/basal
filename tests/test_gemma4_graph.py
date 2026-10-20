@@ -99,6 +99,30 @@ def test_two_passes_equal_separate(kind):
         assert torch.allclose(torch.tensor(r), e, atol=1e-6)
 
 
+def test_attention_never_reaches_memory_efficient_sdpa(monkeypatch):
+    """Every SDPA call of the Gemma 4 forward (plain rows, readout rows, both passes, the long lane) runs with the math
+    backend only, grouped key / value heads unexpanded: memory-efficient SDPA reads wrong keys from expanded
+    (zero-stride) heads (every global layer of 12B wrong, the 7 Oct bug); flex and FlashAttention 3 take grouped heads
+    natively."""
+    import torch.nn.functional as F
+    calls, real = [], F.scaled_dot_product_attention
+
+    def spy(q, k, *a, **kw):
+        b = torch.backends.cuda
+        calls.append((b.mem_efficient_sdp_enabled(), b.flash_sdp_enabled(), b.cudnn_sdp_enabled(),
+                      k.shape[1] < q.shape[1] and kw.get("enable_gqa")))
+        return real(q, k, *a, **kw)
+    monkeypatch.setattr(F, "scaled_dot_product_attention", spy)
+    m = tiny("31b", torch.float32)
+    be = Stub(m)
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
+    toks = [state + [20, 21, 30 + o, 31 - o] for o in range(2)]
+    be.run_shared([(toks, [[7, 8], [7, 8]])])
+    be.run_long([(toks, [[7, 8], [7, 8]])])
+    be.gemma.forward(torch.tensor([toks[0]]), ro=torch.tensor([[3, 15]]))
+    assert calls and all(c == (False, False, False, True) for c in calls)
+
+
 def test_moe_not_supported():
     cfg = Gemma4TextConfig(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                            num_attention_heads=2, num_key_value_heads=1, head_dim=16, enable_moe_block=True,
