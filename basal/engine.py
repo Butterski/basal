@@ -87,7 +87,8 @@ class EagerBackend:
     media_lock = threading.Lock()
     g4 = None  # basal/gemma4.py: the own Gemma 4 forward (shared prefixes, answer rows), None = the transformers forward
 
-    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False, forward=None):
+    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False, forward=None, ple_offload=False,
+                 attn="auto"):
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.padding_side = "left"
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
@@ -108,11 +109,17 @@ class EagerBackend:
             self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
             _memo_media(self.proc)
         self.lock, self.media_lock = threading.Lock(), threading.Lock()
-        self.model = cls.from_pretrained(model_dir, dtype=getattr(torch, dtype)).to(dev).eval()
+        self.model = cls.from_pretrained(model_dir, dtype=getattr(torch, dtype))
+        if ple_offload:  # --ple-offload on (Gemma 4 E2B / E4B): the per-layer embedding table stays in host memory
+            from .gemma4 import offload_ple
+            if not offload_ple(self.model):
+                raise SystemExit("--ple-offload on: the model has no per-layer embeddings (Gemma 4 E2B / E4B)")
+        self.model = self.model.to(dev).eval()
         from .gemma4 import is_gemma4
         if is_gemma4(self.model):
-            # Gemma 4 (basal-omni): SDPA's memory-efficient kernel returned wrong attention on real activations in some
-            # shapes (omni kernel check 2026-10-07); the math kernel equals eager attention there
+            # Gemma 4 (basal-omni): SDPA's memory-efficient kernel returned wrong attention on real activations (omni
+            # kernel check 2026-10-07: expanded keys / values at query lengths = 1 mod 32, pytorch/pytorch#191937, as
+            # the transformers forward passes max's one global KV head); the math kernel equals eager attention there
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
             torch.backends.cuda.enable_cudnn_sdp(False)
@@ -123,8 +130,8 @@ class EagerBackend:
             if forward not in EAGER_FORWARDS:
                 raise ValueError(f"eager forward {forward!r} (one of {', '.join(EAGER_FORWARDS)})")
             if forward == "basal":
-                from .gemma4 import Gemma4Forward
-                self.g4 = Gemma4Forward(self.model)
+                from .gemma4 import Gemma4Forward, attention_plan
+                self.g4 = Gemma4Forward(self.model, attn=attention_plan(attn))
         self.dev = dev
         self.prefill = PREFILL
         # option-code logits in fp32, as in GraphBackend._rows: the output head's input (the normalised last hidden
