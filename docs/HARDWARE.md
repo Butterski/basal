@@ -271,7 +271,7 @@ HTTP: `basal-loadtest` against `basal-serve --mode mlx` (default prompts of the 
 - **Compute-bound.** About 90% of the forward time is in the linear layers, which MLX runs at 10–12 TFLOPS in bf16 on
   the M4 Max; bf16, fp16 and fp32 differ little, larger batches do not raise throughput, and `mx.compile` gave no
   speed-up (so the `mlx` backend pads only to the longest prompt of a batch instead of to fixed shape buckets). Other
-  M-series chips were not measured; being compute-bound, latency should scale roughly with GPU core count and clock.
+  M-series chips were not measured in that run (an M5 Max is below); being compute-bound, latency should scale roughly with GPU core count and clock.
 - **8-bit weights** (`mlx-q8`, MLX affine, group 64, decoder layers only) cut the resident weights of the 4.5B from
   8.9 to 4.8 GB (the checkpoint is loaded lazily, so the bf16 copy is never held); 0–10% slower.
 - **4-bit weights** were tried and dropped: agreement fell to 0.86 on the 1.5B without any speed gain.
@@ -287,7 +287,8 @@ macOS 27.0.1, Python 3.12.2, torch 2.14.1 (MPS), MLX 0.32.4, mlx-lm 0.32.2; on m
 modes measured back to back. Agreement with `eager-fp32` (PyTorch MPS, fp32) on the same machine; GB: peak memory
 (MLX: allocator peak, MPS: memory held by the Metal driver).
 
-**basal-1.0**, at commit `3fa2eea` (the commit of the M5 Pro measurement in #7, so the two chips compare one to one):
+**basal-1.0**, at commit `3fa2eea`, the merge of #4: the same `mlx` backend as the M4 Max table above, and the commit of
+the M5 Pro measurement in #7, so the three chips compare one to one:
 
 | model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy | GB |
 |---|---|---|---|---|---|---|---|
@@ -302,8 +303,10 @@ modes measured back to back. Agreement with `eager-fp32` (PyTorch MPS, fp32) on 
 
 Two more runs of `--modes mps mlx` for the 4.5B: `mlx` 71.6 / 73.3 ms, `mps` 86.7 / 88.3 ms (2 orders).
 
-**basal-2.0**, at v2.2.0 (`e49665c`); `mps` in bf16, `mlx` with the `-MLX-8bit` ports (`basal-bench` takes one
-`--model`, so the `mlx` mode was run from the `-MLX-8bit` folder with the bf16 `eager-fp32` run as reference):
+**basal-2.0**, at v2.2.0 (`e49665c`); `mps` in bf16, `mlx` with the `-MLX-8bit` ports. `basal-bench` takes one
+`--model`, so these rows come from a single run of `basal.bench.main()` (unchanged) in which only the `mlx` mode loads
+its weights from the `-MLX-8bit` folder and every other mode, including the `eager-fp32` reference, from the bf16
+folder; agreement is therefore against the same bf16 reference as the other rows. The 20-line wrapper is in #18.
 
 | model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy | GB |
 |---|---|---|---|---|---|---|---|
@@ -320,7 +323,7 @@ Two more runs for basal-2.0 (4.5B): `mlx` 133.8 / 134.6 ms, `mps` 72.6 / 72.5 ms
 
 - **Same generation, twice the GPU cores** (M5 Max 40 vs M5 Pro 20, basal-1.0 at `3fa2eea`, 2 orders): bf16 and 8-bit
   modes are 1.35–1.63× faster, `eager-fp32` 1.71–1.88×; the 1.5B gains less than the 4.5B.
-- **Same core count, newer generation** (M5 Max vs M4 Max, both 40 cores): bf16 modes are 2.8–4.1× faster,
+- **Same core count, newer generation** (M5 Max vs M4 Max, both 40 cores): bf16 modes are 2.8–4.0× faster,
   `eager-fp32` 1.5–1.7×. On the M5 Max bf16 is 3.4–4.8× faster than fp32.
 
 #### Inference engines on Apple Silicon
