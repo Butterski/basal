@@ -23,6 +23,7 @@ Backends:
   TPUBackend        (basal/tpu.py, extra basal[tpu]; experimental) the same SOAM packing in JAX / XLA on Google TPU
 """
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -498,6 +499,12 @@ class GraphBackend(EagerBackend):
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
                  readout_layer="off", template="off", gemma_attn="auto"):
         torch.backends.cuda.enable_cudnn_sdp(False)  # before capture: a captured graph keeps its attention kernel
+        from . import gemma4_graph
+        if gemma4_graph.is_gemma4_dir(model_dir):
+            # every captured graph keeps its own cuBLAS workspace (32 MB on an H100): basal-omni-1.1-max's ~400 graphs
+            # held 37 GB of graph pool and ran out of memory in warm-up; 8 MB workspaces made no difference to its
+            # forwards (1.1-max, H100, 20 Oct). Read when the first cuBLAS handle is made, so set before any GEMM
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:2")
         self.fp8_checkpoint = modelopt_fp8(model_dir)  # the -FP8 repositories: FP8 weights with static scales
         # likewise: the kernel of the causal forwards (--attn; auto keeps FlashAttention 2 for FP8 GEMMs)
         self.attn = set_attention(attn, fp8=self.fp8_checkpoint or quant == "fp8")
@@ -511,7 +518,6 @@ class GraphBackend(EagerBackend):
             self.model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=getattr(torch, dtype)).cuda().eval()
         self.dev = next(self.model.parameters()).device
         self.prefill = PREFILL
-        from . import gemma4_graph
         if gemma4_graph.is_gemma4(self.model):
             self._gemma_init(gemma_attn, quant, compile, merge)
         else:
@@ -558,6 +564,10 @@ class GraphBackend(EagerBackend):
             quantize(self.model, quant, gemma4_graph.text_model(self.model).layers)
         if kernels == "auto":
             kernels = "math"
+        # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
+        # agreement with eager 0.998-0.999 on dev v2, mini and 1.1-max); the compiled forward comes with the flex /
+        # fa3 kernels
+        compile = compile and kernels != "math"
         # merged projections: bf16 linears only (an FP8 checkpoint's FP8Linear layers keep theirs); not with torchao,
         # which would quantise the modules but not the merged copies the forward reads
         self.gemma = gemma4_graph.Gemma4Graph(self.model, kernels, compile=compile, merge=merge is True and not quant)

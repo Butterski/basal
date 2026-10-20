@@ -45,6 +45,17 @@ def is_gemma4(model):
     return str(getattr(model.config, "model_type", "")).startswith("gemma4")
 
 
+def is_gemma4_dir(model_dir):
+    """A model directory with a Gemma 4 config.json (before loading it)."""
+    import json
+    from pathlib import Path
+    p = Path(model_dir) / "config.json"
+    try:
+        return str(json.loads(p.read_text()).get("model_type", "")).startswith("gemma4")
+    except (OSError, ValueError):
+        return False
+
+
 def supports(model):
     """None if this forward runs the model, else why not (the MoE layers of 26B-A4B are not ported)."""
     if not is_gemma4(model):
@@ -109,8 +120,6 @@ class Gemma4Graph:
         if kernels.get("full_attention") == "fa3":
             raise ValueError("fa3 runs the sliding-window layers only (FlashAttention 3 takes heads up to 256 wide)")
         self.flex = any(k != "math" for k in kernels.values())  # fa3 is flex where a mask is needed
-        self._bm = {}  # block masks of the plain rows per (length, layer type), for graph_lens
-        self.graph_lens = set()  # the lengths of the plain graphs (GraphBackend sets them)
         self.qkv, self.gu = {}, {}  # merged projections per layer: (linear, output sizes)
         self.merged = self._merge() if merge else 0
         if compile:
@@ -283,31 +292,24 @@ class Gemma4Graph:
         """FlexAttention block mask of a plain causal row of length L for layer type t (no batch dimension: the same
         for every row), built from block arithmetic (create_block_mask evaluates all L x L pairs: 2.5 GB at 50k
         tokens): key block j is visible from query block i when 0 <= i - j <= dmax (the window), and full (no mask
-        evaluated) when 1 <= i - j <= fmax. Cached for the graph lengths."""
-        key = (L, t)
-        if key in self._bm:
-            return self._bm[key]
+        evaluated) when 1 <= i - j <= fmax. Built inside the forward, so a compiled forward reads L as a symbolic
+        size (a cached mask made outside fixed L in its guards: a recompile for every graph length)."""
         from torch.nn.attention.flex_attention import BlockMask
         W, Bk = self._window(t), self.BLOCK
         n = -(-L // Bk)
-        dmax, fmax = ((W + Bk - 2) // Bk, (W - Bk) // Bk) if W else (n, n)
-        width = min(dmax, n - 1) + 1
-        d = torch.arange(width, device=dev)[None]
-        j = torch.arange(n, device=dev)[:, None] - d                  # [n, width]: key blocks i, i - 1, ...
-        full = (j >= 0) & (d >= 1) & (d <= fmax)
-        part = (j >= 0) & ~full
+        cols = torch.arange(n, device=dev)[None]
+        d = torch.arange(n, device=dev)[:, None] - cols               # [n, n]: query block - key block
+        vis = (d >= 0) & (d <= (W + Bk - 2) // Bk) if W else d >= 0
+        full = (d >= 1) & (d <= (W - Bk) // Bk) if W else d >= 1
+        part = vis & ~full
 
-        def pack(sel):  # selected key blocks first, ascending; one column per key block (BlockMask's layout)
-            idx = torch.where(sel, j, n).sort(1).values.clamp(max=n - 1)
-            idx = torch.cat([idx, idx[:, -1:].expand(n, n - width)], 1)
-            return sel.sum(1).to(torch.int32)[None, None], idx.to(torch.int32)[None, None].contiguous()
+        def pack(sel):  # selected key blocks first, ascending
+            idx = torch.where(sel, cols, n).sort(1).values.clamp(max=n - 1)
+            return sel.sum(1).to(torch.int32)[None, None], idx.to(torch.int32)[None, None]
 
         def mod(b, h, q, kv):
             return (q >= kv) & (q - kv < W) if W else q >= kv
-        bm = BlockMask.from_kv_blocks(*pack(part), *pack(full), BLOCK_SIZE=Bk, mask_mod=mod, seq_lengths=(L, L))
-        if L in self.graph_lens:
-            self._bm[key] = bm
-        return bm
+        return BlockMask.from_kv_blocks(*pack(part), *pack(full), BLOCK_SIZE=Bk, mask_mod=mod, seq_lengths=(L, L))
 
     def _dense_block(self, B, Lq, Lk, mod, dev):
         """A block mask that visits every (query block, key block) pair, each evaluated with mod: its block lists do
@@ -348,8 +350,7 @@ class Gemma4Graph:
     # -- the forward --------------------------------------------------------------------------------------------------
     def _masks(self, kernels, L, pos, prefix, mask, ro):
         """The attention masks of one forward per layer type, for every query and for the readout rows ro: boolean
-        masks for "math", block masks for "flex", ("fa3", window) for FlashAttention 3 over plain rows. Built
-        outside the compiled forward (a CUDA graph keeps them)."""
+        masks for "math", block masks for "flex", ("fa3", window) for FlashAttention 3 over plain rows."""
         from .lean import TreeMask
         dev, types = pos.device, set(self.types)
         math = [t for t in types if kernels[t] == "math"]
@@ -381,12 +382,13 @@ class Gemma4Graph:
                 m_ro[t] = self._tree_block(mask, pos, P, t, ro)
         return m_all, m_ro
 
-    def _run(self, ids, pos, m_all, m_ro, kv=None, prefix=None, ro=None, between=None):
-        """ids / pos [b, L]; m_all / m_ro: the masks per layer type of every query and of the readout rows (_masks;
-        the kernel follows the mask); kv: per own layer (K, V) buffers [b, kv heads, L, d] that receive this pass's
-        keys and values (pass 1); prefix: per own layer (K, V) [b, kv heads, P, d] the rows continue (pass 2); ro
-        [b, R]: readout positions -> final hidden states [b, R, D] (None: every position, [b, L, D]); between(i) is
-        called before layer i (the long lane)."""
+    def _run(self, kernels, ids, pos, kv=None, prefix=None, mask=None, ro=None, between=None):
+        """kernels: per layer type; ids / pos [b, L]; kv: per own layer (K, V) buffers [b, kv heads, L, d] that receive
+        this pass's keys and values (pass 1); prefix: per own layer (K, V) [b, kv heads, P, d] the rows continue (pass
+        2) with mask (the trie: additive, or a TreeMask for flex); ro [b, R]: readout positions -> final hidden states
+        [b, R, D] (None: every position, [b, L, D]); between(i) is called before layer i (the long lane). The masks
+        of every query and of the readout rows are built here (_masks; the kernel follows the mask)."""
+        m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro)
         h = self.lm.embed_tokens(ids)
         pli = self.lm.project_per_layer_inputs(h, self.lm.get_per_layer_inputs(ids, None)) if self.ple else None
         types = set(self.types)
@@ -440,8 +442,7 @@ class Gemma4Graph:
         L = ids.shape[1]
         pos = torch.arange(L, device=ids.device)[None].expand(ids.shape[0], L)
         compiled = compiled and between is None
-        m_all, m_ro = self._masks(self.kernels, L, pos, None, None, ro)
-        return (self.run if compiled else self._run)(ids, pos, m_all, m_ro, kv=kv, ro=ro, between=between)
+        return (self.run if compiled else self._run)(self.kernels, ids, pos, kv=kv, ro=ro, between=between)
 
     @torch.no_grad()
     def forward_suffix(self, ids, mask, pos, prefix, ro=None, compiled=True):
@@ -449,5 +450,4 @@ class Gemma4Graph:
         mask (additive [b, 1, S, P + S], 0 = visible; a TreeMask for flex) -> [b, R, D] at ro [b, R] (None: all)."""
         from .lean import TreeMask
         kernels = self._kernels(dense=not isinstance(mask, TreeMask))
-        m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro)
-        return (self.run if compiled else self._run)(ids, pos, m_all, m_ro, prefix=prefix, ro=ro)
+        return (self.run if compiled else self._run)(kernels, ids, pos, prefix=prefix, mask=mask, ro=ro)
