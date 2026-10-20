@@ -45,6 +45,8 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
     if mode in ("tpu", "tpu-fp32"):  # Google TPU (basal[tpu]); tpu-fp32: the same engine in fp32 (parity reference)
         from .tpu import TPUBackend
         return TPUBackend(md, "float32" if mode == "tpu-fp32" else "bfloat16", warm=False)
+    if mode.startswith("vllm@"):  # vllm@<preset>: basal-serve --mode vllm --vllm-preset <preset>
+        return VLLMBackend(vllm_model or md, max_options=max_options(fmt), preset=mode.split("@", 1)[1])
     kind, quant, comp = MODES[mode]
     if kind == "eager":
         return EagerBackend(md, "bfloat16")
@@ -223,9 +225,10 @@ def main():
     ap.add_argument("--modes", nargs="+", default=None,
                     help="default: eager-fp32 and the serving default (fast on CUDA); on Apple Silicon bf16 mps and mlx "
                          "(--modes eager-fp32 mps mlx for fp32 agreement if memory allows). Modes: eager-fp32, eager, "
-                         "fast, fast-nocompile, fp8, nvfp4, vllm, sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple "
-                         "Silicon: mlx, mlx-q8, mps; GGUF: gguf, gguf@<file.gguf>, ollama, llamacpp; AMD Strix Halo: "
-                         "strix; Google TPU (basal[tpu]): tpu, tpu-fp32")
+                         "fast, fast-nocompile, fp8, nvfp4, vllm, vllm@deterministic (--vllm-preset), "
+                         "sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple Silicon: mlx, mlx-q8, mps; GGUF: gguf, "
+                         "gguf@<file.gguf>, ollama, llamacpp; AMD Strix Halo: strix; Google TPU (basal[tpu]): tpu, "
+                         "tpu-fp32")
     ap.add_argument("--questions", nargs="+", default=DEFAULT_QUESTIONS,
                     help="JSONL file(s) with simple items (default: the bundled examples, 44 items)")
     ap.add_argument("--n", type=int, default=500)

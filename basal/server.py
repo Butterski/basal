@@ -39,8 +39,9 @@ from pathlib import Path
 
 import torch
 
-from .engine import (ATTN, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve, set_fp8_fast_accum)
+from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend,
+                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, attention_available,
+                     resolve, set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from . import tasks
@@ -77,10 +78,15 @@ MODES = {
 }
 
 
-def default_mode():
+def default_mode(model=None, revision=None):
     """fast on CUDA, mlx on Apple Silicon when mlx and mlx-lm are installed, mps otherwise there, tpu on a TPU VM
-    with basal[tpu] installed, else eager."""
+    with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only where
+    the configuration its gate passed runs (FlashAttention 3: Hopper with flash_attn_3), eager on other GPUs until they
+    pass their own (2.2.0 had no working default for it there: fast stopped at "'Gemma4Model' object has no attribute
+    'layers'")."""
     if torch.cuda.is_available():
+        if model is not None and attention_available("fa3") is not None and _gemma4(model, revision):
+            return "eager"
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         try:
@@ -93,6 +99,15 @@ def default_mode():
     if tpu_available():
         return "tpu"
     return "eager"
+
+
+def _gemma4(model, revision=None):
+    """A Gemma 4 model (basal-omni), from its config.json; False when that cannot be read (the server says why)."""
+    from .gemma4_graph import is_gemma4_dir
+    try:
+        return is_gemma4_dir(resolve(model, revision, metadata_only=True))
+    except Exception:  # offline without the model cached, a wrong name: the model load reports it
+        return False
 
 
 def validate_quant(mode, quant):
@@ -332,11 +347,14 @@ def check_calibration(cal, fmt, path):
         raise SystemExit(f"{path} was fitted for prompt format {cal['prompt']}, the model uses format {fmt}")
 
 
-def calibration_name(kind, quant):
-    """Engine name of the per-engine calibration file CALIBRATION.<engine>.json: the quantised CUDA modes (fp8, nvfp4)
-    and the engines other than the basal bf16 path; None = CALIBRATION.json."""
+def calibration_name(kind, quant, preset=None):
+    """Engine name of the per-engine calibration file CALIBRATION.<engine>.json: the quantised CUDA modes (fp8, nvfp4),
+    the engines other than the basal bf16 path and a --vllm-preset other than the default (vllm.<preset>); None =
+    CALIBRATION.json."""
     if kind in ("graph", "exit") and quant in ("fp8", "nvfp4"):
         return quant
+    if kind == "vllm" and preset not in (None, "default"):
+        return f"vllm.{preset}"
     return kind if kind in ("vllm", "sglang", "mlx", "gguf", "ollama", "llamacpp", "tpu") else None
 
 
@@ -477,10 +495,11 @@ def orders_for(orders, k):
 
 
 def models_payload(name, mode, policies, temperatures=None, prompt_format=None, orders=None, media=(),
-                   calibration_warning=None):
+                   calibration_warning=None, vllm_preset=None):
     """GET /v1/models in the official ModelMetadataList shape, plus the serving mode, early-exit levels, the
     temperatures in use ({} = uncalibrated probabilities, what basal-calibrate needs from a running server), the
-    model's prompt format, the option orders served and why the --calibration file may not belong to the model."""
+    model's prompt format, the option orders served, why the --calibration file may not belong to the model and the
+    --vllm-preset (--mode vllm)."""
     entry = {"name": name, "release_date": RELEASE_DATE,
              "description": "basal typed-decision model (choice / noul / score / act / multi / tool), Polish and "
                             "English",
@@ -493,6 +512,8 @@ def models_payload(name, mode, policies, temperatures=None, prompt_format=None, 
         entry["orders"] = orders
     if calibration_warning:
         entry["calibration_warning"] = calibration_warning
+    if vllm_preset:
+        entry["vllm_preset"] = vllm_preset
     return {"models": [entry]}
 
 
@@ -529,13 +550,13 @@ def calibration_mismatch(cal, name, md):
     return None
 
 
-def load_calibration(md, kind, path, quant, orders, off=False):
+def load_calibration(md, kind, path, quant, orders, off=False, preset=None):
     """The calibration basal-serve applies -> (calibration dict, its file, None or why it is unvalidated). A file
     fitted on other option orders than the served ones gives wrong temperatures and thresholds: the file for the
     served orders, CALIBRATION[.<engine>].o<orders>.json, is used when the model ships one; otherwise the file is kept
     for its temperatures without its thresholds, fitted fallback thresholds and task thresholds (max_error defers,
     tasks report automated: null), and the answers are marked unvalidated. An explicit --calibration file is not replaced."""
-    cal = calibration_file(md, kind, path, quant)
+    cal = calibration_file(md, kind, path, quant, preset)
     data = {} if off or not cal.exists() else json.loads(cal.read_text())
     fitted = calibration_orders(data)
     alt = cal.with_name(f"{cal.stem}.o{orders}{cal.suffix}")
@@ -548,14 +569,17 @@ def load_calibration(md, kind, path, quant, orders, off=False):
     return {k: v for k, v in data.items() if k not in ("thresholds", "multi", "task_thresholds")}, cal, why
 
 
-def calibration_file(md, kind, path=None, quant=None):
+def calibration_file(md, kind, path=None, quant=None, preset=None):
     """The calibration file basal-serve loads: `path` (--calibration), else CALIBRATION.<engine>.json when the model
-    ships one for the engine (calibration_name), else CALIBRATION.json."""
+    ships one for the engine (calibration_name; a --vllm-preset without a file of its own: CALIBRATION.vllm.json),
+    else CALIBRATION.json."""
     if path:
         return Path(path)
-    eng = calibration_name(kind, quant)  # 1.5: each engine has its own calibration file when shipped (fp8 too)
-    cal = md / f"CALIBRATION.{eng}.json"
-    return cal if eng and cal.exists() else md / "CALIBRATION.json"
+    # 1.5: each engine has its own calibration file when shipped (fp8 too); 2.2.1: each vLLM preset
+    for eng in dict.fromkeys((calibration_name(kind, quant, preset), calibration_name(kind, quant))):
+        if eng and (md / f"CALIBRATION.{eng}.json").exists():
+            return md / f"CALIBRATION.{eng}.json"
+    return md / "CALIBRATION.json"
 
 
 def model_context(md):
@@ -609,6 +633,8 @@ class Server:
                              "uncompiled kernel during CUDA graph capture and the engine fails to start")
         if getattr(a, "batches", "default") not in ("default", "auto") and kind not in ("graph", "exit"):
             raise SystemExit("--batches needs the CUDA graph engine (fast, fast-nocompile, fast-exit, fp8, nvfp4)")
+        if getattr(a, "vllm_preset", "default") != "default" and kind != "vllm":
+            raise SystemExit("--vllm-preset needs --mode vllm (the CUDA graph engine has --deterministic)")
         attn = getattr(a, "attn", "auto")
         if attn not in ("auto", "fa2") and kind not in ("graph", "exit"):
             raise SystemExit(f"--attn {attn} needs the CUDA graph engine (--mode fast, fast-nocompile, fast-exit, fp8, "
@@ -622,15 +648,25 @@ class Server:
         shared = self.orders != 1 or a.soam == "on"  # prefix sharing: option orders, or the questions of a request
         self.name = a.name or a.model.rstrip("/").split("/")[-1]
         quant = a.quant or quant
-        if getattr(a, "media", "off") == "on" and kind != "eager":
-            raise SystemExit("--media on needs --mode eager (the media path of basal-omni runs in the eager backend)")
+        if getattr(a, "media", "off") == "on" and kind not in ("eager", "vllm"):
+            raise SystemExit("--media on needs --mode eager or vllm (the media paths of basal-omni)")
+        if getattr(a, "ple_offload", "off") == "on" and kind != "eager":
+            raise SystemExit("--ple-offload on needs --mode eager")
+        if getattr(a, "eager_attn", "math") != "math" and kind != "eager":
+            raise SystemExit("--eager-attn needs --mode eager (the CUDA graph engine takes --attn)")
         if kind == "eager":
-            self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on")
+            self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on",
+                                        forward=getattr(a, "eager_forward", None),
+                                        ple_offload=getattr(a, "ple_offload", "off") == "on",
+                                        attn=getattr(a, "eager_attn", "math"))
         elif kind == "exit":
             self.backend = ExitGraphBackend(md, a.dtype, quant, compile=comp, heads_dir=a.exit_heads,
                                             default_policy=a.early_exit, attn=attn, merge=merge_arg(a.merge))
         elif kind == "vllm":
-            self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options)
+            self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options,
+                                       preset=getattr(a, "vllm_preset", "default"),
+                                       fast_prefill=getattr(a, "vllm_fast_prefill", "auto") == "auto",
+                                       media=getattr(a, "media", "off") == "on")
         elif kind == "sglang":
             self.backend = SGLangBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len)
         elif kind == "mlx":
@@ -657,7 +693,8 @@ class Server:
                                         prefix=getattr(a, "prefix_cache", "off") == "on",
                                         batches=getattr(a, "batches", "default"),
                                         readout_layer=getattr(a, "readout_layer", "off"),
-                                        template=getattr(a, "template_prefix", "off"))
+                                        template=getattr(a, "template_prefix", "off"),
+                                        gemma_attn=getattr(a, "gemma_attn", "auto"))
         self.tok = self.backend.tok
         self.states_cached = bool(getattr(a, "state_cache_gb", 0))  # --state-cache-gb: requests are cut at their state
         model = getattr(self.backend, "model", None)  # evidence head: needs the in-process HF model
@@ -665,7 +702,7 @@ class Server:
         self.md, self.kind = md, kind
         self.context = context_limit(md, self.backend)
         self.cal, cal, self.cal_unvalidated = load_calibration(md, kind, a.calibration, quant, self.orders,
-                                                                a.no_calibration)
+                                                                a.no_calibration, getattr(a, "vllm_preset", None))
         check_calibration(self.cal, self.fmt, cal)
         self.cal_mismatch = calibration_mismatch(self.cal, a.model, md) if a.calibration and not a.no_calibration \
             else None  # a file of your own (--calibration); the files in the model directory belong to it
@@ -1050,7 +1087,7 @@ class Server:
         # (question index, branch index, perms, prompts, code ids): every branch in the first pass's option orders
         branches = [self.branch(i, bi, q) for i, q in enumerate(qs) for bi in range(len(q["branches"]))]
         truncation, cut, lane, n_media = None, None, "main", 0
-        if m is not None:  # media: one forward per prompt in the eager backend (no queue, no truncation)
+        if m is not None:  # media: one forward per prompt (eager) or one vLLM call per request; no queue or truncation
             outs, n_tok, longest, n_media = await self.ask_media(qs, branches, m)
         else:
             qs, branches, outs, n_tok, longest, truncation, cut, lane = await self.ask_text(body, qs, branches, pol)
@@ -1087,8 +1124,8 @@ class Server:
         from .media import decode, detail_tokens
         kinds = getattr(self.backend, "media_kinds", ())
         if not kinds:
-            raise ValueError("this server does not take media (basal-serve --mode eager --media on, with a model that "
-                             "has an image / audio encoder)")
+            raise ValueError("this server does not take media (basal-serve --mode eager or vllm with --media on, and a "
+                             "model that has an image / audio encoder)")
         if pol is not None:
             raise ValueError("early_exit is not available with media")
         if any(q.get("evidence") for q in body["questions"].values() if isinstance(q, dict)):
@@ -1231,8 +1268,21 @@ def add_engine_args(ap):
                     help="override the quantisation of the mode (fp8 / nvfp4: CUDA graph modes, q8: mlx)")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--media", choices=["off", "on"], default="off",
-                    help="on: requests may carry images / audio (\"media\", basal/media.py); --mode eager and a model "
-                         "with an image / audio encoder (basal-omni, Gemma 4)")
+                    help="on: requests may carry images / audio (\"media\", basal/media.py); --mode eager or vllm "
+                         "and a model with an image / audio encoder (basal-omni, Gemma 4)")
+    ap.add_argument("--eager-forward", dest="eager_forward", choices=list(EAGER_FORWARDS), default=None,
+                    help="--mode eager with a Gemma 4 model (basal-omni): basal = the engine's own forward (the shared "
+                         "prefix of a request once, the last layers at the answer rows only; default), hf = the "
+                         "transformers forward of basal 2.2.0 (default: BASAL_EAGER_FORWARD, else basal)")
+    ap.add_argument("--eager-attn", dest="eager_attn", default="math",
+                    help="--mode eager with a Gemma 4 model and the engine's own forward: the attention kernel per layer "
+                         "type. math (default) = the math kernel everywhere, as basal 2.2; auto (opt-in) = on Hopper "
+                         "FlashAttention 3 in the sliding-window layers (the memory-efficient kernel without "
+                         "flash_attn_3) and the memory-efficient kernel in the global layers, the math kernel elsewhere; "
+                         "or sliding=K,full=K with K in sdpa, efficient, cudnn, fa3, fa4")
+    ap.add_argument("--ple-offload", dest="ple_offload", choices=["off", "on"], default="off",
+                    help="--mode eager with Gemma 4 E2B / E4B (basal-omni mini): keep the per-layer embedding table in "
+                         "host memory and copy only the rows of each forward's tokens (E4B: 5.6 GB less GPU memory)")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
                     help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu)")
     ap.add_argument("--orders", type=orders_arg, default=None,
@@ -1249,6 +1299,14 @@ def add_engine_args(ap):
     ap.add_argument("--soam", choices=["on", "off"], default="on",
                     help="on = the whole request (every question and option order) is one packed row over the state")
     ap.add_argument("--gpu-memory", dest="gpu_memory", type=float, default=0.6, help="vLLM memory fraction")
+    ap.add_argument("--vllm-preset", dest="vllm_preset", choices=list(VLLM_PRESETS), default="default",
+                    help="--mode vllm: default = as 2.2; deterministic = batch-invariant kernels without the prefix "
+                         "cache and chunked prefill (VLLM_BATCH_INVARIANT: answers independent of the other requests, "
+                         "lower throughput). Loads CALIBRATION.vllm.<preset>.json when the model ships one, else "
+                         "CALIBRATION.vllm.json")
+    ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="auto",
+                    help="--mode vllm: auto = layers that reuse earlier layers' keys and values (Gemma 4 E2B / E4B) "
+                         "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill); off = as 2.2")
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
                     help="--mode vllm / sglang / tpu: context length in tokens (longer states are refused; raise it for "
                          "long documents)")
@@ -1262,6 +1320,14 @@ def add_engine_args(ap):
     ap.add_argument("--attn", choices=list(ATTN), default="auto",
                     help="attention kernel of the CUDA graph engine: auto (FlashAttention 3 on Hopper when installed, "
                          "else 2; FP8 checkpoints and --mode fp8: 2), fa2 (torch SDPA), fa3, fa4 (flash-attn-4), cudnn")
+    ap.add_argument("--gemma-attn", dest="gemma_attn", choices=["auto", "math", "flex", "fa3", "fa3+math"],
+                    default="auto",
+                    help="CUDA graph engine, Gemma 4 (basal-omni): the attention kernel of its layers: math (torch "
+                         "SDPA's math kernel, as --mode eager), flex (FlexAttention with block masks: sliding window, "
+                         "trie), fa3 (FlashAttention 3 in the sliding-window layers' plain rows, flex elsewhere; "
+                         "Hopper), fa3+math (FlashAttention 3 in the sliding layers, math in the global ones). auto: "
+                         "fa3 in --mode fast where FlashAttention 3 runs (with merged projections and compact rows), "
+                         "else math")
     ap.add_argument("--merge", choices=["auto", "on", "off"], default="auto",
                     help="CUDA graph engine: one q/k/v and one gate/up GEMM per layer (bf16: the same products; FP8 "
                          "checkpoints: the merged weights re-quantised per tensor). auto: on for bf16 weights, off for "
@@ -1354,7 +1420,7 @@ def parser():
 
 def main():
     a = parser().parse_args()
-    a.mode = a.mode or default_mode()
+    a.mode = a.mode or default_mode(a.model, a.revision)
     validate_quant(a.mode, a.quant)
     if a.mcp == "on":
         from .mcp_server import available
@@ -1388,7 +1454,7 @@ def main():
     async def models(_):
         return JSONResponse(models_payload(srv.name, a.mode, getattr(srv.backend, "policies", {}), srv.temps,
                                            srv.fmt, srv.orders, getattr(srv.backend, "media_kinds", ()),
-                                           getattr(srv, "cal_mismatch", None)))
+                                           getattr(srv, "cal_mismatch", None), getattr(srv.backend, "preset", None)))
 
     async def health(_):
         return JSONResponse({"status": "ok"})

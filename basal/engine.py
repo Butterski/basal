@@ -7,12 +7,13 @@
 A prompt is a string or a list of token ids (the server tokenizes once and passes ids).
 
 Backends:
-  EagerBackend      plain PyTorch forward (reference, any GPU, Apple MPS or CPU)
+  EagerBackend      plain PyTorch forward (reference, any GPU, Apple MPS or CPU); Gemma 4 (basal-omni) through
+                    basal/gemma4.py: the shared prefix of a group once, the last layers at the answer rows only
   GraphBackend      static shapes + CUDA graphs, optional torch.compile, shared prefix for the two option orders,
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
   MPSBackend        GraphBackend's shared prefix + token-budget batching on Apple MPS (PyTorch, no graphs)
-  VLLMBackend       vLLM, for ModelOpt FP8 / NVFP4 checkpoints (native low-precision kernels)
+  VLLMBackend       vLLM: bf16 checkpoints, ModelOpt FP8 / NVFP4 ports, a repeatable preset, basal-omni media
   SGLangBackend     SGLang offline engine (1.5): the same letter readout from the log-probabilities of the option tokens
   MLXBackend        Apple Silicon, MLX / mlx-lm (1.5): MLX fp8 / fp4 exports or bf16 weights (optional 8-bit at load
                     time); shared-prefix KV cache
@@ -23,8 +24,11 @@ Backends:
   TPUBackend        (basal/tpu.py, extra basal[tpu]; experimental) the same SOAM packing in JAX / XLA on Google TPU
 """
 import json
+import os
+import re
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -58,6 +62,22 @@ def default_device():
     return "cpu"
 
 
+def eager_sdpa_kernels(device):
+    """The SDPA kernels the eager backend's transformers forward may use: None (every enabled one), or, on CUDA with
+    torch older than 2.14.1, the enabled ones without the memory-efficient kernel. That kernel returns wrong attention
+    for keys / values expanded from one KV head (zero stride, transformers' repeat_kv with a mask) at query lengths
+    = 1 mod 32 (head size 256 / 512) or 1 mod 64 (128): pytorch/pytorch#191937, fixed in 2.14.1; basal-omni max was off
+    by 6.2 in code log-prob on a 1,857-token prompt (2026-10-07)."""
+    from torch.torch_version import TorchVersion
+    if torch.device(device).type != "cuda" or TorchVersion(torch.__version__) >= "2.14.1":
+        return None
+    from torch.nn.attention import SDPBackend
+    on = ((SDPBackend.FLASH_ATTENTION, torch.backends.cuda.flash_sdp_enabled()),
+          (SDPBackend.CUDNN_ATTENTION, torch.backends.cuda.cudnn_sdp_enabled()),
+          (SDPBackend.MATH, torch.backends.cuda.math_sdp_enabled()))
+    return [k for k, enabled in on if enabled]
+
+
 def _memo_media(proc):
     """The processor prepares a request's images / audio once for all its prompts (questions and option orders): at
     1,120 soft tokens the image preprocessing took ~2.8 s a call against 0.65 s for the forward (measured
@@ -83,8 +103,11 @@ class EagerBackend:
     # processor's media memo); class defaults, so a backend built without __init__ (tests) has them too
     lock = threading.Lock()
     media_lock = threading.Lock()
+    g4 = None  # basal/gemma4.py: the own Gemma 4 forward (shared prefixes, answer rows), None = the transformers forward
+    sdpa_kernels = None  # eager_sdpa_kernels: the SDPA kernels of the transformers forward (None: every enabled one)
 
-    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False):
+    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False, forward=None, ple_offload=False,
+                 attn="math"):
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.padding_side = "left"
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
@@ -105,14 +128,31 @@ class EagerBackend:
             self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
             _memo_media(self.proc)
         self.lock, self.media_lock = threading.Lock(), threading.Lock()
-        self.model = cls.from_pretrained(model_dir, dtype=getattr(torch, dtype)).to(dev).eval()
-        if str(getattr(self.model.config, "model_type", "")).startswith("gemma4"):
-            # Gemma 4 (basal-omni): SDPA's memory-efficient kernel returned wrong attention on real activations in some
-            # shapes (omni kernel check 2026-10-07); the math kernel equals eager attention there
+        self.model = cls.from_pretrained(model_dir, dtype=getattr(torch, dtype))
+        if ple_offload:  # --ple-offload on (Gemma 4 E2B / E4B): the per-layer embedding table stays in host memory
+            from .gemma4 import offload_ple
+            if not offload_ple(self.model):
+                raise SystemExit("--ple-offload on: the model has no per-layer embeddings (Gemma 4 E2B / E4B)")
+        self.model = self.model.to(dev).eval()
+        from .gemma4 import is_gemma4
+        if is_gemma4(self.model):
+            # Gemma 4 (basal-omni): SDPA's memory-efficient kernel returned wrong attention on real activations (omni
+            # kernel check 2026-10-07: expanded keys / values at query lengths = 1 mod 32, pytorch/pytorch#191937, as
+            # the transformers forward passes max's one global KV head); the math kernel equals eager attention there
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
             torch.backends.cuda.enable_cudnn_sdp(False)
+            # basal 2.3: the engine's own Gemma 4 forward (basal/gemma4.py) unless --eager-forward hf (or
+            # BASAL_EAGER_FORWARD=hf), the transformers forward of 2.2.0
+            import os
+            forward = forward or os.environ.get("BASAL_EAGER_FORWARD") or "basal"
+            if forward not in EAGER_FORWARDS:
+                raise ValueError(f"eager forward {forward!r} (one of {', '.join(EAGER_FORWARDS)})")
+            if forward == "basal":
+                from .gemma4 import Gemma4Forward, attention_plan
+                self.g4 = Gemma4Forward(self.model, attn=attention_plan(attn))
         self.dev = dev
+        self.sdpa_kernels = eager_sdpa_kernels(dev)
         self.prefill = PREFILL
         # option-code logits in fp32, as in GraphBackend._rows: the output head's input (the normalised last hidden
         # state) is taken from a hook and multiplied by the fp32 code rows; the model's final logit softcap (Gemma)
@@ -125,6 +165,14 @@ class EagerBackend:
 
     def _grab(self, module, inputs, output):
         self._head_in = inputs[0]
+
+    def _forward(self, **kw):
+        """The transformers forward on the SDPA kernels of sdpa_kernels."""
+        if self.sdpa_kernels is None:
+            return self.model(**kw)
+        from torch.nn.attention import sdpa_kernel
+        with sdpa_kernel(self.sdpa_kernels):
+            return self.model(**kw)
 
     def encode(self, prompts):
         """Strings -> token id lists (one batched tokenizer call); id lists pass through."""
@@ -143,6 +191,8 @@ class EagerBackend:
     MAX_BATCH_TOKENS = 16384
 
     def run(self, prompts, ids_list):
+        if self.g4 is not None:
+            return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
         with self.lock:
             return self._run(prompts, ids_list)
 
@@ -169,12 +219,18 @@ class EagerBackend:
                     raise ValueError(f"the prompt with its media is {ids.shape[0]} tokens, more than the {max_tokens} "
                                      "tokens of the context; send fewer or shorter media, or detail \"default\"")
                 encs.append((enc, int(ids.shape[0]), n_media))
+            if self.g4 is not None:  # the towers once, the prompts' shared prefix (template, media, state) once
+                with self.lock:
+                    feats = self.g4.media_features(encs[0][0])
+                    hid = self.g4.hidden([[e["input_ids"][0].tolist() for e, _, _ in encs]], media=feats)[0]
+                    ps = self._codes(torch.stack(hid).float(), ids_list)
+                return [(p, n, n_media) for p, (_, n, n_media) in zip(ps, encs)]
             out = []
             for (enc, n, n_media), lid in zip(encs, ids_list):
                 x = {k: (v.to(self.dev, self.model.dtype) if v.is_floating_point() else v.to(self.dev))
                      for k, v in enc.items() if isinstance(v, torch.Tensor)}
                 with self.lock:
-                    self.model(**x, logits_to_keep=1)
+                    self._forward(**x, logits_to_keep=1)
                     p = self._codes(self._head_in[:, -1, :].float(), [lid])[0]
                 out.append((p, n, n_media))
             return out
@@ -210,8 +266,8 @@ class EagerBackend:
         for s0 in range(0, ids.shape[1], self.CHUNK):
             part = ids[:, s0:s0 + self.CHUNK]
             pos = torch.arange(s0, s0 + part.shape[1], device=self.dev)[None]
-            cache = self.model(input_ids=part, position_ids=pos, past_key_values=cache, use_cache=True,
-                               logits_to_keep=1).past_key_values
+            cache = self._forward(input_ids=part, position_ids=pos, past_key_values=cache, use_cache=True,
+                                  logits_to_keep=1).past_key_values
         return self._codes(self._head_in[:, -1, :].float(), [lid])[0]
 
     def _batch(self, enc, ids_list):
@@ -222,7 +278,7 @@ class EagerBackend:
         # positions that skip the left pads, so a padded prompt reads as it does alone: on Gemma 4 (basal-omni) the
         # default arange moved a 44-option distribution by 0.12 with 1,458 pads (RoPE is relative only up to rounding)
         pos = (att.cumsum(-1) - 1).clamp_min(0)
-        self.model(input_ids=ids, attention_mask=att, position_ids=pos, logits_to_keep=1)
+        self._forward(input_ids=ids, attention_mask=att, position_ids=pos, logits_to_keep=1)
         return self._codes(self._head_in[:, -1, :].float(), ids_list)
 
     def _codes(self, h, ids_list):
@@ -238,13 +294,19 @@ class EagerBackend:
         return out
 
     def run_shared(self, groups, policy=None):
-        flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])
+        if self.g4 is not None:  # Gemma 4: the shared prefix of each group once (SOAM)
+            with self.lock, torch.no_grad():
+                hid = self.g4.hidden([self.encode(g[0]) for g in groups])
+                flat = self._codes(torch.stack([h for g in hid for h in g]).float(), [x for g in groups for x in g[1]])
+        else:
+            flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])
         out, j = [], 0
         for g in groups:
             out.append(flat[j: j + len(g[0])]); j += len(g[0])
         return out
 
 
+EAGER_FORWARDS = ("basal", "hf")
 ATTN = ("auto", "fa2", "fa3", "fa4", "cudnn")
 _ATTN = {"impl": "fa2", "direct": None}  # the attention of causal forwards without a mask (process-wide)
 
@@ -374,6 +436,15 @@ def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scal
     if (direct is not None and attention_mask is None and basal_prefix is None and query.shape[2] > 1
             and query.dtype in (torch.bfloat16, torch.float16)):
         return direct(query, key, value, scaling), None
+    groups = getattr(module, "num_key_value_groups", 1)
+    if attention_mask is not None and key.shape[1] == 1 and groups > 1:
+        # one key / value head: transformers' repeat_kv would hand SDPA a stride-0 view, and the memory-efficient
+        # kernel (the dispatcher's pick for a masked call) then returns a wrong last query row on torch < 2.14.1 at
+        # query lengths 1 mod 64 (head size 128; 1 mod 32 at 256 and 512): pytorch/pytorch#191937, fp32 last rows off
+        # by ~3 on an H100 (20 Oct). The heads are copied here instead (basal-2.0 has 2 or 8 key / value heads, which
+        # repeat_kv already copies)
+        key, value = (x.expand(-1, groups, -1, -1).contiguous() for x in (key, value))
+        module = SimpleNamespace(num_key_value_groups=1, is_causal=getattr(module, "is_causal", True))
     return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
                                   is_causal=is_causal, **kwargs)
 
@@ -491,11 +562,19 @@ class GraphBackend(EagerBackend):
     prefix = False
     lean, flex = None, False      # the lean layer (basal/lean.py) and its FlexAttention pass 2, when enabled
     state_cache = None            # StateCache: keys / values of request states, reused across requests
+    gemma = None                  # basal/gemma4_graph.py: the forward of a Gemma 4 model (basal-omni)
+    softcap = None                # the model's final logit softcap (Gemma), applied to the fp32 code logits
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
-                 readout_layer="off", template="off"):
+                 readout_layer="off", template="off", gemma_attn="auto"):
         torch.backends.cuda.enable_cudnn_sdp(False)  # before capture: a captured graph keeps its attention kernel
+        from . import gemma4_graph
+        if gemma4_graph.is_gemma4_dir(model_dir):
+            # every captured graph keeps its own cuBLAS workspace (32 MB on an H100): basal-omni-1.1-max's ~400 graphs
+            # held 37 GB of graph pool and ran out of memory in warm-up; 8 MB workspaces made no difference to its
+            # forwards (1.1-max, H100, 20 Oct). Read when the first cuBLAS handle is made, so set before any GEMM
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:2")
         self.fp8_checkpoint = modelopt_fp8(model_dir)  # the -FP8 repositories: FP8 weights with static scales
         # likewise: the kernel of the causal forwards (--attn; auto keeps FlashAttention 2 for FP8 GEMMs)
         self.attn = set_attention(attn, fp8=self.fp8_checkpoint or quant == "fp8")
@@ -509,7 +588,81 @@ class GraphBackend(EagerBackend):
             self.model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=getattr(torch, dtype)).cuda().eval()
         self.dev = next(self.model.parameters()).device
         self.prefill = PREFILL
-        causal_sdpa(self.model)
+        if gemma4_graph.is_gemma4(self.model):
+            self._gemma_init(gemma_attn, quant, compile, merge)
+        else:
+            causal_sdpa(self.model)
+            self._llama_init(merge, quant, lean, tree, compile)
+        self.shared = shared
+        self._wrows = {}
+        if batches == "fine":
+            self.BATCHES = self.FINE_BATCHES
+        # compact rows need FlashAttention 3's varlen kernel (Hopper); auto: compact where it runs. Gemma 4: with its
+        # fa3 kernels (FA3 varlen in the sliding layers, a flex block mask per prompt in the 512-wide global ones)
+        self.compact = batches in ("compact", "auto") and self.attn == "fa3" and self.dev.type == "cuda" \
+            and (self.gemma is None or self.gemma.kernels.get("sliding_attention") == "fa3"
+                 and self.gemma.kernels.get("full_attention") != "math")
+        if batches == "compact" and not self.compact:
+            raise ValueError("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper; Gemma 4: "
+                             "--gemma-attn fa3)")
+        if self.compact and self.gemma is not None:  # its forward reads out at one row per prompt
+            self.fwd_c, self.readout_layer = self.gemma.forward_compact, True
+        elif self.compact:
+            self.fwd_c = torch.compile(self._forward_compact, dynamic=True) if compile else self._forward_compact
+            last = self.model.model.layers[-1]
+            self.readout_layer = readout_layer in ("on", "auto") and type(last).__name__ == "LlamaDecoderLayer" \
+                and type(last.self_attn).__name__ == "LlamaAttention" and type(last.mlp).__name__ == "LlamaMLP"
+        self.prefix = bool(prefix) and shared
+        gb = max(state_cache_gb, self.PREFIX_GB if self.prefix else 0)
+        self.state_cache = StateCache(gb * 2 ** 30) if gb and shared else None
+        self._alloc_kv()
+        self.template = []  # --template-prefix (with compact rows): [(start in template_kv, prefix token ids)]
+        if self.compact and template in ("on", "auto") and self.gemma is None:  # (Gemma 4's template: 7 tokens)
+            self._template_prefixes(model_dir)
+        self.pool = torch.cuda.graph_pool_handle()
+        self.graphs = {}
+        if warm:
+            self.warm()
+
+    def _gemma_init(self, kernels, quant, compile, merge):
+        """basal-omni (Gemma 4): the forward of basal/gemma4_graph.py under the same packing, graphs and caches. Its
+        own layer code reads the code rows at the readout positions (`ro`), so its plain graphs take them as an
+        input; pass 2 with flex takes the trie as a TreeMask.
+
+        auto (--gemma-attn, --merge): the configuration gated on an H100 (E3, 20 Oct: dev v2 against eager bf16,
+        mini 0.9933 / 1.1-max 0.9891 of top answers equal, 0.9990-0.9998 at margin >= 0.2; automated at 1% within
+        -0.11 points, each engine its own calibration; 1.1-max 3.4x eager's decisions/s, mini 6.1x): fa3 kernels,
+        merged projections and (--batches auto) compact rows where FlashAttention 3 runs and the engine compiles;
+        else the math kernel, uncompiled (E2's gate) - Blackwell's flex awaits its own identity gate."""
+        from . import gemma4_graph
+        why = gemma4_graph.supports(self.model)
+        if why:
+            raise ValueError(why)
+        for name in ("vision_tower", "audio_tower", "embed_vision", "embed_audio"):  # text only here (31B: ~1.7 GB)
+            if getattr(self.model.model, name, None) is not None:
+                setattr(self.model.model, name, None)
+        torch.cuda.empty_cache()
+        if quant:  # NVFP4: its vLLM ports failed (15 Oct); torchao FP8 on 1.1-max failed the port gate (2-10 options at
+            # margin >= 0.2: 0.9892, bar 0.9893; 20 Oct). The -FP8 checkpoints run in --mode fast / fp8 as stored
+            raise ValueError(f"--mode {quant} quantisation at load time is not available for basal-omni (Gemma 4); "
+                             "serve its -FP8 checkpoint instead")
+        if kernels == "auto":
+            kernels = "fa3" if compile and attention_available("fa3") is None else "math"
+        if merge == "auto":
+            merge = kernels != "math"
+        if "fa3" in str(kernels) and attention_available("fa3"):
+            raise ValueError(f"--gemma-attn {kernels}: {attention_available('fa3')}")
+        # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
+        # agreement with eager 0.998-0.999 on dev v2, mini and 1.1-max); the compiled forward comes with the flex /
+        # fa3 kernels
+        compile = compile and kernels != "math"
+        # merged projections: bf16 linears only (an FP8 checkpoint's FP8Linear layers keep theirs)
+        self.gemma = gemma4_graph.Gemma4Graph(self.model, kernels, compile=compile, merge=merge is True)
+        self.softcap, self.merged, self.lean = self.gemma.softcap, self.gemma.merged, None
+        self.fwd, self.fwd_sfx = self.gemma.forward, self.gemma.forward_suffix
+        self.flex = all(k != "math" for k in self.gemma.kernels.values())
+
+    def _llama_init(self, merge, quant, lean, tree, compile):
         # one q / k / v and one gate / up GEMM per layer (before torchao, which quantises the merged linears as such).
         # auto: on for bf16 / fp32 weights (gated: same bf16 identity, dev v2 accuracy +0.01 points); off for FP8
         # checkpoints and torchao quantisation until their gate decides
@@ -535,44 +688,71 @@ class GraphBackend(EagerBackend):
             # pass 2 stays uncompiled: compiled graphs for its (rows, branch length, root length) grid took minutes
             # to capture; its graphs replay the normal forward
             self.fwd = torch.compile(self._forward, dynamic=True)
-        self.shared = shared
-        self._wrows = {}
-        if batches == "fine":
-            self.BATCHES = self.FINE_BATCHES
-        # compact rows need FlashAttention 3's varlen kernel (Hopper); auto: compact where it runs
-        self.compact = batches in ("compact", "auto") and self.attn == "fa3" and self.dev.type == "cuda"
-        if batches == "compact" and not self.compact:
-            raise ValueError("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper)")
-        if self.compact:
-            self.fwd_c = torch.compile(self._forward_compact, dynamic=True) if compile else self._forward_compact
-            last = self.model.model.layers[-1]
-            self.readout_layer = readout_layer in ("on", "auto") and type(last).__name__ == "LlamaDecoderLayer" \
-                and type(last.self_attn).__name__ == "LlamaAttention" and type(last.mlp).__name__ == "LlamaMLP"
-        self.prefix = bool(prefix) and shared
-        gb = max(state_cache_gb, self.PREFIX_GB if self.prefix else 0)
-        self.state_cache = StateCache(gb * 2 ** 30) if gb and shared else None
-        self._alloc_kv()
-        self.template = []  # --template-prefix (with compact rows): [(start in template_kv, prefix token ids)]
-        if self.compact and template in ("on", "auto"):
-            self._template_prefixes(model_dir)
-        self.pool = torch.cuda.graph_pool_handle()
-        self.graphs = {}
-        if warm:
-            self.warm()
+
+    @property
+    def _dtype(self):
+        """The dtype of the model body (its token embeddings)."""
+        m = self.gemma.lm if self.gemma is not None else self.model.model
+        return m.embed_tokens.weight.dtype
 
     def _alloc_kv(self):
         """The keys / values buffer that pass 1 writes and pass 2 reads: per layer, room for the largest plain graph
-        and for the largest pass-2 graph's rows over the longest root."""
-        cfg = self.model.config
-        H = cfg.num_key_value_heads
-        D = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
-        n = max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1], self.TREE_ROWS[-1] * self.LENS[-1]) * H * D
-        dt = self.model.model.embed_tokens.weight.dtype
-        self.kv_shape = (H, D)
+        and for the largest pass-2 graph's rows over the longest root. kv_shapes: (kv heads, head size) per layer
+        with its own keys and values (Gemma 4: per layer type; its KV-shared layers read those of an earlier layer)."""
+        if self.gemma is not None:
+            self.kv_shapes = list(self.gemma.kv_shapes)
+            self._fit_grid()
+        else:
+            cfg = self.model.config
+            H = cfg.num_key_value_heads
+            D = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+            self.kv_shapes = [(H, D)] * len(self.model.model.layers)
+        self.kv_shape = self.kv_shapes[0]
+        n = self._kv_tokens()
+        dt = self._dtype
         # zeros, not empty: below a cached root the masked tail of its rows is never written, and a masked NaN still
         # poisons the readout (0 x NaN)
-        self._kv = [(torch.zeros(n, dtype=dt, device=self.dev), torch.zeros(n, dtype=dt, device=self.dev))
-                    for _ in self.model.model.layers] if self.shared else None
+        self._kv = [tuple(torch.zeros(n * H * D, dtype=dt, device=self.dev) for _ in "kv") for H, D in self.kv_shapes] \
+            if self.shared else None
+
+    KV_SHARE = 0.15  # Gemma 4: the most of the free GPU memory (after the weights) its key / value buffers may take
+
+    def _fit_grid(self):
+        """Gemma 4: every layer with its own keys and values keeps them for every token (31B: 0.9 MB per token in
+        bf16, 12B: 0.34 MB), so buffers for the largest graph shapes could leave the activations no room next to the
+        weights. Its pass-2 graphs are captured only where pass 1 can fill them (rows x root length within
+        TOKEN_BUDGET; warm), so the buffers hold max(TOKEN_BUDGET, PLAIN_LENS[-1]) tokens, and both shrink until they
+        take at most KV_SHARE of the free memory; longer units run without a graph, as beyond PLAIN_LENS."""
+        if self.dev.type != "cuda" or not self.shared:
+            return
+        per = sum(2 * H * D for H, D in self.kv_shapes) * self._dtype.itemsize
+        cap = int(self.KV_SHARE * torch.cuda.mem_get_info(self.dev)[0] / per)
+        if max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1]) > cap:  # 31B on an 80 GB GPU (a quarter of free memory
+            # left 76 GB allocated and ran out in warm-up: graph pools and activations need the rest, 20 Oct)
+            self.TOKEN_BUDGET = min(self.TOKEN_BUDGET, max(cap // 512 * 512, 1024))
+            self.PLAIN_LENS = [x for x in self.PLAIN_LENS if x <= max(cap, self.PLAIN_LENS[0])]
+            self.LENS = [x for x in self.LENS if x <= self.PLAIN_LENS[-1]]
+            # compact rows hold no keys / values, but their activations and graph pool grow with the row: 31B with
+            # compact rows of 12,288 tokens ran out of memory in warm-up (12.5 GB of graph pool, 20 Oct)
+            self.COMPACT_LENS = [x for x in self.COMPACT_LENS if x <= self.TOKEN_BUDGET]
+
+    def _kv_tokens(self):
+        """Tokens of the key / value buffer: the largest plain graph and the largest pass-2 graph's rows over the
+        longest root (Gemma 4: within TOKEN_BUDGET, see _fit_grid)."""
+        if self.gemma is not None:
+            return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1])
+        return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1], self.TREE_ROWS[-1] * self.LENS[-1])
+
+    def _kv_new(self, L):
+        """Fresh per-layer (K, V) buffers [1, kv heads, L, head size] (a root longer than the largest graph). Gemma 4:
+        a sliding layer's last `window` tokens only (kv_lens: pass 2 reads no further back), so a long state takes a
+        fifth of the memory on 31B (0.9 MB per token: its 10k-token states ran out of memory on an 80 GB H100 next to
+        59 GB of weights, 20 Oct); the state cache keeps the same."""
+        dt = self._dtype
+        lens = self.gemma.kv_lens(L) if self.gemma is not None else [L] * len(self.kv_shapes)
+        return [(torch.empty((1, H, n, D), dtype=dt, device=self.dev), torch.empty((1, H, n, D), dtype=dt,
+                                                                                  device=self.dev))
+                for (H, D), n in zip(self.kv_shapes, lens)]
 
     @torch.no_grad()
     def _template_prefixes(self, model_dir):
@@ -618,8 +798,8 @@ class GraphBackend(EagerBackend):
         so that the compiled forward is compiled once)."""
         if self._kv is None:
             return None
-        H, D = self.kv_shape
-        return [(k[: b * H * L * D].view(b, H, L, D), v[: b * H * L * D].view(b, H, L, D)) for k, v in self._kv]
+        return [(k[: b * H * L * D].view(b, H, L, D), v[: b * H * L * D].view(b, H, L, D))
+                for (k, v), (H, D) in zip(self._kv, self.kv_shapes)]
 
     def grid(self, lens):
         """(rows, length) shapes of one graph family."""
@@ -638,7 +818,7 @@ class GraphBackend(EagerBackend):
             for b in self.TREE_ROWS:
                 for L in self.LENS:
                     for S in self.SUFFIX_LENS:
-                        if b * S <= self.TOKEN_BUDGET:
+                        if b * S <= self.TOKEN_BUDGET and (self.gemma is None or b * L <= self.TOKEN_BUDGET):
                             self._graph_sfx(b, S, L)
             if self.prefix:  # pass 2 of short requests over a cached template prefix
                 for L in (x for x in self.LENS if x <= self.PREFIX_ROOT):
@@ -649,7 +829,9 @@ class GraphBackend(EagerBackend):
         # beyond the largest graph the forwards run uncompiled; their first use sets up kernels and memory for long
         # shapes (3 s of the first long request on an H100), so a long prompt and a long branched unit run here once
         n = self.PLAIN_LENS[-1] + 64
-        if getattr(self.model.config, "max_position_embeddings", 0) >= n + 8:
+        cfg = self.model.config
+        cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg  # Gemma 4: the decoder's settings
+        if getattr(cfg, "max_position_embeddings", 0) >= n + 8:
             root = [self.tok.pad_token_id] * n
             self.run_shared([([root + [5]], [[10, 11]])] + ([([root + [5, 6], root + [6, 5]], [[10, 11], [10, 11]])]
                                                              if self.shared else []))
@@ -685,8 +867,11 @@ class GraphBackend(EagerBackend):
         return x.pin_memory().to(self.dev, non_blocking=True) if self.dev.type == "cuda" else x.to(self.dev)
 
     @torch.no_grad()
-    def _forward(self, ids, kv=None):
-        """Plain causal forward; kv: per-layer (K, V) buffers [rows, kv heads, length, head dim] it fills (pass 1)."""
+    def _forward(self, ids, kv=None, ro=None):
+        """Plain causal forward; kv: per-layer (K, V) buffers [rows, kv heads, length, head dim] it fills (pass 1).
+        Gemma 4: uncompiled; ro [rows, R]: the readout positions -> [rows, R, D]."""
+        if self.gemma is not None:
+            return self.gemma.forward(ids, kv, ro, compiled=False)
         return self.model.model(input_ids=ids, use_cache=False, basal_kv=kv).last_hidden_state
 
     @torch.no_grad()
@@ -726,9 +911,12 @@ class GraphBackend(EagerBackend):
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False).last_hidden_state
 
     @torch.no_grad()
-    def _forward_suffix(self, ids, mask, pos, prefix):
+    def _forward_suffix(self, ids, mask, pos, prefix, ro=None):
         """Pass 2: rows that continue computed prefixes (per-layer (K, V) [rows, kv heads, prefix length, head dim]);
-        mask [rows, 1, length, prefix length + length]."""
+        mask [rows, 1, length, prefix length + length] (Gemma 4 with flex: a TreeMask). Gemma 4: uncompiled; ro as in
+        _forward."""
+        if self.gemma is not None:
+            return self.gemma.forward_suffix(ids, mask, pos, prefix, ro, compiled=False)
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
                                 basal_prefix=prefix).last_hidden_state
 
@@ -736,7 +924,9 @@ class GraphBackend(EagerBackend):
     def _forward_layered(self, ids, kv=None, between=None):
         """The plain causal forward (`_forward`, uncompiled) one decoder layer at a time, calling between(i) before
         layer i (the long lane gives the GPU to the main lane there): the transformers model's own loop, the same
-        modules with the same arguments, so the same result."""
+        modules with the same arguments, so the same result. Gemma 4: its own forward, uncompiled."""
+        if self.gemma is not None:
+            return self.gemma.forward(ids, kv, between=between, compiled=False)
         from transformers.masking_utils import create_causal_mask
         m = self.model.model
         h = m.embed_tokens(ids)
@@ -764,11 +954,15 @@ class GraphBackend(EagerBackend):
         return self.graphs[key]
 
     def _graph(self, b, L):
-        """Plain graph (b rows, length L): (graph, ids, kv buffers or None, hidden states)."""
+        """Plain graph (b rows, length L): (graph, ids, kv buffers or None, hidden states [b, L, D]); Gemma 4: (graph,
+        ids, kv buffers or None, readout position of every row [b, 1], hidden states there [b, 1, D])."""
         key = ("p", b, L)
         if key in self.graphs:
             return self.graphs[key]
         ids = torch.full((b, L), self.tok.pad_token_id, dtype=torch.long, device=self.dev)
+        if self.gemma is not None:
+            ro = torch.zeros((b, 1), dtype=torch.long, device=self.dev)
+            return self._capture(key, self.fwd, ids, self._kv_views(b, L), ro)
         return self._capture(key, self.fwd, ids, self._kv_views(b, L))
 
     def _graph_c(self, T):
@@ -797,7 +991,7 @@ class GraphBackend(EagerBackend):
             return self.graphs[key]
         ids = torch.full((b, S), self.tok.pad_token_id, dtype=torch.long, device=self.dev)
         pos = torch.arange(L, L + S, device=self.dev)[None].expand(b, S).contiguous()
-        dt = self.model.model.embed_tokens.weight.dtype
+        dt = self._dtype
         if self.flex:
             from .lean import TreeMask
             mask = TreeMask(torch.zeros(b, dtype=torch.long, device=self.dev),
@@ -901,9 +1095,14 @@ class GraphBackend(EagerBackend):
         p = torch.softmax(z.float().gather(1, idx).masked_fill(pad, float("-inf")), -1).tolist()  # one device sync
         return [row[: len(ids)] for row, ids in zip(p, lids)]
 
+    def _code_logits(self, h, W):
+        """fp32 logits of the code rows W from normalised hidden states h, with the model's final softcap (Gemma)."""
+        z = h.float() @ W.T
+        return torch.tanh(z / self.softcap) * self.softcap if self.softcap else z
+
     def _readout(self, h, lids):
         W, idx, pad = self._rows(lids)
-        return self._letters(h.float() @ W.T, idx, pad, lids)  # last_hidden_state is already normalised
+        return self._letters(self._code_logits(h, W), idx, pad, lids)  # last_hidden_state is already normalised
 
     def _host_rows(self, packs, idx, b, L):
         """Packed rows -> padded host arrays ids / positions / block ids [b, L], readout rows and columns, and the
@@ -940,11 +1139,20 @@ class GraphBackend(EagerBackend):
         if n > self.PLAIN_LENS[-1]:
             assert len(idx) == 1
             t, _, _, last, _ = packs[idx[0]]
+            if self.gemma is not None:  # a single prompt (or duplicates) reads out at its last token
+                return self._forward(self._to_dev(torch.tensor([t])), ro=self._to_dev(torch.tensor([[last[0]]])))[
+                    0, [0] * len(last)]
             return self._forward(self._to_dev(torch.tensor([t])))[0, last]
         L, b = self._bucket(n, self.PLAIN_LENS), self._bucket(len(idx), self.BATCHES)
-        g, ids, _, out = self._graph(b, L)
+        g, ids, _, *ro, out = self._graph(b, L)
         h_ids, _, _, rows, cols, _ = self._host_rows(packs, idx, b, L)
         ids.copy_(self._to_dev(h_ids), non_blocking=True)
+        if ro:  # Gemma 4: the forward reads out at each row's last token (duplicates share it)
+            h_ro = np.zeros((b, 1), dtype=np.int64)
+            for r, c in zip(rows, cols):
+                h_ro[r, 0] = c
+            ro[0].copy_(self._to_dev(h_ro), non_blocking=True)
+            cols = [0] * len(rows)
         g.replay()
         return out[self._to_dev(torch.tensor(rows)), self._to_dev(torch.tensor(cols))]
 
@@ -1016,8 +1224,9 @@ class GraphBackend(EagerBackend):
         plain graph that also writes the keys and values (an uncompiled-shape forward beyond the largest graph), then
         all other blocks, one row per unit, over those keys and values with the trie mask. keys / hits: per unit, the
         state-cache key of its root and the cached keys / values; when every root is cached, pass 1 is skipped and the
-        cached keys / values go where pass 1 would have written them; the roots computed here are stored."""
-        H, D = self.kv_shape
+        cached keys / values go where pass 1 would have written them; the roots computed here are stored. Gemma 4:
+        pass 1 reads out at the root's last token (the only readout a root can hold: a prompt that is the shared
+        prefix itself) and pass 2 without a graph at the readout positions only."""
         P = [packs[k][2].index(1) for k in idx]  # block 0 (the root) comes first and is contiguous
         b = len(idx)
         n2 = max(len(packs[k][0]) - p for k, p in zip(idx, P))  # longest part below the root
@@ -1031,40 +1240,47 @@ class GraphBackend(EagerBackend):
             if max(P) > self.PLAIN_LENS[-1]:
                 assert b == 1
                 L = P[0]
-                kv = [(torch.empty((1, H, L, D), dtype=k.dtype, device=self.dev),
-                       torch.empty((1, H, L, D), dtype=k.dtype, device=self.dev)) for k, _ in self._kv]
+                kv = self._kv_new(L)
             else:
                 L = self._bucket(max(P), self.PLAIN_LENS)
-                kv = self._kv_views(max(b, self._bucket(b, rows) if L <= self.LENS[-1] else b), L)
+                B = max(b, self._bucket(b, rows) if L <= self.LENS[-1] else b)
+                kv = self._kv_views(B if B * L <= self._kv_tokens() else b, L)  # the rows of a pass-2 graph if any
             same = {}  # rows with the same cached root (a template prefix): one broadcast copy per layer
             for r, e in enumerate(hits):
                 same.setdefault(id(e), (e, P[r], []))[2].append(r)
             for e, p, rs in same.values():
+                # a cached entry may hold the root's last tokens only (Gemma 4's sliding layers, _kv_new): they end
+                # where the root ends (a buffer of the graph) or the buffer does (a fresh one as long as the entry)
                 if len(rs) == 1:
                     for (kb, vb), (ke, ve) in zip(kv, e):
-                        kb[rs[0], :, :p].copy_(ke, non_blocking=True)
-                        vb[rs[0], :, :p].copy_(ve, non_blocking=True)
+                        z = min(p, kb.shape[2])
+                        kb[rs[0], :, z - ke.shape[1]: z].copy_(ke, non_blocking=True)
+                        vb[rs[0], :, z - ke.shape[1]: z].copy_(ve, non_blocking=True)
                     continue
                 ix = self._to_dev(torch.tensor(rs))
                 for (kb, vb), (ke, ve) in zip(kv, e):
-                    kb[:, :, :p].index_copy_(0, ix, ke[None].expand(len(rs), *ke.shape))
-                    vb[:, :, :p].index_copy_(0, ix, ve[None].expand(len(rs), *ve.shape))
+                    z = min(p, kb.shape[2])
+                    kb[:, :, z - ke.shape[1]: z].index_copy_(0, ix, ke[None].expand(len(rs), *ke.shape))
+                    vb[:, :, z - ke.shape[1]: z].index_copy_(0, ix, ve[None].expand(len(rs), *ve.shape))
         elif max(P) > self.PLAIN_LENS[-1]:
             # a root longer than the largest graph runs uncompiled, like a long single prompt: the compiled forward
             # recompiles for these fresh key / value buffers (44-109 s on the first long request on an H100), the
             # uncompiled one costs a few percent of a forward that is rare and long anyway
             assert b == 1
             L, B = P[0], 1
-            kv = [(torch.empty((1, H, L, D), dtype=k.dtype, device=self.dev),
-                   torch.empty((1, H, L, D), dtype=k.dtype, device=self.dev)) for k, _ in self._kv]
-            h1 = self._forward(self._to_dev(torch.tensor([packs[idx[0]][0][:L]])), kv)
+            kv = self._kv_new(L)
+            ro = self._to_dev(torch.tensor([[L - 1]])) if self.gemma is not None else None
+            h1 = self._forward(self._to_dev(torch.tensor([packs[idx[0]][0][:L]])), kv, ro)
         else:
             L, B = self._bucket(max(P), self.PLAIN_LENS), self._bucket(b, self.BATCHES)
-            g, ids, kv, h1 = self._graph(B, L)
+            g, ids, kv, *ro, h1 = self._graph(B, L)
             h_ids = np.full((B, L), self.tok.pad_token_id, dtype=np.int64)
             for r, k in enumerate(idx):
                 h_ids[r, : P[r]] = packs[k][0][: P[r]]
             ids.copy_(self._to_dev(h_ids), non_blocking=True)
+            if ro:
+                ro[0].copy_(self._to_dev(np.array([[p - 1] for p in P] + [[0]] * (B - b), dtype=np.int64)),
+                            non_blocking=True)
             g.replay()
         if h1 is not None and self.state_cache is not None:  # store the roots computed here
             for r, key in enumerate(keys):
@@ -1091,24 +1307,31 @@ class GraphBackend(EagerBackend):
             ids2[r, :n], seg2[r, :n] = t[p:], [x - 1 for x in sg[p:]]  # blocks 1.. -> 0..: the trie below the root
             pos2[r, :n], pos2[r, n:] = pp[p:], pp[-1] + 1 + np.arange(S - n)
             par2[r] = [-1 if q <= 0 else q - 1 for q in par[1:]]
-            sel += [(1, r, i) if i < p else (2, r, i - p) for i in last]
+            # Gemma 4: pass 1 holds the root's last token only (column 0 of its readout rows)
+            sel += [(1, r, i if self.gemma is None else 0) if i < p else (2, r, i - p) for i in last]
         # FlexAttention only in the pass-2 graphs captured at start-up: an uncaptured shape (long roots, many or long
         # branches) runs the dense pass 2 uncompiled, as without flex. The compiled flex layer specialises on shape
-        # classes, and a request of a new class compiled for 1-4 s (SPEED.md sections 6 and 11)
-        if self.flex and graph is not None:  # the trie as FlexAttention's mask: root tokens, blocks, ancestors
+        # classes, and a request of a new class compiled for 1-4 s (SPEED.md sections 6 and 11). Gemma 4: its flex
+        # kernel takes the TreeMask in uncaptured shapes too (one compiled flex_attention of dynamic shapes)
+        if self.flex and (graph is not None or self.gemma is not None):  # root tokens, blocks, ancestors
             tm = self._tree_mask(seg2, par2, P + [0] * (B - b), S)
-            g2, s_ids, s_mask, s_pos, _, h2 = graph
-            s_ids.copy_(self._to_dev(ids2), non_blocking=True)
-            s_pos.copy_(self._to_dev(pos2), non_blocking=True)
-            for dst, src in zip(s_mask, tm):
-                dst.copy_(src)
-            g2.replay()
+            if graph is None:
+                h2, sel = self._gemma_suffix(ids2, tm, pos2, kv, sel, B)
+            else:
+                g2, s_ids, s_mask, s_pos, _, h2 = graph
+                s_ids.copy_(self._to_dev(ids2), non_blocking=True)
+                s_pos.copy_(self._to_dev(pos2), non_blocking=True)
+                for dst, src in zip(s_mask, tm):
+                    dst.copy_(src)
+                g2.replay()
         else:
             m2 = self._mask_from_seg(self._to_dev(seg2), par2)                             # [B, 1, S, S]
             Pr = self._to_dev(torch.tensor(P + [0] * (B - b)))
             root = Pr[:, None] > torch.arange(L, device=self.dev)[None]                     # [B, L]
             pre = torch.where(root, 0.0, torch.finfo(m2.dtype).min).to(m2.dtype)[:, None, None].expand(B, 1, S, L)
-            if graph is None:
+            if graph is None and self.gemma is not None:
+                h2, sel = self._gemma_suffix(ids2, torch.cat([pre, m2], -1), pos2, kv, sel, B)
+            elif graph is None:
                 fwd = self._forward_suffix if self.flex else self.fwd_sfx
                 h2 = fwd(self._to_dev(ids2), torch.cat([pre, m2], -1), self._to_dev(pos2), kv)
             else:
@@ -1126,6 +1349,27 @@ class GraphBackend(EagerBackend):
                 cols = self._to_dev(torch.tensor([sel[n][2] for n in j]))
                 out[self._to_dev(torch.tensor(j))] = h[rows, cols]
         return out
+
+    def _gemma_suffix(self, ids2, mask, pos2, kv, sel, B):
+        """Gemma 4, pass 2 without a graph: uncompiled, the layers from the last own-key one on at the readout rows
+        only. -> (hidden states [B, R, D], sel with each pass-2 readout's slot in its row)."""
+        ro2, slot = self._readout_slots(sel, B)
+        h2 = self._forward_suffix(self._to_dev(ids2), mask, self._to_dev(pos2), kv, self._to_dev(ro2))
+        return h2, [(x[0], x[1], slot[n]) if x[0] == 2 else x for n, x in enumerate(sel)]
+
+    @staticmethod
+    def _readout_slots(sel, B):
+        """The pass-2 readouts of _tree_hidden ((2, row, column) in sel) as readout positions per row [B, R] (padded
+        with each row's first; R = the most of any row) and the slot of each readout in its row (None for pass 1)."""
+        cols = [[] for _ in range(B)]
+        slot = [None] * len(sel)
+        for n, (src, r, c) in enumerate(sel):
+            if src == 2:
+                if c not in cols[r]:
+                    cols[r].append(c)
+                slot[n] = cols[r].index(c)
+        R = max(1, max(map(len, cols)))
+        return np.array([c + [c[0] if c else 0] * (R - len(c)) for c in cols], dtype=np.int64), slot
 
     @torch.no_grad()
     def _tree_cache(self, pack):
@@ -1282,7 +1526,7 @@ class GraphBackend(EagerBackend):
                 else:
                     h = self._tree_hidden(packs, idx, [keys[k] for k in idx], [hits.get(k) for k in idx])
                 W, cols, pad = self._rows([x for k in idx for x in units[k][1]])
-                p = torch.softmax((h.float() @ W.T).gather(1, cols).masked_fill(pad, float("-inf")), -1)
+                p = torch.softmax(self._code_logits(h, W).gather(1, cols).masked_fill(pad, float("-inf")), -1)
                 if cuda:
                     host = torch.empty(p.shape, dtype=p.dtype, pin_memory=True)
                     host.copy_(p, non_blocking=True)
@@ -1317,14 +1561,12 @@ class GraphBackend(EagerBackend):
         t, pp, sg, last, par = pack
         if len(par) == 1:
             return self._forward_layered(self._to_dev(torch.tensor([t])), None, between)[0, last]
-        H, D = self.kv_shape
         P = sg.index(1)  # block 0 (the root) comes first and is contiguous
         h1 = None
         if hit is not None:
             kv = [(k[None], v[None]) for k, v in hit]
         else:
-            kv = [(torch.empty((1, H, P, D), dtype=k.dtype, device=self.dev),
-                   torch.empty((1, H, P, D), dtype=k.dtype, device=self.dev)) for k, _ in self._kv]
+            kv = self._kv_new(P)
             h1 = self._forward_layered(self._to_dev(torch.tensor([t[:P]])), kv, between)[0]
             if key is not None and self.state_cache is not None:
                 self.state_cache.put(key, [(k[0].clone(), v[0].clone()) for k, v in kv])
@@ -1529,8 +1771,48 @@ class MPSBackend(GraphBackend):
         return self._assemble(groups, units, probs)
 
 
+VLLM_PRESETS = {
+    # --vllm-preset: repeatable. The weights are the checkpoint's own (bf16, or a ModelOpt FP8 / NVFP4 port): bf16
+    # weights quantised to FP8 at load time cost basal-omni 0.5-9.5 points of automation at 1%
+    "default": False,
+    "deterministic": True,   # batch-invariant kernels, no prefix cache, no chunked prefill: answers independent of load
+}
+
+
+def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
+    """vLLM engine arguments and environment of a --vllm-preset for a model's config.json -> (kwargs, env).
+    fast_prefill:
+    models whose last layers reuse earlier layers' keys and values (Gemma 4 E2B / E4B: num_kv_shared_layers) run those
+    layers at the answer position only during prefill (vLLM's kv_sharing_fast_prefill, YOCO); the generated token, the
+    only one basal reads, is the same, prompt log-probabilities would not be. media (--media on): at most
+    media.MAX_ITEMS items per prompt of the media the model takes, no video. A text-only server still loads the
+    encoders: without them (language_model_only) vLLM 0.31 picks another attention backend for Gemma 4 on an H100
+    (FlashAttention instead of Triton + FlashAttention) and keeps fewer KV tokens (mini: 911k instead of 978k)."""
+    if preset not in VLLM_PRESETS:
+        raise ValueError(f"unknown --vllm-preset {preset!r} (one of: {', '.join(VLLM_PRESETS)})")
+    invariant = VLLM_PRESETS[preset]
+    text = cfg.get("text_config") or cfg
+    kw, env = {}, {}
+    if invariant:
+        # batch-invariant kernels without the prefix cache and without chunked prefill: with them, a request's numbers
+        # depend on the states earlier requests left in the cache and on where the scheduler cut a long prompt (the
+        # 31B FP8 port, 2,000 decisions at 32 in flight, two runs: 96.9% the same top answer with the prefix cache,
+        # 99.95% without; basal-omni-1.1-max without it: every decision with 2-10 options bit-identical, 95.6% of
+        # those with 11-127). Triton attention: vLLM's batch-invariant FlashAttention is FlashAttention 2, which takes
+        # heads up to 256 wide (Gemma 4's global layers: 512; vLLM 0.31)
+        env["VLLM_BATCH_INVARIANT"] = "1"
+        kw.update(enable_prefix_caching=False, enable_chunked_prefill=False, attention_backend="TRITON_ATTN")
+    if fast_prefill and text.get("num_kv_shared_layers"):
+        kw["kv_sharing_fast_prefill"] = True
+    if media:
+        from .media import MAX_ITEMS, kinds_of
+        kw["limit_mm_per_prompt"] = {k: MAX_ITEMS if k in kinds_of(cfg) else 0 for k in ("image", "audio", "video")}
+    return kw, env
+
+
 class VLLMBackend:
-    """vLLM backend for ModelOpt FP8 / NVFP4 checkpoints. One generated token restricted to the option letters; with
+    """vLLM backend: bf16 checkpoints and the ModelOpt FP8 / NVFP4 ports, with the engine settings of a --vllm-preset
+    (VLLM_PRESETS, vllm_args). One generated token restricted to the option letters; with
     logprobs_mode="processed_logprobs" the log-probabilities are computed after that restriction, so the softmax over
     the letters equals the readout of the other backends. Where vLLM supports it, logprob_token_ids asks for exactly
     the letter ids: vllm-metal ignores the logprobs mode and returns the top-k of the unrestricted vocabulary, which
@@ -1541,33 +1823,84 @@ class VLLMBackend:
     CUDA (processed log-probabilities) are exactly the allowed codes."""
 
     LOGPROB_TOKEN_IDS = 128  # longest logprob_token_ids list vLLM accepts
+    lock = threading.Lock()  # one vLLM call at a time (text batches and media requests); a class default for tests
+    media_kinds, max_audio_s = (), None
 
-    def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10):
-        from vllm import LLM
+    def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
+                 fast_prefill=True, media=False):
+        cfg_file = Path(model_dir) / "config.json"
+        cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
+        kw, env = vllm_args(cfg, preset, media=media, fast_prefill=fast_prefill)
+        if media:  # --media on: the media the model takes (basal/media.py), as EagerBackend
+            from .media import audio_window, kinds_of
+            self.media_kinds = kinds_of(cfg)
+            if not self.media_kinds:
+                raise SystemExit("--media on: the model has no image or audio encoder (config.json: vision_config, "
+                                 "audio_config)")
+            if "Gemma4UnifiedForConditionalGeneration" in (cfg.get("architectures") or ()):
+                # basal-omni-1.1-max against --mode eager --media on (2.3 media check set): images 0.942 the same
+                # answer, accuracy -1.3 points; 19 of 285 audio clips expanded to other token counts
+                raise SystemExit("--media on with --mode vllm does not serve Gemma 4 Unified models (basal-omni-1.1-max): "
+                                 "vLLM 0.31 reads their images and audio differently from the model's processor; use "
+                                 "--mode eager --media on")
+            pc = Path(model_dir) / "processor_config.json"
+            self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
+        os.environ.update(env)  # before vLLM starts its engine process, which reads it
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.prefill = PREFILL
-        self.llm = LLM(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
-                       enable_prefix_caching=True, logprobs_mode="processed_logprobs",
-                       max_logprobs=max(16, max_options))
+        self.preset, self.engine_args, self.lock = preset, kw, threading.Lock()
+        from vllm import LLM
+        self.llm = LLM(**{**dict(model=str(model_dir), dtype=dtype, gpu_memory_utilization=mem, max_model_len=max_len,
+                                 enable_prefix_caching=True, logprobs_mode="processed_logprobs",
+                                 max_logprobs=max(16, max_options)), **kw})
         self.context = max_len - 1  # longest prompt: max_model_len holds the one generated token too
         self.context_reason = f"vLLM's --max-len {max_len}"
 
     def run(self, prompts, ids_list):
-        from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
         reqs = [TokensPrompt(prompt_token_ids=list(ids)) for ids in EagerBackend.encode(self, prompts)]
+        return [p for p, _ in self._generate(reqs, ids_list)]
+
+    def _generate(self, reqs, ids_list):
+        """One vLLM call -> [(softmax over the option codes, vLLM's output)]."""
+        from vllm import SamplingParams
         import inspect
         exact = "logprob_token_ids" in inspect.signature(SamplingParams).parameters
         sps = [SamplingParams(max_tokens=1, temperature=0.0, logprobs=len(ids), allowed_token_ids=list(ids),
                               **(dict(logprob_token_ids=list(ids)) if exact and len(ids) <= self.LOGPROB_TOKEN_IDS
                                  else {}))
                for ids in ids_list]
+        with self.lock:
+            outs = self.llm.generate(reqs, sps, use_tqdm=False)
         res = []
-        for o, ids in zip(self.llm.generate(reqs, sps, use_tqdm=False), ids_list):
+        for o, ids in zip(outs, ids_list):
             lp = o.outputs[0].logprobs[0]
             x = torch.tensor([lp[i].logprob if i in lp else -1e9 for i in ids], dtype=torch.float32)
-            res.append(torch.softmax(x, -1).tolist())
+            res.append((torch.softmax(x, -1).tolist(), o))
         return res
+
+    def run_media(self, msgs_list, ids_list, images, audio, max_soft_tokens, max_tokens=None):
+        """Prompts of one request with media, as EagerBackend.run_media reads them: the chat template's text with one
+        placeholder per item, which vLLM's Gemma 4 processor expands with the Hugging Face processor (detail: the
+        image's soft tokens). All prompts go into one vLLM call, so they share the request's media and state through
+        the prefix cache: [(position probabilities, prompt tokens, media tokens)]."""
+        from .media import SAMPLE_RATE
+        mm = {k: v for k, v in (("image", list(images)), ("audio", [(a, SAMPLE_RATE) for a in audio])) if v}
+        reqs = [{"prompt": self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                        enable_thinking=False) + self.prefill,
+                 "multi_modal_data": mm, "mm_processor_kwargs": {"max_soft_tokens": max_soft_tokens}}
+                for msgs in msgs_list]
+        try:
+            outs = self._generate(reqs, ids_list)
+        except ValueError as e:  # vLLM: "The decoder prompt (length N) is longer than the maximum model length ..."
+            n = re.search(r"\(length (\d+)\) is longer than", str(e))
+            if not n:
+                raise
+            raise ValueError(f"the prompt with its media is {n.group(1)} tokens, more than the {max_tokens or '?'} "
+                             "tokens of the context; send fewer or shorter media, or detail \"default\"") from None
+        media_ids = {t for t in (getattr(self.tok, "image_token_id", None), getattr(self.tok, "audio_token_id", None))
+                     if t is not None}
+        return [(p, len(o.prompt_token_ids), sum(t in media_ids for t in o.prompt_token_ids)) for p, o in outs]
 
     def run_shared(self, groups, policy=None):
         flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])
@@ -2261,6 +2594,9 @@ def load_modelopt_fp8(model_dir, device="cuda", dtype=torch.bfloat16):
         raise ValueError(f"{model_dir}: no FP8 linear layers (weight_scale / input_scale) in the checkpoint")
     missing, unexpected = model.load_state_dict(sd, strict=False)
     missing = [k for k in missing if k.rsplit(".", 1)[0] not in fp8]
+    if getattr(cfg, "tie_word_embeddings", False) and "lm_head.weight" in missing:
+        model.tie_weights()  # the output head is the embedding (Gemma 4): not in the checkpoint
+        missing.remove("lm_head.weight")
     if missing or unexpected:
         raise ValueError(f"{model_dir}: checkpoint does not match the model (missing {missing[:5]}, unexpected "
                          f"{unexpected[:5]})")

@@ -1,4 +1,59 @@
-# What is new in basal 2.2.1 (not released yet)
+# What is new in basal 2.3
+
+- **vLLM: KV-sharing fast prefill for basal-omni-1.0-mini, 1.43x / 1.60x** (`--mode vllm`, on by default for Gemma 4
+  E2B / E4B; `--vllm-fast-prefill off` restores 2.2). Its last 18 of 42 layers reuse earlier layers' keys and values,
+  so during prefill they run at the answer position only. One H100, against 2.2's vLLM path: 60.8 vs 41.5 decisions/s
+  for one question over a ~1.5k-token state, 39.0 vs 24.2 questions/s for five questions over 3k-10k tokens; the same
+  top answer as eager on 0.9994 of dev v2 decisions with margin >= 0.2, automation at 1% with the shipped calibration
+  within 0.2 points of eager. [OMNI.md](OMNI.md#vllm---mode-vllm)
+- **vLLM: images and audio for basal-omni-1.0-mini** (`--mode vllm --media on`): the same prompts and media tokens as
+  `--mode eager --media on`, all prompts of a request in one vLLM call. On the omni media check set: 96.5% / 98.3% the
+  same top answer as the eager media path (all where eager's margin >= 0.2), 6.0x / 7.9x the requests per second
+  (images / audio, 8 in flight). basal-omni-1.1-max is refused (its images and audio did not match the eager path).
+- **vLLM: `--vllm-preset deterministic`** for repeatable answers: batch-invariant kernels without the prefix cache and
+  chunked prefill; two runs of basal-omni-1.1-max at 32 in flight gave bit-identical probabilities. Costs throughput (1.1-max 0.64x single questions, 0.22x five questions over a long state); automation
+  at 1% with each model's shipped calibration within 0.2 points of eager. Presets load `CALIBRATION.vllm.<preset>.json`
+  when a model ships one.
+- **`basal-loadtest --seed`:** synthetic states from another seed, so a repeated load test does not answer from the
+  prefix cache of an earlier one.
+
+- **basal-omni in `--mode eager` computes a request's state once for all its questions.** The eager backend runs
+  Gemma 4 through the engine's own forward (`basal/gemma4.py`, transformers' modules and weights): a request's state
+  and media run once and every question and option order runs over them, the image and audio encoders once per
+  request, and mini's 18 KV-sharing layers only where the answer is read. On one H100 at 16 requests in flight, five
+  questions over a 3k-10k-token state: mini 1.6 -> 15.3 questions/s, max 0.7 -> 4.5; one question: mini 10.0 -> 17.2
+  decisions/s. Agreement with the 2.2 forward on dev v2: 1.000 (mini) and 0.9997 (max) on decisions with margin >=
+  0.2. `--eager-forward hf` keeps the 2.2 path. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+- **`--eager-attn auto` (opt-in, basal-omni in `--mode eager` on Hopper):** FlashAttention 3 in the sliding-window
+  layers and the memory-efficient kernel (keys and values copied per head) in the 512-wide global layers. One H100 at
+  16 in flight, against the default math kernel: mini 17.2 -> 24.4 decisions/s and 15.3 -> 19.0 questions/s over long
+  states, max 5.0 -> 8.7 and 4.5 -> 7.6. Top answers equal to the 2.2 forward on 0.9995 (mini) and 0.9991 (max) of the
+  dev v2 decisions with margin >= 0.2.
+- **`--ple-offload on` (basal-omni mini, `--mode eager`):** the 5.6 GB per-layer embedding table stays in host memory
+  and only the rows of each forward's tokens go to the GPU: 5.2 GB less GPU memory at about 4% fewer decisions per
+  second, the same answers. For mini on smaller GPUs.
+- **`--mode eager` avoids a torch attention bug.** Before torch 2.14.1, SDPA's memory-efficient kernel returns wrong
+  attention for keys and values expanded from one key / value head at some query lengths (pytorch/pytorch#191937):
+  transformers passes such a view with an attention mask, and basal-omni-1.0-max was off by 6.2 in code log-prob on a
+  1,857-token prompt. The eager backend now runs every model's transformers forward without that kernel on CUDA with
+  older torch (2.2 did so for Gemma 4 only).
+
+- **basal-omni in the CUDA graph engine, 3-6x 2.2's eager** (`--mode fast`; without `--mode`, the default for basal-omni on
+  Hopper GPUs with FlashAttention 3; text). Gemma 4 runs
+  through the engine's own layer code: SOAM's packed row and two passes over its sliding-window and global layers (the
+  window is a condition on positions inside the trie mask), key / value buffers per layer type, E4B's KV-shared layers
+  and the last own-key layer at the answer rows only, the fp32 readout with the softcap. On Hopper: FlashAttention 3 in
+  the sliding layers, FlexAttention in the 512-wide global ones, merged projections, compact rows, compiled; elsewhere
+  the math kernel of `--mode eager` (`--gemma-attn`). One H100, against 2.2's `--mode eager`: 1.1-max 16.2 vs 4.8 decisions
+  per second on single questions (vLLM bf16: 16.7) and 10.6 vs 0.7 questions per second with five questions over a long
+  state; mini 61.2 vs 10.0 and 21.4 vs 1.6; ultra 6.1 vs 2.0 and 4.8 vs 0.3. Same answers within bf16 rounding (dev
+  v2: 0.998-0.999 of the top answers at margin >= 0.2; with the shipped calibration files the automated share at 1%
+  within 0.1 points). On an RTX PRO 6000 Blackwell (`--mode fast --gemma-attn flex`, opt-in until its calibration
+  check): mini 23.2 vs 5.6 and 18.4 vs 0.85, 1.0-max 5.0 vs 2.3 and 5.3 vs 0.37 (vLLM is faster there for single max
+  questions). [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+- **Less GPU memory for basal-omni in the graph engine:** 8 MB cuBLAS workspaces per captured graph
+  (`CUBLAS_WORKSPACE_CONFIG` unless set; 32 MB each by default), no image / audio towers (text only), and long states
+  keep only the sliding layers' last window of keys and values (ultra's 10k-token states ran out of memory on 80 GB).
 
 - **Faster preparation of large requests.** The prompt language is detected from the state once per request in task
   expansion and once in question preparation, not once per question: an English state was re-scanned for Polish
