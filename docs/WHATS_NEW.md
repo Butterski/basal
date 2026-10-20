@@ -9,6 +9,11 @@
   `torch.set_num_threads`). basal-2.0-mini Q8_0 on a 6-core CPU: 1.34× faster on 16 recorded requests, probabilities
   bit-identical (each logit is still one dot product in one thread). Builds with every layer on Metal or CUDA are not
   affected. Contributed by Milosz (@Butterski), [#20](https://github.com/rkinas/basal/pull/20).
+- **`--mode mps` on the CPU** (`--device cpu`, the default without Apple Silicon): the packed engine (SOAM) computes a
+  request's state once for all its questions and option orders, where `--mode eager` computes it once per prompt.
+  basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: three task requests (41, 24 and 10 prompts) 838 s -> 88 s, 9.6x,
+  the same top answer on 75 of 75 readouts (max |Δp| 4e-6); single questions as fast as in `eager`. `--device cuda` is
+  refused (that is `--mode fast`). Contributed by Milosz (@Butterski), [#26](https://github.com/rkinas/basal/pull/26).
 
 # What is new in basal 2.3
 

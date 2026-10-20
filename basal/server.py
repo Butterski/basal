@@ -639,6 +639,8 @@ class Server:
         if attn not in ("auto", "fa2") and kind not in ("graph", "exit"):
             raise SystemExit(f"--attn {attn} needs the CUDA graph engine (--mode fast, fast-nocompile, fast-exit, fp8, "
                              "nvfp4)")
+        if kind == "mps" and a.device == "cuda":
+            raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
         # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
         md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp"))
         self.fmt = model_format(md)  # prompt format of the model (basal.json "prompt"; 1 when absent)
@@ -672,7 +674,7 @@ class Server:
         elif kind == "mlx":
             self.backend = MLXBackend(md, quant=quant)
         elif kind == "mps":
-            self.backend = MPSBackend(md, a.dtype, shared=shared)
+            self.backend = MPSBackend(md, a.dtype, shared=shared, device=a.device)
         elif kind == "gguf":
             self.backend = GGUFBackend(md, a.gguf)
         elif kind == "strix":
@@ -1284,7 +1286,9 @@ def add_engine_args(ap):
                     help="--mode eager with Gemma 4 E2B / E4B (basal-omni mini): keep the per-layer embedding table in "
                          "host memory and copy only the rows of each forward's tokens (E4B: 5.6 GB less GPU memory)")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
-                    help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu)")
+                    help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu) "
+                         "and --mode mps (mps or cpu; default: mps on Apple Silicon, else cpu: a request's state "
+                         "computed once for all its prompts, where eager computes it once per prompt)")
     ap.add_argument("--orders", type=orders_arg, default=None,
                     help="1 = the option order given; 2 = also the reversed order, averaged (shares the state); auto = "
                          "order 1, and the reversed order only where order 1 is uncertain (--auto-tau, --auto-band); "
