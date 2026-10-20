@@ -169,3 +169,39 @@ def test_long_lane_equals_separate():
     for r, e in zip(res[0] + res[1], separate(m, toks, lids)):
         assert torch.allclose(torch.tensor(r), e, atol=1e-6)
     assert calls == list(range(6)) * 2  # the root and the single prompt layer by layer; pass 2 runs whole
+
+
+def test_modelopt_fp8_gemma4_loads_tied_and_runs(tmp_path):
+    """A ModelOpt FP8 Gemma 4 checkpoint (the -FP8 repositories): the decoder linears become FP8Linear, the output head
+    is tied to the embedding (not in the checkpoint), and the graph engine's forward equals transformers' forward of
+    the loaded model (the FP8 product emulated on CPU)."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from basal.engine import FP8Linear, load_modelopt_fp8
+    m = tiny("e4b", torch.float32)
+    m.save_pretrained(tmp_path)
+    sd = {}
+    for name, mod in m.named_modules():
+        if isinstance(mod, torch.nn.Linear) and ".layers." in name and "per_layer" not in name:
+            w = mod.weight.detach().float()
+            ws = w.abs().max() / 448.0
+            sd[f"{name}.weight"] = (w / ws).to(torch.float8_e4m3fn)
+            sd[f"{name}.weight_scale"], sd[f"{name}.input_scale"] = ws.reshape(()), torch.tensor(0.05)
+    for k, v in m.state_dict().items():
+        if k != "lm_head.weight" and k.rsplit(".", 1)[0] + ".weight_scale" not in sd:
+            sd.setdefault(k, v.detach().clone())
+    for f in tmp_path.glob("*.safetensors"):
+        f.unlink()
+    save_file({k: v.contiguous() for k, v in sd.items()}, str(tmp_path / "model.safetensors"))
+    cfg = json.loads((tmp_path / "config.json").read_text())
+    cfg["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "FP8"}
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    q = load_modelopt_fp8(tmp_path, "cpu", torch.float32)
+    assert q.lm_head.weight.data_ptr() == q.model.embed_tokens.weight.data_ptr()
+    assert sum(isinstance(x, FP8Linear) for x in q.modules()) > 0
+    ids = torch.randint(0, 64, (1, 13), generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        ref = q.model(input_ids=ids).last_hidden_state[0, -1]
+    assert torch.allclose(Gemma4Graph(q).forward(ids, ro=torch.tensor([[12]]))[0, 0], ref, atol=1e-5)

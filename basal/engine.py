@@ -2404,6 +2404,9 @@ def load_modelopt_fp8(model_dir, device="cuda", dtype=torch.bfloat16):
         raise ValueError(f"{model_dir}: no FP8 linear layers (weight_scale / input_scale) in the checkpoint")
     missing, unexpected = model.load_state_dict(sd, strict=False)
     missing = [k for k in missing if k.rsplit(".", 1)[0] not in fp8]
+    if getattr(cfg, "tie_word_embeddings", False) and "lm_head.weight" in missing:
+        model.tie_weights()  # the output head is the embedding (Gemma 4): not in the checkpoint
+        missing.remove("lm_head.weight")
     if missing or unexpected:
         raise ValueError(f"{model_dir}: checkpoint does not match the model (missing {missing[:5]}, unexpected "
                          f"{unexpected[:5]})")
