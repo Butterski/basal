@@ -86,7 +86,8 @@ from . import tasks as task_types
 from .engine import resolve
 from .prompt import max_options, model_format
 from .server import (MODES, Server, _text, add_engine_args, calibration_file, calibration_name, calibration_orders,
-                     certified, default_mode, load_calibration, model_identity, temper, temperature, to_items)
+                     certified, default_mode, load_calibration, model_identity, refuse_lean_flex, temper, temperature,
+                     to_items)
 from .sets import label_set_id
 from .sets import select as select_set
 
@@ -1250,6 +1251,7 @@ def main(argv=None):
         task_responses = []
     else:
         a.model = a.model or add_engine_args(argparse.ArgumentParser()).get_default("model")  # basal-serve's
+        refuse_lean_flex(a.lean, a.tree)  # before default_mode, which resolves the model on CUDA GPUs without FA3
         mode = a.mode or default_mode(a.model, a.revision)
         srv = Server(argparse.Namespace(**{**vars(a), "mode": mode, "name": None, "calibration": None,
                                            "no_calibration": True, "log_decisions": None}))
