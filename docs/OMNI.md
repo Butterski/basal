@@ -11,9 +11,12 @@ uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags
 basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000    # or Remek/basal-omni-1.0-mini
 ```
 
-- **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), and, since v2.1.0, `vllm`
-  (text only; faster, with prefix caching and FlashAttention). The `-FP8` checkpoints (mini, max, ultra) run on
-  `--mode vllm` only.
+- **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), since v2.1.0 `vllm` (text only;
+  faster, with prefix caching and FlashAttention) and, since 2.3, `fast` / `fast-nocompile` (text only; the CUDA
+  graph engine, below). Without `--mode`, basal-omni runs `fast` on Hopper GPUs with the `flash_attn_3` package (the
+  configuration its gate passed) and `eager` on other GPUs until they pass theirs (2.2.0 had no working default for
+  basal-omni on CUDA: `fast` stopped while loading the model). The `-FP8` checkpoints (mini, max, ultra) run on `--mode vllm`;
+  basal-omni-1.0-mini-FP8 also on `--mode fast` (its port gate below).
   With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max and the `-FP8` checkpoints) uses
   it; the others use their `CALIBRATION.json`.
 - **Repeatable answers with vLLM:** vLLM's numbers depend on what the server computed before (prefix cache,
@@ -30,14 +33,68 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 
 ## What the engine does differently for Gemma 4
 
-- **Attention kernel:** SDPA runs on the math kernel only. The memory-efficient kernel returned wrong attention on
-  real Gemma 4 activations in some shapes, and FlashAttention does not take Gemma's 512-wide global heads.
+- **Attention kernel (`--mode eager`):** SDPA runs on the math kernel only. The memory-efficient kernel returned wrong
+  attention on real Gemma 4 activations in some shapes, and FlashAttention does not take Gemma's 512-wide global heads.
 - **Padding:** left-padded prompts in a batch read at their own positions, so a padded prompt gives the same answer as
   the prompt alone.
 - **Code logits:** option codes are read in fp32 from the output head's input, with Gemma's final logit softcap
   applied in fp32. The model body runs in bf16.
-- **Not yet for Gemma 4:** `fast` (shared prefix, CUDA graphs), the engine's own `fp8` and `nvfp4` modes and SGLang.
-  FP8 weights are served through vLLM (the `-FP8` checkpoints). The rest come with a later basal-omni release.
+- **`fast` and `fast-nocompile` (basal 2.3, text):** the CUDA graph engine runs Gemma 4 through its own layer code
+  (`basal/gemma4_graph.py`, transformers' modules and weights) under the engine's packing, graphs and caches:
+  - **SOAM over sliding-window layers.** The packed row of a request and its two passes work as for every basal model
+    ([SOAM.md](SOAM.md)); in the sliding-window layers (window 512 on E4B, 1,024 on 12B and 31B) a branch token sees a
+    key only within the window of its own position, as in its prompt alone, so the window is a condition on positions
+    inside the trie mask.
+  - **Keys and values per layer type** (head size 256 in sliding, 512 in global layers; 12B / 31B: one projection for
+    keys and values in global layers). E4B's last 18 of 42 layers reuse the keys and values of earlier layers.
+  - **Readout rows only.** Those KV-shared layers, and the attention and MLP of the last layer with its own keys and
+    values, run at the answer positions only (they produce nothing a later token reads): same answers, ~40% less
+    compute per decision on E4B.
+  - **Attention kernel** (`--gemma-attn`): `auto` (default) is `fa3` in `--mode fast` on Hopper with the
+    `flash_attn_3` wheel (as `--attn auto`), else `math`. `fa3`: FlashAttention 3 with the window in the sliding layers,
+    FlexAttention in the 512-wide global layers (32 x 32 tiles: the default tiles need more shared memory than an
+    H100 has) and wherever the trie needs a mask; compiled, with merged q / k / v and gate / up (`--merge auto`) and
+    compact rows (`--batches auto`: prompts back to back in one row, no padding). `math`: the kernel of `--mode
+    eager`, uncompiled. Also `flex` (FlexAttention everywhere) and `fa3+math`. On Blackwell, `auto` is `math` until
+    FlexAttention there has its own identity gate.
+  - Text only: `--media on` needs `--mode eager`; the image and audio towers are not loaded. Each captured CUDA graph
+    keeps its own cuBLAS workspace, so the engine sets `CUBLAS_WORKSPACE_CONFIG=:4096:2` for Gemma 4 unless you set it
+    (1.1-max ran out of GPU memory in warm-up with the default; the smaller workspace did not change its forward
+    time). On 31B the graph grid shrinks to fit (key / value buffers within 15% of the free memory). A state beyond the
+    largest graph keeps only the last window of the sliding layers' keys and values (a question never reads further
+    back), also in the state cache: a fifth of the memory per token on 31B.
+  - `--mode fp8` / `nvfp4` (quantisation at load time) are refused for basal-omni: torchao FP8 on 1.1-max missed the
+    port gate (0.9892 at margin >= 0.2 on 2-10 options, bar 0.9893). Serve an `-FP8` checkpoint instead.
+
+  Measured 2026-10-20 on one H100 against `--mode eager` of the same engine (the gate of the FP8 ports, as above;
+  dev v2, 10,606 decisions, one order; automated share at 1% on the calibration test split with the calibration file
+  the mode loads, paired bootstrap, bar: 95% lower bound of the difference >= -0.5 points; `basal-loadtest` at 16 in
+  flight: one question over a ~1.5k-token state, and five questions over 3k-10k-token states):
+
+  | model, configuration | agreement (all / at margin >= 0.2) | accuracy | ECE | automated at 1% (eager) | decisions/s, one question (eager) | questions/s, five over a long state (eager) |
+  |---|---|---|---|---|---|---|
+  | mini, `fast` (auto: fa3, compact rows) | 0.9937 / 0.9994 | +0.00 pt | +0.000 | 41.97% (41.99%) | 61.2 (10.0) | 21.4 (1.6) |
+  | 1.1-max, `fast` (auto: fa3, compact rows) | 0.9891 / 0.9990 | +0.04 pt | -0.001 | 47.16% (47.10%) | 16.2 (4.8) | 10.6 (0.7) |
+  | mini, `fast --gemma-attn math` | 0.9984 / 0.9997 | -0.02 pt | +0.000 | | 15.8 | 7.9 |
+  | 1.1-max, `fast --gemma-attn math` | 0.9992 / 0.9997 | +0.01 pt | -0.000 | | 3.8 | 2.0 |
+  | ultra, `fast` (auto: fa3, compact rows) | 0.9918 / 0.9985 | -0.06 pt | +0.002 | 56.73% (56.82%) | 6.1 (2.0 at 4 in flight) | 4.8 (0.3 at 2 in flight) |
+  | mini-FP8 checkpoint, `fast` | 0.9635 / 0.9908 | -0.26 pt | +0.002 | 41.82% (41.99%) | 80.6 | 19.6 |
+
+  `--mode fast` has no calibration file of its own (it never loads a `CALIBRATION.fast.json`): it loads the model's
+  `CALIBRATION.json`, fitted on eager readouts, and the automated shares above are measured with that file (mini-FP8:
+  the `-FP8` repository's `CALIBRATION.json`, fitted on vLLM FP8 readouts; at the 5% target it automates 63.5% against
+  eager's 77.4%). A calibration refitted on fast-mode readouts is not shipped: the refit moves the certified thresholds
+  by fit noise, not because the readouts differ (top answer 0.996-0.997 of the calibration test against eager's, no
+  mean shift of the confidence). Refits of four fast configurations of 1.1-max with equally close readouts automated
+  -0.49, -0.39, -0.05 and -0.11 points against eager's own fit at 1% (the default configuration: -0.11), ultra's -0.56
+  (its refit's yes / no temperature is 0.958 against 0.944, so fewer yes / no answers clear the threshold), and mini's
+  refit certifies choice questions only at confidence 0.9998 at the 5% target (32.7% automated instead of 77.4%). On
+  one 80 GB H100 ultra answers five questions over 3k-10k-token states at 4.8 per second (vLLM bf16 with `--max-len
+  8192`: 3.8). For comparison, vLLM bf16 on 1.1-max: 0.9866 / 0.9994, 16.7 decisions/s, 10.8 questions/s.
+  With the math kernel (fp32 scores, without tensor cores) 1.1-max's single questions are slower than eager's larger
+  batches. In fp32 every path of `fast` (fa3's compiled code with flex in place of FA3) gives the answers of separate
+  prompts (identity gate: max |dp| 1.6e-5). Start-up: about 5 minutes (compile and graph capture).
+- **Not yet for Gemma 4:** the engine's `nvfp4` mode and SGLang.
 
 ## GGUF (llama.cpp, Ollama) and MLX (text)
 

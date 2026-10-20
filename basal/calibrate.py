@@ -1248,7 +1248,7 @@ def main(argv=None):
         task_responses = []
     else:
         a.model = a.model or add_engine_args(argparse.ArgumentParser()).get_default("model")  # basal-serve's
-        mode = a.mode or default_mode()
+        mode = a.mode or default_mode(a.model, a.revision)
         srv = Server(argparse.Namespace(**{**vars(a), "mode": mode, "name": None, "calibration": None,
                                            "no_calibration": True, "log_decisions": None}))
         kind, quant, fmt, orders = srv.kind, a.quant or MODES[mode][1], srv.fmt, srv.orders

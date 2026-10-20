@@ -40,7 +40,8 @@ from pathlib import Path
 import torch
 
 from .engine import (ATTN, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, resolve, set_fp8_fast_accum)
+                     MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, attention_available, resolve,
+                     set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from . import tasks
@@ -77,10 +78,15 @@ MODES = {
 }
 
 
-def default_mode():
+def default_mode(model=None, revision=None):
     """fast on CUDA, mlx on Apple Silicon when mlx and mlx-lm are installed, mps otherwise there, tpu on a TPU VM
-    with basal[tpu] installed, else eager."""
+    with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only where
+    the configuration its gate passed runs (FlashAttention 3: Hopper with flash_attn_3), eager on other GPUs until they
+    pass their own (2.2.0 had no working default for it there: fast stopped at "'Gemma4Model' object has no attribute
+    'layers'")."""
     if torch.cuda.is_available():
+        if model is not None and attention_available("fa3") is not None and _gemma4(model, revision):
+            return "eager"
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         try:
@@ -93,6 +99,15 @@ def default_mode():
     if tpu_available():
         return "tpu"
     return "eager"
+
+
+def _gemma4(model, revision=None):
+    """A Gemma 4 model (basal-omni), from its config.json; False when that cannot be read (the server says why)."""
+    from .gemma4_graph import is_gemma4_dir
+    try:
+        return is_gemma4_dir(resolve(model, revision, metadata_only=True))
+    except Exception:  # offline without the model cached, a wrong name: the model load reports it
+        return False
 
 
 def validate_quant(mode, quant):
@@ -671,7 +686,8 @@ class Server:
                                         prefix=getattr(a, "prefix_cache", "off") == "on",
                                         batches=getattr(a, "batches", "default"),
                                         readout_layer=getattr(a, "readout_layer", "off"),
-                                        template=getattr(a, "template_prefix", "off"))
+                                        template=getattr(a, "template_prefix", "off"),
+                                        gemma_attn=getattr(a, "gemma_attn", "auto"))
         self.tok = self.backend.tok
         self.states_cached = bool(getattr(a, "state_cache_gb", 0))  # --state-cache-gb: requests are cut at their state
         model = getattr(self.backend, "model", None)  # evidence head: needs the in-process HF model
@@ -1286,6 +1302,14 @@ def add_engine_args(ap):
     ap.add_argument("--attn", choices=list(ATTN), default="auto",
                     help="attention kernel of the CUDA graph engine: auto (FlashAttention 3 on Hopper when installed, "
                          "else 2; FP8 checkpoints and --mode fp8: 2), fa2 (torch SDPA), fa3, fa4 (flash-attn-4), cudnn")
+    ap.add_argument("--gemma-attn", dest="gemma_attn", choices=["auto", "math", "flex", "fa3", "fa3+math"],
+                    default="auto",
+                    help="CUDA graph engine, Gemma 4 (basal-omni): the attention kernel of its layers: math (torch "
+                         "SDPA's math kernel, as --mode eager), flex (FlexAttention with block masks: sliding window, "
+                         "trie), fa3 (FlashAttention 3 in the sliding-window layers' plain rows, flex elsewhere; "
+                         "Hopper), fa3+math (FlashAttention 3 in the sliding layers, math in the global ones). auto: "
+                         "fa3 in --mode fast where FlashAttention 3 runs (with merged projections and compact rows), "
+                         "else math")
     ap.add_argument("--merge", choices=["auto", "on", "off"], default="auto",
                     help="CUDA graph engine: one q/k/v and one gate/up GEMM per layer (bf16: the same products; FP8 "
                          "checkpoints: the merged weights re-quantised per tensor). auto: on for bf16 weights, off for "
@@ -1378,7 +1402,7 @@ def parser():
 
 def main():
     a = parser().parse_args()
-    a.mode = a.mode or default_mode()
+    a.mode = a.mode or default_mode(a.model, a.revision)
     validate_quant(a.mode, a.quant)
     if a.mcp == "on":
         from .mcp_server import available
