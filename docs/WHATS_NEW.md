@@ -42,6 +42,10 @@
   error, with the same `{"error": ...}` body. `GET /health` also returns the requests in flight as `running` and
   `queued` (waiting for the engine), so a manager can tell when the server is idle ([API.md](API.md)). Suggested by
   @edurdias, [#22](https://github.com/rkinas/basal/issues/22).
+- **`basal-calibrate --strict` says when it tested nothing.** The family check needs 30 CERT decisions of a type in a
+  family (`--min-family`); with fewer in every family it passed without a test. It still passes, but now prints
+  "0 families tested" for each such type on stderr and in the report. Reported by @agentGreg,
+  [#19](https://github.com/rkinas/basal/issues/19).
 
 # What is new in basal 2.3
 
