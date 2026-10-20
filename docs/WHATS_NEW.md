@@ -4,6 +4,11 @@
   from the start of the text (and retried at every position of a long token), O(n²) per document; it is now read
   backwards from the sentence end (a 98k-character document: 13 s on the event loop before the 600-unit refusal, now
   4 ms). Same units as before. Contributed by Milosz (@Butterski), [#16](https://github.com/rkinas/basal/pull/16).
+- **`--mode gguf` uses every physical core.** llama.cpp in process ran its own default of 4 threads; it now takes
+  PyTorch's thread count (the physical cores within the process's CPU affinity, or `OMP_NUM_THREADS` /
+  `torch.set_num_threads`). basal-2.0-mini Q8_0 on a 6-core CPU: 1.34× faster on 16 recorded requests, probabilities
+  bit-identical (each logit is still one dot product in one thread). Builds with every layer on Metal or CUDA are not
+  affected. Contributed by Milosz (@Butterski), [#20](https://github.com/rkinas/basal/pull/20).
 
 # What is new in basal 2.3
 

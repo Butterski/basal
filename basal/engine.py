@@ -2205,6 +2205,9 @@ class GGUFBackend(GraphBackend):
         cp.n_seq_max = self.N_SEQ
         cp.kv_unified = True  # sequences share the cells of their common prefix
         cp.swa_full = True  # sliding-window layers (Gemma 4) keep every cell: a shared prefix cell stays readable
+        # llama.cpp's own default is 4 threads (GGML_DEFAULT_N_THREADS); PyTorch's count is the physical cores (or
+        # OMP_NUM_THREADS / torch.set_num_threads). Each output element stays one dot product in one thread: same logits.
+        cp.n_threads = cp.n_threads_batch = torch.get_num_threads()
         self.ctx = C.llama_init_from_model(self.cmodel, cp)
         if not self.ctx:
             raise ValueError("llama.cpp could not create a context")
