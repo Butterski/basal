@@ -650,6 +650,9 @@ class GraphBackend(EagerBackend):
             self.TOKEN_BUDGET = min(self.TOKEN_BUDGET, max(cap // 512 * 512, 1024))
             self.PLAIN_LENS = [x for x in self.PLAIN_LENS if x <= max(cap, self.PLAIN_LENS[0])]
             self.LENS = [x for x in self.LENS if x <= self.PLAIN_LENS[-1]]
+            # compact rows hold no keys / values, but their activations and graph pool grow with the row: 31B with
+            # compact rows of 12,288 tokens ran out of memory in warm-up (12.5 GB of graph pool, 20 Oct)
+            self.COMPACT_LENS = [x for x in self.COMPACT_LENS if x <= self.TOKEN_BUDGET]
 
     def _kv_tokens(self):
         """Tokens of the key / value buffer: the largest plain graph and the largest pass-2 graph's rows over the
