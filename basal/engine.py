@@ -1732,12 +1732,14 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
         if text.get("attention_k_eq_v"):  # Gemma 4 12B / 31B (values = keys): vLLM 0.31's FlashAttention with an FP8
             kw["attention_backend"] = "TRITON_ATTN"  # cache fails at start-up (H100: "Expected strides ... got 0")
     if invariant:
-        # batch-invariant kernels without the prefix cache: with it, a request's numbers depend on the states earlier
-        # requests left in the cache (the 31B FP8 port, 2,000 decisions at 32 in flight, two runs: 96.9% the same top
-        # answer with the prefix cache, 99.95% without). Triton attention: vLLM's batch-invariant FlashAttention is
-        # FlashAttention 2, which takes heads up to 256 wide (Gemma 4's global layers: 512; vLLM 0.31)
+        # batch-invariant kernels without the prefix cache and without chunked prefill: with them, a request's numbers
+        # depend on the states earlier requests left in the cache and on where the scheduler cut a long prompt (the
+        # 31B FP8 port, 2,000 decisions at 32 in flight, two runs: 96.9% the same top answer with the prefix cache,
+        # 99.95% without; basal-omni-1.1-max without it: every decision with 2-10 options bit-identical, 95.6% of
+        # those with 11-127). Triton attention: vLLM's batch-invariant FlashAttention is FlashAttention 2, which takes
+        # heads up to 256 wide (Gemma 4's global layers: 512; vLLM 0.31)
         env["VLLM_BATCH_INVARIANT"] = "1"
-        kw.update(enable_prefix_caching=False, attention_backend="TRITON_ATTN")
+        kw.update(enable_prefix_caching=False, enable_chunked_prefill=False, attention_backend="TRITON_ATTN")
     if fast_prefill and text.get("num_kv_shared_layers"):
         kw["kv_sharing_fast_prefill"] = True
     if media:
