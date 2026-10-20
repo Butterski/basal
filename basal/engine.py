@@ -631,6 +631,7 @@ class GraphBackend(EagerBackend):
         torch_varlen = not fa3 and batches == "compact" and why is None
         self.compact = batches in ("compact", "auto") and (fa3 or torch_varlen) and self.dev.type == "cuda"
         _VARLEN["impl"] = "torch" if torch_varlen else "fa3"
+        self.compact_kernel = ("torch varlen" if torch_varlen else "fa3") if self.compact else None  # start-up line
         if batches == "compact" and not self.compact:
             raise ValueError("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper; Gemma 4: "
                              f"--gemma-attn fa3) or torch's varlen attention ({why})")

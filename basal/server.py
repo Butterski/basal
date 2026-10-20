@@ -1446,8 +1446,10 @@ def main():
         from .think import ThinkServer
         srv = ThinkServer(a)
     attn = getattr(srv.backend, "attn", None)
-    print(f"basal: model {a.model} mode {a.mode}{f' attention {attn}' if attn else ''} ready in {time.time() - t0:.0f}s "
-          f"on port {a.port}", flush=True)
+    rows = getattr(srv.backend, "compact_kernel", None)  # compact rows: their kernel, and the template prefix with them
+    info = (f" attention {attn}" if attn else "") + (f" compact rows {rows}" if rows else "") \
+        + (" template prefix" if rows and getattr(srv.backend, "template", None) else "")
+    print(f"basal: model {a.model} mode {a.mode}{info} ready in {time.time() - t0:.0f}s on port {a.port}", flush=True)
 
     async def systemone(request):
         try:
