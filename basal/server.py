@@ -1449,6 +1449,8 @@ def main():
             return JSONResponse(await srv.decide(await request.json()))
         except Exception as e:  # noqa: BLE001
             print(f"basal: request failed: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr, flush=True)
+            if isinstance(e, torch.OutOfMemoryError):  # the failed forward's blocks back to the GPU: kept by the
+                torch.cuda.empty_cache()  # allocator, they failed the next requests too (ultra, 20 Oct)
             return JSONResponse({"error": str(e)}, status_code=422)
 
     async def models(_):

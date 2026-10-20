@@ -976,9 +976,10 @@ class GraphBackend(EagerBackend):
                                 basal_prefix=prefix, basal_kv=kv).last_hidden_state
 
     one_forward = 0  # tokens of the longest state run as one forward (_one_forward_tokens; 0: every one in chunks)
-    # of the free memory after warm-up a state beyond the largest graph may take in one forward: ultra on an 80 GB
-    # H100 has 8.4 GB free after warm-up and one forward of 32k tokens peaked 7.5 GB above it (48k ran out of memory)
-    ONE_FORWARD_SHARE = 0.8
+    # of the free memory after warm-up a state beyond the largest graph may take in one forward (else in chunks; one
+    # that runs out of memory anyway is redone in chunks): ultra on an 80 GB H100 has 8-12 GB free after warm-up, and
+    # one forward of 32k tokens ran in one start-up and out of memory in another (20 Oct): at the edge, so chunked
+    ONE_FORWARD_SHARE = 0.5
 
     def _one_forward_tokens(self):
         """The longest prompt or state beyond the largest graph that runs as one forward (2.3.0's path, the fastest);
@@ -1318,10 +1319,15 @@ class GraphBackend(EagerBackend):
                 h = self._continue(list(t))[1][None].expand(len(last), -1).clone()
                 torch.cuda.empty_cache()
                 return h
-            if self.gemma is not None:  # a single prompt (or duplicates) reads out at its last token
-                return self._forward(self._to_dev(torch.tensor([t])), ro=self._to_dev(torch.tensor([[last[0]]])))[
-                    0, [0] * len(last)]
-            return self._forward(self._to_dev(torch.tensor([t])))[0, last]
+            try:
+                if self.gemma is not None:  # a single prompt (or duplicates) reads out at its last token
+                    return self._forward(self._to_dev(torch.tensor([t])), ro=self._to_dev(torch.tensor([[last[0]]])))[
+                        0, [0] * len(last)]
+                return self._forward(self._to_dev(torch.tensor([t])))[0, last]
+            except torch.OutOfMemoryError:  # beyond what the estimate allowed for: in chunks after all
+                torch.cuda.empty_cache()
+                self.one_forward = min(self.one_forward, n - 1)
+                return self._plain_hidden(packs, idx)
         L, b = self._bucket(n, self.PLAIN_LENS), self._bucket(len(idx), self.BATCHES)
         g, ids, _, *ro, out = self._graph(b, L)
         h_ids, _, _, rows, cols, _ = self._host_rows(packs, idx, b, L)
@@ -1451,9 +1457,15 @@ class GraphBackend(EagerBackend):
                 kv, h1 = self._continue(list(packs[idx[0]][0][:L]))
                 kv, h1 = [(k[None], v[None]) for k, v in kv], h1[None, None]
             else:
-                kv = self._kv_new(L)
-                ro = self._to_dev(torch.tensor([[L - 1]])) if self.gemma is not None else None
-                h1 = self._forward(self._to_dev(torch.tensor([packs[idx[0]][0][:L]])), kv, ro)
+                try:
+                    kv = self._kv_new(L)
+                    ro = self._to_dev(torch.tensor([[L - 1]])) if self.gemma is not None else None
+                    h1 = self._forward(self._to_dev(torch.tensor([packs[idx[0]][0][:L]])), kv, ro)
+                except torch.OutOfMemoryError:  # beyond what the estimate allowed for: in chunks after all
+                    kv = None
+                    torch.cuda.empty_cache()
+                    self.one_forward = min(self.one_forward, L - 1)
+                    return self._tree_hidden(packs, idx, keys, hits)
         else:
             L, B = self._bucket(max(P), self.PLAIN_LENS), self._bucket(b, self.BATCHES)
             g, ids, kv, *ro, h1 = self._graph(B, L)
