@@ -8,7 +8,8 @@ import json
 import pytest
 import torch
 from transformers import (Gemma4AudioConfig, Gemma4Config, Gemma4ForCausalLM, Gemma4ForConditionalGeneration,
-                          Gemma4TextConfig, Gemma4VisionConfig)
+                          Gemma4TextConfig, Gemma4UnifiedConfig, Gemma4UnifiedForConditionalGeneration,
+                          Gemma4UnifiedTextConfig, Gemma4UnifiedVisionConfig, Gemma4VisionConfig)
 
 from basal import engine
 from basal.engine import EagerBackend
@@ -225,3 +226,37 @@ def test_eager_forward_choice(tmp_path, monkeypatch):
     assert EagerBackend(tmp_path, "float32", device="cpu").g4 is None
     with pytest.raises(ValueError):
         EagerBackend(tmp_path, "float32", device="cpu", forward="fast")
+
+
+def test_unified_image_blocks_in_every_layer():
+    """Gemma 4 unified (basal-omni max, 1.1-max): an image's soft tokens attend to each other in every layer and past the
+    sliding window, as transformers builds its masks (31B: sliding-window layers only, within the window). The image
+    here (12 soft tokens) is longer than the window (8)."""
+    torch.manual_seed(0)
+    t = Gemma4UnifiedTextConfig(vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=6,
+                                num_attention_heads=4, num_key_value_heads=2, head_dim=16, global_head_dim=32,
+                                sliding_window=8, layer_types=["sliding_attention", "sliding_attention",
+                                                               "full_attention"] * 2,
+                                final_logit_softcapping=30.0, max_position_embeddings=1024, rope_parameters=ROPE,
+                                attention_k_eq_v=True, num_global_key_value_heads=1)
+    v = Gemma4UnifiedVisionConfig(patch_size=2, pooling_kernel_size=1, mm_embed_dim=32, mm_posemb_size=16,
+                                  output_proj_dims=32)
+    m = Gemma4UnifiedForConditionalGeneration(Gemma4UnifiedConfig(
+        text_config=t, vision_config=v, audio_config=None, image_token_id=IMG, video_token_id=VID, boi_token_id=BOI,
+        eoi_token_id=EOI)).eval()
+    g = Gemma4Forward(m)
+    assert g.unified_blocks and g.block_types == {"sliding_attention", "full_attention"}
+    px = torch.randn(1, 12, 12, generator=torch.Generator().manual_seed(2))  # 3 x 4 patches of 2 x 2 x 3
+    yx = torch.stack(torch.meshgrid(torch.arange(3), torch.arange(4), indexing="ij"), -1).reshape(1, 12, 2)
+    feats = g.media_features(dict(pixel_values=px, image_position_ids=yx))
+    state = torch.randint(1, 50, (20,), generator=torch.Generator().manual_seed(3)).tolist()
+    head = [2, 5, 6, BOI] + [IMG] * feats["image"].shape[0] + [EOI, 7]
+    prompts = [head + state + [11, 12, 13], head + state + [11, 14], head + state + [15, 16, 17]]
+    for chunk in (2048, 6):  # 6: the prefix in parts around the image (never inside it)
+        g.CHUNK = chunk
+        for p, h in zip(prompts, g.hidden([prompts], media=feats)[0]):
+            ids = torch.tensor([p])
+            with torch.no_grad():
+                r = m.model(input_ids=ids, pixel_values=px, image_position_ids=yx,
+                            mm_token_type_ids=(ids == IMG).long()).last_hidden_state[0, -1]
+            assert (h - r).abs().max() <= 1e-4 * r.abs().max()

@@ -16,8 +16,9 @@ model (the same modules and weights) in its own loop, for three things the trans
   query attending the stored keys. A prefix stops after the keys and values of that layer. Same maths.
 - **Media once per request:** the image and audio towers run once for all prompts of a request (the prompts carry the
   same media), and the soft tokens are part of the shared prefix. On the larger Gemma 4 models
-  (use_bidirectional_attention "vision") the soft tokens of one image attend to each other in the sliding-window
-  layers, as transformers builds the mask; a prefix part never ends inside an image.
+  (use_bidirectional_attention "vision") the soft tokens of one image attend to each other as transformers builds the
+  masks: Gemma 4 31B in its sliding-window layers within the window, the unified models (basal-omni max, 1.1-max) in
+  every layer, past the window as well; a prefix part never ends inside an image.
 
 Attention is torch SDPA with an explicit boolean mask (the math kernel; EagerBackend turns the others off for Gemma 4).
 """
@@ -67,6 +68,13 @@ class Gemma4Forward:
         self.store = set(self.src.values())
         self.ple = bool(getattr(cfg, "hidden_size_per_layer_input", 0))
         self.bidir = getattr(cfg, "use_bidirectional_attention", None) == "vision"
+        # where an image's soft tokens see each other: transformers' Gemma 4 (31B) masks the sliding-window layers only,
+        # the window still applying (create_masks_for_vision_model); Gemma 4 unified (max, 1.1-max) passes the image
+        # blocks to every layer's mask, OR-ed after the window (create_masks_for_generate). Taking the 31B rule for max
+        # moved image answers by up to 0.48 against the transformers forward (33 of 150 images over 0.05; H100,
+        # 2026-10-20); text and audio were unaffected
+        self.unified_blocks = str(getattr(cfg, "model_type", "")).startswith("gemma4_unified")
+        self.block_types = set(self.types) if self.unified_blocks else {"sliding_attention"}
         self.rope = sys.modules[type(self.layers[0].self_attn).__module__].apply_rotary_pos_emb
         self.answer_rows = answer_rows
         top = model.config
@@ -124,10 +132,15 @@ class Gemma4Forward:
         sliding = t == "sliding_attention"
         d = qpos[:, :, None] - pos[:, None, :]
         m = d >= 0
-        if sliding and qblk is not None:
-            m = m | ((qblk[:, :, None] == qblk[:, None, :]) & (qblk[:, :, None] >= 0))
+        block = None
+        if qblk is not None and t in self.block_types:
+            block = (qblk[:, :, None] == qblk[:, None, :]) & (qblk[:, :, None] >= 0)
+        if block is not None and not self.unified_blocks:
+            m = m | block  # 31B: within the window
         if sliding:
             m = m & (d < self.window)
+        if block is not None and self.unified_blocks:
+            m = m | block  # unified: the whole image, past the window too
         m = m & (valid[:, None, :] | (d == 0))
         if kc is not None:
             dc = qpos[:, :, None] - kc[:, None, :]
