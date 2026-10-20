@@ -49,8 +49,8 @@ Method (the one the shipped files were fitted with):
     once pooled over all types (thresholds[r].confidence, informational: basal-serve never applies it). A type
     without a certified threshold of its own ("confidence": null, or no entry) has every automatic action of act and
     tool with that max_error deferred ("no certified threshold for this type at this max_error"). A few hundred
-    decisions usually certify 5%; 1% needs at least 299 accepted FIT decisions without an error (about 1,000 items or
-    more);
+    decisions usually certify 5%; 1% needs at least 299 accepted FIT decisions of the type without an error (about
+    1,000 items of the type or more);
   * gates: ece_lofo per type, for every family the temperatures fitted on the FIT decisions of the other families and
     the ECE measured on its CERT decisions (mean and max over the families with at least --min-family CERT decisions
     of the type, and pooled over all of them), next to --reference (basal-1.5: the same statistic on our calibration
@@ -814,10 +814,12 @@ def fit(rows, baseline, targets, min_per_type=50, fmt=1, min_family=30, referenc
         if not rs:
             continue
         cert = [r for r in cert_rows if r["prim"] == t]
+        # as served: a choice question of a format-2 file gets its option-count bucket temperature first
         report["types"][t] = dict(n=len(rs), n_fit=len(rs) - len(cert), n_cert=len(cert),
                                   accuracy=float(np.mean([ok for _, ok in served(rs, {})])),
                                   T_shipped=shipped_T.get(t), T=temps.get(t), source=source.get(t, "default 1.0"),
-                                  ece_shipped=ece(served(cert, shipped_T)), ece=ece(served(cert, temps)))
+                                  ece_shipped=ece(served(cert, shipped_T, shipped_B)),
+                                  ece=ece(served(cert, temps, buckets)))
     gates = dict(ece_lofo=lofo(fit_rows, cert_rows, shipped_T, shipped_B, min_per_type, fmt, min_family, reference,
                                min_blend=min_blend),
                  automated_at=automated, automated_error=automated_error, automated_at_pooled=automated_pooled,

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 import basal.server as server_module
-from basal.calibrate import BUCKETS, fit, is_cert, main
+from basal.calibrate import BUCKETS, ece, fit, is_cert, main, served
 from basal.server import Server, parser, temper, temperature
 from tests.test_server import Tok
 
@@ -42,6 +42,20 @@ def test_bucket_temperatures_are_fitted_where_there_are_enough_decisions():
     assert set(report["buckets"]) == {name for name, _, _ in BUCKETS}
     one, _ = fit(data, {}, [0.05], 50, fmt=1)  # format 1: the 1.5 file, no buckets
     assert "temperature_per_bucket" not in one and "prompt" not in one
+
+
+def test_type_ece_uses_the_bucket_temperature_as_served():
+    """The choice row of the report measures ECE with the temperatures basal-serve applies: the option-count bucket
+    temperature before the type one (here the only bucket, so the type row equals the bucket row)."""
+    data = rows(600, 4, 2.0)
+    shipped = {"prompt": 2, "temperature_per_prim": {"choice": 1.0},
+               "temperature_per_bucket": {"choice": {"2-10": 2.0}}}
+    cal, report = fit(data, shipped, [0.05], 10 ** 9, fmt=2, min_blend=0)  # shipped temperatures kept, not fitted
+    t, b = report["types"]["choice"], report["buckets"]["2-10"]
+    assert cal["temperature_per_bucket"]["choice"]["2-10"] == 2.0
+    assert t["ece_shipped"] == b["ece_shipped"] and t["ece"] == b["ece"]
+    cert = [r for r in data if is_cert(r["group"])]
+    assert t["ece_shipped"] != ece(served(cert, {"choice": 1.0}))   # the type temperature alone is not what is served
 
 
 class StubBackend:

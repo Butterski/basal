@@ -26,7 +26,7 @@ measurements):
 <!-- engines -->
 | engine | `basal-serve` mode | hardware | what it is for | quick start | status (basal-1.5, 4.5B) |
 |---|---|---|---|---|---|
-| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`, `fp8`, `nvfp4`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon with `mps` (packed requests on the Mac's GPU, no CUDA graphs) or `eager`; CPU with `eager` | the primary server: packed requests (SOAM), evidence spans, `fp8` on Hopper and Blackwell | `basal-serve --model Remek/basal-1.5-4.5B --mode fast` | **verified**: served check on one H100, 13.7 ms p50 per question over HTTP, 64.4 decisions/s with 32 clients |
+| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`, `fp8`, `nvfp4`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon with `mps` (packed requests on the Mac's GPU, no CUDA graphs) or `eager`; CPU with `mps --device cpu` (packed requests) or `eager` | the primary server: packed requests (SOAM), evidence spans, `fp8` on Hopper and Blackwell | `basal-serve --model Remek/basal-1.5-4.5B --mode fast` | **verified**: served check on one H100, 13.7 ms p50 per question over HTTP, 64.4 decisions/s with 32 clients |
 | **vLLM** | `vllm` | NVIDIA GPUs | an alternative CUDA server | `basal-serve --model Remek/basal-1.5-4.5B --mode vllm` (extra `basal[vllm]`) | **verified offline** (one H100, `basal-bench`, 1,000 development decisions): agreement 0.994 with the fp32 engine, accuracy 0.928 vs 0.930, 147 decisions/s |
 | **SGLang** | `sglang` | NVIDIA GPUs | an alternative CUDA server (RadixAttention prefix sharing) | `basal-serve --model Remek/basal-1.5-4.5B --mode sglang` (own environment: `sglang[srt]==0.5.21`, then basal with `--no-deps`) | **verified offline** (one H100, `basal-bench`, 1,000 development decisions): agreement 0.995 with the fp32 engine, accuracy 0.925 vs 0.930, 104.6 decisions/s; on Werdykt the same answer as the basal engine on 98.3% of items (97.0% for states over 8k tokens) |
 | **MLX** | `mlx` (default on a Mac with `basal[mlx]`); `mlx-q8` | Apple Silicon | Macs: `-MLX-8bit` (recommended) or `-MLX-fp4` (half the memory); `mlx-q8` makes 8-bit weights from bf16 at load time | `basal-serve --model Remek/basal-1.5-4.5B-MLX-8bit --mode mlx` (extra `basal[mlx]`) | **verified** on an Apple M4 Pro (500 development decisions): agreement with bf16 0.992 (`-MLX-8bit`) / 0.970 (`-MLX-fp4`), 587 / 581 ms per question |
@@ -271,13 +271,60 @@ HTTP: `basal-loadtest` against `basal-serve --mode mlx` (default prompts of the 
 - **Compute-bound.** About 90% of the forward time is in the linear layers, which MLX runs at 10–12 TFLOPS in bf16 on
   the M4 Max; bf16, fp16 and fp32 differ little, larger batches do not raise throughput, and `mx.compile` gave no
   speed-up (so the `mlx` backend pads only to the longest prompt of a batch instead of to fixed shape buckets). Other
-  M-series chips were not measured; being compute-bound, latency should scale roughly with GPU core count and clock.
+  M-series chips were not measured in that run (an M5 Max is below); being compute-bound, latency should scale roughly with GPU core count and clock.
 - **8-bit weights** (`mlx-q8`, MLX affine, group 64, decoder layers only) cut the resident weights of the 4.5B from
   8.9 to 4.8 GB (the checkpoint is loaded lazily, so the bf16 copy is never held); 0–10% slower.
 - **4-bit weights** were tried and dropped: agreement fell to 0.86 on the 1.5B without any speed gain.
 - **Throttling.** Under sustained load the MacBook's GPU slows down by up to 2× (automatic power mode); the table above
   was measured back to back, the comparison below after a cool-down before every engine.
 - **Early exit** (`fast-exit`) and the `fp8` / `nvfp4` modes are CUDA-only.
+
+### Apple M5 Max (basal-1.0 and basal-2.0)
+
+Measured by Greg Brzezinka with `basal-bench` on the **44 bundled examples**, like the M4 Max table above and the
+Apple M5 Pro numbers in [#7](https://github.com/rkinas/basal/issues/7). Apple M5 Max (Mac17,6, 40-core GPU, 128 GB),
+macOS 27.0.1, Python 3.12.2, torch 2.14.1 (MPS), MLX 0.32.4, mlx-lm 0.32.2; on mains power, automatic power mode,
+modes measured back to back. Agreement with `eager-fp32` (PyTorch MPS, fp32) on the same machine; GB: peak memory
+(MLX: allocator peak, MPS: memory held by the Metal driver).
+
+**basal-1.0**, at commit `3fa2eea`, the merge of #4: the same `mlx` backend as the M4 Max table above, and the commit of
+the M5 Pro measurement in #7, so the three chips compare one to one:
+
+| model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy | GB |
+|---|---|---|---|---|---|---|---|
+| basal-1.0-4.5B | `eager-fp32` | 312.8 | 185.9 | 2.8 | reference | 0.795 | 23.0 |
+| | `mps` (bf16) | 81.1 | 68.1 | 13.8 | 1.000 | 0.795 | 10.1 |
+| | `mlx` (bf16) | **65.7** | **62.3** | **15.6** | 1.000 | 0.795 | 10.1 |
+| | `mlx-q8` | 85.4 | 77.9 | 13.5 | 0.977 | 0.773 | 6.0 |
+| basal-1.0-1.5B | `eager-fp32` | 119.8 | 72.2 | 7.5 | reference | 0.727 | 10.2 |
+| | `mps` (bf16) | 34.8 | 31.5 | 37.3 | 0.977 | 0.750 | 4.1 |
+| | `mlx` (bf16) | **26.0** | **25.7** | **43.2** | 0.977 | 0.750 | 4.0 |
+| | `mlx-q8` | 32.7 | 30.6 | 38.2 | 1.000 | 0.727 | 2.6 |
+
+Two more runs of `--modes mps mlx` for the 4.5B: `mlx` 71.6 / 73.3 ms, `mps` 86.7 / 88.3 ms (2 orders).
+
+**basal-2.0**, at v2.2.0 (`e49665c`); `mps` in bf16, `mlx` with the `-MLX-8bit` ports. `basal-bench` takes one
+`--model`, so these rows come from a single run of `basal.bench.main()` (unchanged) in which only the `mlx` mode loads
+its weights from the `-MLX-8bit` folder and every other mode, including the `eager-fp32` reference, from the bf16
+folder; agreement is therefore against the same bf16 reference as the other rows. The 20-line wrapper is in #18.
+
+| model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy | GB |
+|---|---|---|---|---|---|---|---|
+| basal-2.0-mini | `eager-fp32` | 104.3 | 66.4 | 9.1 | reference | 0.750 | 9.1 |
+| | `mps` (bf16) | **30.0** | **28.4** | **45.9** | 1.000 | 0.750 | 4.1 |
+| | `mlx` (`-MLX-8bit`) | 49.0 | 30.9 | 21.0 | 0.977 | 0.727 | 2.1 |
+| basal-2.0 (4.5B) | `eager-fp32` | 304.9 | 182.0 | 3.0 | reference | 0.795 | 21.1 |
+| | `mps` (bf16) | **72.5** | **68.0** | **15.4** | 1.000 | 0.795 | 10.1 |
+| | `mlx` (`-MLX-8bit`) | 130.0 | 74.6 | 7.6 | 0.955 | 0.795 | 5.2 |
+
+Two more runs for basal-2.0 (4.5B): `mlx` 133.8 / 134.6 ms, `mps` 72.6 / 72.5 ms (2 orders). With two option orders,
+`mlx` at v2.2.0 is slower than at `3fa2eea` on this machine (basal-1.0-4.5B: 115.6 vs 65.7 ms; one order: 68.0 vs
+62.3 ms), so on v2.2.0 `mps` is the faster route for two orders on the M5 Max.
+
+- **Same generation, twice the GPU cores** (M5 Max 40 vs M5 Pro 20, basal-1.0 at `3fa2eea`, 2 orders): bf16 and 8-bit
+  modes are 1.35–1.63× faster, `eager-fp32` 1.71–1.88×; the 1.5B gains less than the 4.5B.
+- **Same core count, newer generation** (M5 Max vs M4 Max, both 40 cores): bf16 modes are 2.8–4.0× faster,
+  `eager-fp32` 1.5–1.7×. On the M5 Max bf16 is 3.4–4.8× faster than fp32.
 
 #### Inference engines on Apple Silicon
 
@@ -427,8 +474,9 @@ the Llama-architecture models basal-1.5 and basal-2.0 only, and was measured wit
 cannot run are refused at start-up with a message naming what does not fit: the mini models (hidden size 1,536, 6 query
 heads per kv head) and basal-omni (Gemma 4) are not supported; the 11B max models pass the checks but have not been
 measured. ROCm only, bf16, tile configs tuned on the Radeon 8060S. **Every number in this section was measured by
-@kardysm** on the machine below; we have not reproduced them. The benchmark scripts and raw results are in the author's
-fork, [kardysm/basal#3](https://github.com/kardysm/basal/pull/3).
+@kardysm** on the machine below, except the last bullet (a second machine, measured by @piotrkowski); we have not
+reproduced them. The benchmark scripts and raw results are in the author's fork,
+[kardysm/basal#3](https://github.com/kardysm/basal/pull/3).
 
 One Ryzen AI Max+ PRO 395 (Radeon 8060S, gfx1151, 128 GB unified memory; Fedora 44, PyTorch 2.12 + ROCm 7.2),
 basal-1.5 (4.5B). On this iGPU a decision is compute-bound prefill (~9.2 GFLOP per token), and the stock kernels reach
@@ -454,6 +502,9 @@ Request matrix over HTTP, p50 (details, profile and method: [benchmarks/STRIX_HA
   136 → 144 ms for one question over a ≈100-token state, 1.27 s → **714 ms** at ≈2,000 tokens, 4.16 → **2.41 s** at
   ≈6,000 tokens (5.25 → **2.90 s** with 20 questions), 11.5 → **19.0/s** with 32 clients. Both agree with fp32 on 142 of
   144 decisions; the other two are one question that fp32 puts at 0.502 / 0.498.
+- **A second machine** ([@piotrkowski](https://github.com/piotrkowski)): basal-2.0 (4.5B) on a ROG Flow Z13 tablet
+  (same GPU, 32 GB, ~50 W) gives the same answers and a close speed-up (1.05–1.70×), 1.4–1.7× slower in both engines
+  ([details](benchmarks/STRIX_HALO.md#a-second-machine-basal-20-on-a-rog-flow-z13)).
 
 ## Google TPU (experimental, community-maintained)
 
