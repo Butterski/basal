@@ -974,29 +974,41 @@ class GraphBackend(EagerBackend):
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
                                 basal_prefix=prefix, basal_kv=kv).last_hidden_state
 
-    CHUNK = 4096  # tokens per forward of a long state (and of a state's new part over a cached one): _continue
+    CHUNK = 2048  # tokens per forward of a long state (and of a state's new part over a cached one): _continue
 
     @torch.no_grad()
     def _continue(self, tokens, prefix=None, m=0):
         """tokens[m:] at positions m.. over prefix (per own layer (K, V) [kv heads, length, head size] of tokens[:m];
         Gemma 4's sliding layers may hold its last tokens only) in forwards of at most CHUNK tokens, each over the keys
         and values before it, so the activations scale with the chunk, not the state (basal-omni-1.0-ultra's
-        76k-token states ran out of memory as one forward on an 80 GB H100, 20 Oct) -> (per own layer (K, V) [kv
-        heads, length, head size] of all of tokens: sliding layers keep their last window + 256 (kv_lens), the hidden
-        state of the last token [D]). Uncompiled, as beyond the largest graph."""
-        dt, kv, h = self._dtype, None, None
-        if prefix is not None:
-            kv = [(k[None], v[None]) for k, v in prefix]
-        for s in range(m, len(tokens), self.CHUNK):
-            e = min(len(tokens), s + self.CHUNK)
+        76k-token states ran out of memory as one forward on an 80 GB H100, 20 Oct). The keys / values go into
+        buffers allocated once: the whole length for layers that keep every token, window + MARGIN + CHUNK for
+        Gemma 4's sliding layers (no copy of the growing prefix per chunk) -> (per own layer (K, V) [kv heads,
+        length, head size] of all of tokens, sliding layers their last window + MARGIN (kv_lens); the hidden state of
+        the last token [D]). Uncompiled, as beyond the largest graph."""
+        dt, L, h = self._dtype, len(tokens), None
+        keep = self.gemma.kv_lens(L) if self.gemma is not None else [L] * len(self.kv_shapes)
+        full = [t >= L for t in keep]
+        bufs, cur = [], []  # per layer: (K, V) [1, kv heads, room, d]; tokens held (positions s - cur .. s - 1)
+        for (H, D), t, f, pre in zip(self.kv_shapes, keep, full, prefix or [None] * len(keep)):
+            room = L if f else t + self.CHUNK
+            kb = torch.empty((1, H, room, D), dtype=dt, device=self.dev)
+            vb = torch.empty((1, H, room, D), dtype=dt, device=self.dev)
+            c = 0
+            if pre is not None:
+                c = min(pre[0].shape[1], m if f else t)
+                kb[0, :, :c].copy_(pre[0][:, pre[0].shape[1] - c:])
+                vb[0, :, :c].copy_(pre[1][:, pre[1].shape[1] - c:])
+            bufs.append((kb, vb))
+            cur.append(c)
+        for s in range(m, L, self.CHUNK):
+            e = min(L, s + self.CHUNK)
             n = e - s
             ids = self._to_dev(torch.tensor([tokens[s:e]]))
-            bufs = [(torch.empty((1, H, n, D), dtype=dt, device=self.dev), torch.empty((1, H, n, D), dtype=dt,
-                                                                                      device=self.dev))
-                    for H, D in self.kv_shapes]
             ro = self._to_dev(torch.tensor([[n - 1]])) if self.gemma is not None else None
-            if kv is None:  # from position 0: a plain causal forward
-                out = self._forward(ids, bufs, ro)
+            out_kv = [(kb[:, :, c: c + n], vb[:, :, c: c + n]) for (kb, vb), c in zip(bufs, cur)]
+            if s == 0:  # from position 0: a plain causal forward
+                out = self._forward(ids, out_kv, ro)
             else:  # the chunk as one block of a trie over the keys / values before it: positions continue from s
                 pos = self._to_dev(torch.arange(s, e)[None])
                 if self.flex and self.gemma is not None:
@@ -1004,15 +1016,21 @@ class GraphBackend(EagerBackend):
                 else:
                     m2 = self._mask_from_seg(self._to_dev(torch.zeros((1, n), dtype=torch.long)), [[-1]])
                     mask = torch.cat([torch.zeros((1, 1, n, s), dtype=m2.dtype, device=self.dev), m2], -1)
-                out = self._forward_suffix(ids, mask, pos, kv, ro, kv=bufs)
+                pre = [(kb[:, :, :c], vb[:, :, :c]) for (kb, vb), c in zip(bufs, cur)]
+                out = self._forward_suffix(ids, mask, pos, pre, ro, kv=out_kv)
             h = out[0, -1]
-            kv = bufs if kv is None else [(torch.cat([pk, k], 2), torch.cat([pv, v], 2))
-                                          for (pk, pv), (k, v) in zip(kv, bufs)]
-            if self.gemma is not None:  # sliding layers: the last window + 256 only
-                kv = [(k[:, :, -t:], v[:, :, -t:]) for (k, v), t in zip(kv, self.gemma.kv_lens(e))]
-        if self.dev.type == "cuda" and len(tokens) - m > self.CHUNK:  # the allocator's blocks of a long state back to
-            torch.cuda.empty_cache()  # the GPU (after one 32k-token ultra request the next ones ran out of memory)
-        return [(k[0], v[0]) for k, v in kv], h
+            for i, ((kb, vb), c, t, f) in enumerate(zip(bufs, cur, keep, full)):
+                c += n
+                if not f and c > t:  # a sliding layer: its last t tokens to the front
+                    kb[:, :, :t] = kb[:, :, c - t: c].clone()
+                    vb[:, :, :t] = vb[:, :, c - t: c].clone()
+                    c = t
+                cur[i] = c
+        if self.dev.type == "cuda" and L - m > self.CHUNK:  # the allocator's blocks of a long state back to the GPU
+            torch.cuda.empty_cache()  # (after one 32k-token ultra request the next ones ran out of memory)
+        # (sliding layers copied out of their room of window + MARGIN + CHUNK: what the state cache holds is what it counts)
+        return [(kb[0, :, :c], vb[0, :, :c]) if f else (kb[0, :, :c].clone(), vb[0, :, :c].clone())
+                for (kb, vb), c, f in zip(bufs, cur, full)], h
 
     def _usable(self, kv, m, n):
         """The common prefix m of a cached state of n tokens that its keys / values can continue (0: none): Gemma 4's
