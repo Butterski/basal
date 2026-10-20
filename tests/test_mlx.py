@@ -235,9 +235,14 @@ def test_mlx_packed_rows_equal_kv_cache(tmp_path):
     be._packed = lambda g: calls.append(len(g)) or packed_fwd(g)
     got = be.run_shared(groups)
     assert calls == [3]  # one forward for the three groups
+    be.PACK_BUDGET = 100  # rows longer than a third of the budget: one forward each, the same readouts
+    alone = be.run_shared(groups)
+    assert calls == [3, 1, 1, 1]
+    assert max(abs(a - b) for g, h in zip(got, alone) for x, y in zip(g, h) for a, b in zip(x, y)) < 1e-5
+    calls.clear()
     be.PACK_TOKENS = 0
     cached = be.run_shared(groups)
-    assert calls == [3]  # PACK_TOKENS = 0: every group through _group (_shared_len, KV cache)
+    assert calls == []  # PACK_TOKENS = 0: every group through _group (_shared_len, KV cache)
     assert len(got) == len(cached) == len(groups)
     for (toks, lids), g, c in zip(groups, got, cached):
         ref = reference(m, toks, lids)
