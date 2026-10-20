@@ -1,3 +1,10 @@
+# What is new in basal 2.3.1 (not released yet)
+
+- **Faster sentence splitting for `compress`.** With `unit: "sentence"`, the word before each sentence end was searched
+  from the start of the text (and retried at every position of a long token), O(n²) per document; it is now read
+  backwards from the sentence end (a 98k-character document: 13 s on the event loop before the 600-unit refusal, now
+  4 ms). Same units as before. Contributed by Milosz (@Butterski), [#16](https://github.com/rkinas/basal/pull/16).
+
 # What is new in basal 2.3
 
 - **vLLM: KV-sharing fast prefill for basal-omni-1.0-mini, 1.43x / 1.60x** (`--mode vllm`, on by default for Gemma 4

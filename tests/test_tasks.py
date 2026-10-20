@@ -39,6 +39,14 @@ def test_units_sentences_lines_paragraphs():
                                                                    "z o.o., ul. Długa 5.\nUwagi: brak."
 
 
+def test_units_abbreviation_right_after_a_sentence_end():
+    # the word before each sentence end is searched only from the previous sentence end on; skipped abbreviations and
+    # single letters right after one must still not end a sentence
+    t = 'Koniec. Dr. Nowak i prof. Kowalski. „Tak.” A. Mickiewicz napisał. Np. to. Ul. Długa 5! Nr. 7 stoi.'
+    assert [t[a:b] for a, b in units(t)] == ["Koniec.", "Dr. Nowak i prof. Kowalski.", "„Tak.”",
+                                             "A. Mickiewicz napisał.", "Np. to.", "Ul. Długa 5!", "Nr. 7 stoi."]
+
+
 @pytest.mark.parametrize("text,integer,value", [
     ("1 234,56 zł", False, 1234.56), ("1,234.56", False, 1234.56), ("12,5", False, 12.5), ("1.234.567", False, 1234567),
     ("PLN 99", False, 99), ("7 szt.", True, 7), ("2,5", True, None), ("brak", False, None), ("1 000,00", False, 1000)])
