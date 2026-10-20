@@ -562,6 +562,10 @@ class GraphBackend(EagerBackend):
         why = gemma4_graph.supports(self.model)
         if why:
             raise ValueError(why)
+        for name in ("vision_tower", "audio_tower", "embed_vision", "embed_audio"):  # text only here (31B: ~1.7 GB)
+            if getattr(self.model.model, name, None) is not None:
+                setattr(self.model.model, name, None)
+        torch.cuda.empty_cache()
         if quant == "nvfp4":  # NVFP4 ports of basal-omni failed their gate (W4A16 on H100; vLLM, 15 Oct)
             raise ValueError("--mode nvfp4 is not available for basal-omni (Gemma 4); use fp8")
         if quant:  # torchao on the decoder layers' linears only (not the towers, embeddings or per-layer projection)
@@ -634,7 +638,7 @@ class GraphBackend(EagerBackend):
         self._kv = [tuple(torch.zeros(n * H * D, dtype=dt, device=self.dev) for _ in "kv") for H, D in self.kv_shapes] \
             if self.shared else None
 
-    KV_SHARE = 0.25  # Gemma 4: the most of the free GPU memory (after the weights) its key / value buffers may take
+    KV_SHARE = 0.15  # Gemma 4: the most of the free GPU memory (after the weights) its key / value buffers may take
 
     def _fit_grid(self):
         """Gemma 4: every layer with its own keys and values keeps them for every token (31B: 0.9 MB per token in
@@ -646,7 +650,8 @@ class GraphBackend(EagerBackend):
             return
         per = sum(2 * H * D for H, D in self.kv_shapes) * self._dtype.itemsize
         cap = int(self.KV_SHARE * torch.cuda.mem_get_info(self.dev)[0] / per)
-        if max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1]) > cap:
+        if max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1]) > cap:  # 31B on an 80 GB GPU (a quarter of free memory
+            # left 76 GB allocated and ran out in warm-up: graph pools and activations need the rest, 20 Oct)
             self.TOKEN_BUDGET = min(self.TOKEN_BUDGET, max(cap // 512 * 512, 1024))
             self.PLAIN_LENS = [x for x in self.PLAIN_LENS if x <= max(cap, self.PLAIN_LENS[0])]
             self.LENS = [x for x in self.LENS if x <= self.PLAIN_LENS[-1]]
