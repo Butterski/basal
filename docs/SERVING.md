@@ -31,7 +31,8 @@ benchmarking a GPU.
 - **basal-omni (Gemma 4) in `fast` / `fast-nocompile`** (2.3, text): the engine's own Gemma 4 layer code with SOAM
   over its sliding-window layers and the answer-rows-only last layers; `--gemma-attn auto` = FlashAttention 3 + flex,
   compiled, on Hopper (`fast`), else eager's math kernel uncompiled; `fp8` / `nvfp4` quantisation at load time is
-  refused for it (serve an `-FP8` checkpoint). [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+  refused for it (serve an `-FP8` checkpoint). Without `--mode` it runs `fast` on Hopper with FlashAttention 3 and
+  `eager` on other GPUs. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
 - `--calibration file.json` overrides the calibration file (default: `CALIBRATION.<mode>.json` when the model ships
   one for that engine, else `CALIBRATION.json`; `--mode gguf` loads `CALIBRATION.gguf.json` when the model ships one,
   else `CALIBRATION.json`; with `--orders 2`,
