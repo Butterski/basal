@@ -40,7 +40,8 @@ from pathlib import Path
 import torch
 
 from .engine import (ATTN, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, resolve, set_fp8_fast_accum)
+                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, attention_available, resolve,
+                     set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from . import tasks
@@ -77,10 +78,15 @@ MODES = {
 }
 
 
-def default_mode():
+def default_mode(model=None, revision=None):
     """fast on CUDA, mlx on Apple Silicon when mlx and mlx-lm are installed, mps otherwise there, tpu on a TPU VM
-    with basal[tpu] installed, else eager."""
+    with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only where
+    the configuration its gate passed runs (FlashAttention 3: Hopper with flash_attn_3), eager on other GPUs until they
+    pass their own (2.2.0 had no working default for it there: fast stopped at "'Gemma4Model' object has no attribute
+    'layers'")."""
     if torch.cuda.is_available():
+        if model is not None and attention_available("fa3") is not None and _gemma4(model, revision):
+            return "eager"
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         try:
@@ -93,6 +99,15 @@ def default_mode():
     if tpu_available():
         return "tpu"
     return "eager"
+
+
+def _gemma4(model, revision=None):
+    """A Gemma 4 model (basal-omni), from its config.json; False when that cannot be read (the server says why)."""
+    from .gemma4_graph import is_gemma4_dir
+    try:
+        return is_gemma4_dir(resolve(model, revision, metadata_only=True))
+    except Exception:  # offline without the model cached, a wrong name: the model load reports it
+        return False
 
 
 def validate_quant(mode, quant):
@@ -1363,7 +1378,7 @@ def parser():
 
 def main():
     a = parser().parse_args()
-    a.mode = a.mode or default_mode()
+    a.mode = a.mode or default_mode(a.model, a.revision)
     validate_quant(a.mode, a.quant)
     if a.mcp == "on":
         from .mcp_server import available

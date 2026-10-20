@@ -153,6 +153,7 @@ class Gemma4Graph:
     # parts: 33 GB in the pool, out of memory before warm-up ended, 2026-10-20)
     SCORES = 2 ** 26
     BLOCK = 128   # "flex": block size of the block masks
+    SMEM = None   # shared memory per block of the GPU (flex's tiles, _flex)
 
     def __init__(self, model, kernels="math", compile=False, merge=False):
         lm = self.lm = text_model(model)
@@ -162,6 +163,9 @@ class Gemma4Graph:
         self.types = list(cfg.layer_types[:n])
         self.window = cfg.sliding_window
         self.softcap = getattr(cfg, "final_logit_softcapping", None)
+        dev = lm.embed_tokens.weight.device
+        if dev.type == "cuda":
+            Gemma4Graph.SMEM = torch.cuda.get_device_properties(dev).shared_memory_per_block_optin
         self.own = [not layer.self_attn.is_kv_shared_layer for layer in self.layers]
         assert all(self.own[: sum(self.own)]), "layers with their own keys and values come first"
         self.n_kv = sum(self.own)
@@ -309,10 +313,17 @@ class Gemma4Graph:
     @staticmethod
     def _flex(q, k, v, bm):
         """FlexAttention with a block mask. The 512-wide global heads take 32 x 32 tiles: Inductor's default tiles
-        need more shared memory than an H100 has (Triton "out of resource", 2026-10-20); in fp32 one stage as well."""
+        need more shared memory than an H100 has (Triton "out of resource", 2026-10-20); in fp32 one stage as well.
+        With 99 KB per block (RTX PRO 6000 Blackwell; H100: 227 KB) one stage in bf16 too, and 16 x 16 tiles in fp32
+        in both layer types (sm_120 probe, 2026-10-20: d512 bf16 32 x 32 x 1 stage 0.44 ms against math's 3.13;
+        fp32 32 x 32 x 1 stage needed 131 KB)."""
         opts = {"FORCE_USE_FLEX_ATTENTION": True}
-        if q.shape[-1] > 256:
-            opts.update(BLOCK_M=32, BLOCK_N=32, **({"num_stages": 1} if q.dtype == torch.float32 else {}))
+        small = (Gemma4Graph.SMEM or 1 << 30) < 160 * 1024
+        fp32 = q.dtype == torch.float32
+        if fp32 and small:
+            opts.update(BLOCK_M=16, BLOCK_N=16, num_stages=1)
+        elif q.shape[-1] > 256:
+            opts.update(BLOCK_M=32, BLOCK_N=32, **({"num_stages": 1} if fp32 or small else {}))
         o = _flex_attention()(q, k, v, block_mask=bm, scale=1.0, enable_gqa=True, kernel_options=opts)
         return o.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
 
