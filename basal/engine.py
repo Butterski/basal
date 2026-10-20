@@ -965,14 +965,92 @@ class GraphBackend(EagerBackend):
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False).last_hidden_state
 
     @torch.no_grad()
-    def _forward_suffix(self, ids, mask, pos, prefix, ro=None):
+    def _forward_suffix(self, ids, mask, pos, prefix, ro=None, kv=None):
         """Pass 2: rows that continue computed prefixes (per-layer (K, V) [rows, kv heads, prefix length, head dim]);
         mask [rows, 1, length, prefix length + length] (Gemma 4 with flex: a TreeMask). Gemma 4: uncompiled; ro as in
-        _forward."""
+        _forward; kv: buffers that receive the rows' own keys / values (_continue)."""
         if self.gemma is not None:
-            return self.gemma.forward_suffix(ids, mask, pos, prefix, ro, compiled=False)
+            return self.gemma.forward_suffix(ids, mask, pos, prefix, ro, compiled=False, kv=kv)
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
-                                basal_prefix=prefix).last_hidden_state
+                                basal_prefix=prefix, basal_kv=kv).last_hidden_state
+
+    CHUNK = 4096  # tokens per forward of a long state (and of a state's new part over a cached one): _continue
+
+    @torch.no_grad()
+    def _continue(self, tokens, prefix=None, m=0):
+        """tokens[m:] at positions m.. over prefix (per own layer (K, V) [kv heads, length, head size] of tokens[:m];
+        Gemma 4's sliding layers may hold its last tokens only) in forwards of at most CHUNK tokens, each over the keys
+        and values before it, so the activations scale with the chunk, not the state (basal-omni-1.0-ultra's
+        76k-token states ran out of memory as one forward on an 80 GB H100, 20 Oct) -> (per own layer (K, V) [kv
+        heads, length, head size] of all of tokens: sliding layers keep their last window + 256 (kv_lens), the hidden
+        state of the last token [D]). Uncompiled, as beyond the largest graph."""
+        dt, kv, h = self._dtype, None, None
+        if prefix is not None:
+            kv = [(k[None], v[None]) for k, v in prefix]
+        for s in range(m, len(tokens), self.CHUNK):
+            e = min(len(tokens), s + self.CHUNK)
+            n = e - s
+            ids = self._to_dev(torch.tensor([tokens[s:e]]))
+            bufs = [(torch.empty((1, H, n, D), dtype=dt, device=self.dev), torch.empty((1, H, n, D), dtype=dt,
+                                                                                      device=self.dev))
+                    for H, D in self.kv_shapes]
+            ro = self._to_dev(torch.tensor([[n - 1]])) if self.gemma is not None else None
+            if kv is None:  # from position 0: a plain causal forward
+                out = self._forward(ids, bufs, ro)
+            else:  # the chunk as one block of a trie over the keys / values before it: positions continue from s
+                pos = self._to_dev(torch.arange(s, e)[None])
+                if self.flex and self.gemma is not None:
+                    mask = self._tree_mask(np.zeros((1, n), dtype=np.int64), [[-1]], [s], n)
+                else:
+                    m2 = self._mask_from_seg(self._to_dev(torch.zeros((1, n), dtype=torch.long)), [[-1]])
+                    mask = torch.cat([torch.zeros((1, 1, n, s), dtype=m2.dtype, device=self.dev), m2], -1)
+                out = self._forward_suffix(ids, mask, pos, kv, ro, kv=bufs)
+            h = out[0, -1]
+            kv = bufs if kv is None else [(torch.cat([pk, k], 2), torch.cat([pv, v], 2))
+                                          for (pk, pv), (k, v) in zip(kv, bufs)]
+            if self.gemma is not None:  # sliding layers: the last window + 256 only
+                kv = [(k[:, :, -t:], v[:, :, -t:]) for (k, v), t in zip(kv, self.gemma.kv_lens(e))]
+        return [(k[0], v[0]) for k, v in kv], h
+
+    def _usable(self, kv, m, n):
+        """The common prefix m of a cached state of n tokens that its keys / values can continue (0: none): Gemma 4's
+        sliding layers of a long state hold its last tokens only, which must reach a window back from m."""
+        if self.gemma is None:
+            return m
+        for (k, _), t in zip(kv, self.gemma.kv_lens(n)):
+            if t < n and n - k.shape[1] > max(0, m - self.gemma.window):
+                return 0
+        return m
+
+    def _extend_states(self, units, keys, hits):
+        """Incremental states: a unit whose state (root) is not cached but begins with a cached state's first m tokens
+        (a growing agent trace or chat history, or an edited one up to the edit) computes only tokens m.. over that
+        state's keys / values (_continue); the result is cached, replacing the old entry when it extends it to its
+        end, and used as a hit."""
+        if not keys or self.state_cache is None:
+            return
+        for k, key in enumerate(keys):
+            if key is None or k in hits:
+                continue
+            pk = units[k][0]
+            root = list(pk[0][: pk[2].index(1)])
+            found = self.state_cache.longest(root)
+            if found is None:
+                continue
+            old, kv, m, n = found
+            if old == key:  # cached by an earlier unit of this call
+                hits[k] = kv
+                continue
+            m = self._usable(kv, m, n)
+            if m < self.state_cache.BLOCK or m >= len(root):
+                continue
+            prefix = []
+            for (ck, cv), t in zip(kv, self.gemma.kv_lens(n) if self.gemma is not None else [n] * len(kv)):
+                o = n - ck.shape[1]  # position of the entry's first stored token (sliding layers of a long state)
+                prefix.append((ck[:, : m - o], cv[:, : m - o]))
+            new, _ = self._continue(root, prefix, m)
+            self.state_cache.put(key, new, tokens=root, replaces=old if m == n else None)
+            hits[k] = new
 
     @torch.no_grad()
     def _forward_layered(self, ids, kv=None, between=None):
@@ -1193,10 +1271,8 @@ class GraphBackend(EagerBackend):
         if n > self.PLAIN_LENS[-1]:
             assert len(idx) == 1
             t, _, _, last, _ = packs[idx[0]]
-            if self.gemma is not None:  # a single prompt (or duplicates) reads out at its last token
-                return self._forward(self._to_dev(torch.tensor([t])), ro=self._to_dev(torch.tensor([[last[0]]])))[
-                    0, [0] * len(last)]
-            return self._forward(self._to_dev(torch.tensor([t])))[0, last]
+            assert all(i == len(t) - 1 for i in last)  # a single prompt (or duplicates) reads out at its last token
+            return self._continue(list(t))[1][None].expand(len(last), -1)  # in chunks (_continue)
         L, b = self._bucket(n, self.PLAIN_LENS), self._bucket(len(idx), self.BATCHES)
         g, ids, _, *ro, out = self._graph(b, L)
         h_ids, _, _, rows, cols, _ = self._host_rows(packs, idx, b, L)
@@ -1322,9 +1398,8 @@ class GraphBackend(EagerBackend):
             # uncompiled one costs a few percent of a forward that is rare and long anyway
             assert b == 1
             L, B = P[0], 1
-            kv = self._kv_new(L)
-            ro = self._to_dev(torch.tensor([[L - 1]])) if self.gemma is not None else None
-            h1 = self._forward(self._to_dev(torch.tensor([packs[idx[0]][0][:L]])), kv, ro)
+            kv, h1 = self._continue(list(packs[idx[0]][0][:L]))  # in chunks (_continue)
+            kv, h1 = [(k[None], v[None]) for k, v in kv], h1[None, None]  # pass 1 holds the root's last token only
         else:
             L, B = self._bucket(max(P), self.PLAIN_LENS), self._bucket(b, self.BATCHES)
             g, ids, kv, *ro, h1 = self._graph(B, L)
@@ -1339,7 +1414,8 @@ class GraphBackend(EagerBackend):
         if h1 is not None and self.state_cache is not None:  # store the roots computed here
             for r, key in enumerate(keys):
                 if key is not None and hits[r] is None:
-                    self.state_cache.put(key, [(kb[r, :, : P[r]].clone(), vb[r, :, : P[r]].clone()) for kb, vb in kv])
+                    self.state_cache.put(key, [(kb[r, :, : P[r]].clone(), vb[r, :, : P[r]].clone()) for kb, vb in kv],
+                                         tokens=packs[idx[r]][0][: P[r]])
         S = next((x for x in sfx if n2 <= x), None)
         graph = None
         if S and L <= self.LENS[-1] and b <= rows[-1]:  # a pass-2 graph, rows padded (stale buffer rows are masked)
@@ -1362,7 +1438,7 @@ class GraphBackend(EagerBackend):
             pos2[r, :n], pos2[r, n:] = pp[p:], pp[-1] + 1 + np.arange(S - n)
             par2[r] = [-1 if q <= 0 else q - 1 for q in par[1:]]
             # Gemma 4: pass 1 holds the root's last token only (column 0 of its readout rows)
-            sel += [(1, r, i if self.gemma is None else 0) if i < p else (2, r, i - p) for i in last]
+            sel += [(1, r, i if self.gemma is None and h1.shape[1] > 1 else 0) if i < p else (2, r, i - p) for i in last]
         # FlexAttention only in the pass-2 graphs captured at start-up: an uncaptured shape (long roots, many or long
         # branches) runs the dense pass 2 uncompiled, as without flex. The compiled flex layer specialises on shape
         # classes, and a request of a new class compiled for 1-4 s (SPEED.md sections 6 and 11). Gemma 4: its flex
@@ -1569,6 +1645,7 @@ class GraphBackend(EagerBackend):
         cuda = self.dev.type == "cuda"
         pending = []
         keys, hits = self._cache_keys(groups, units)
+        self._extend_states(units, keys, hits)
         for idx, kind in self._forwards(units, hits):
             with self._launch:  # the static buffers of a graph are shared by concurrent calls
                 if kind == "compact":
@@ -1623,7 +1700,7 @@ class GraphBackend(EagerBackend):
             kv = self._kv_new(P)
             h1 = self._forward_layered(self._to_dev(torch.tensor([t[:P]])), kv, between)[0]
             if key is not None and self.state_cache is not None:
-                self.state_cache.put(key, [(k[0].clone(), v[0].clone()) for k, v in kv])
+                self.state_cache.put(key, [(k[0].clone(), v[0].clone()) for k, v in kv], tokens=t[:P])
         n = len(t) - P
         m2 = self._mask_from_seg(self._to_dev(torch.tensor([[x - 1 for x in sg[P:]]])),
                                  [[-1 if q <= 0 else q - 1 for q in par[1:]]])                 # [1, 1, n, n]
@@ -1641,6 +1718,7 @@ class GraphBackend(EagerBackend):
         every prompt, as run_shared."""
         units = self._units(groups)
         keys, hits = self._cache_keys(groups, units)
+        self._extend_states(units, keys, hits)
         probs = [self._readout(self._long_hidden(pk, keys[k] if keys else None, hits.get(k), between), lids)
                  for k, (pk, lids, _, _) in enumerate(units)]
         return self._assemble(groups, units, probs)

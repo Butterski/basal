@@ -118,3 +118,22 @@ def test_longest_prefix_extends_and_diverges():
         t = [i] + base
         small.put(small.key(t), kv, tokens=t)
     assert small.stats()["evictions"] == 1 and small.longest([0] + base) is None
+
+
+def test_growing_and_edited_states_reuse_the_cached_prefix():
+    """Incremental states (Llama): a state that extends a cached one runs only its new tokens over the cached keys /
+    values (in chunks: CHUNK), replacing the old entry; an edited one reuses the common prefix only. Every readout
+    equals a separate forward of its prompt (fp32)."""
+    rnd = random.Random(2)
+    be = Stub(tiny())
+    be.state_cache = StateCache(1e9)
+    be.state_cache.BLOCK, be.CHUNK = 4, 7
+    s1 = [1] + [rnd.randrange(3, 50) for _ in range(40)]
+    check(be, requests(rnd, s1, 1))
+    s2 = s1 + [rnd.randrange(3, 50) for _ in range(9)]                  # the trace grows
+    check(be, requests(rnd, s2, 2))
+    st = be.state_cache.stats()
+    assert st["prefix_hits"] >= 1 and st["entries"] == 1               # s2 replaced s1
+    s3 = s2[:22] + [rnd.randrange(3, 50) for _ in range(15)]            # edited after token 22
+    check(be, requests(rnd, s3, 1))
+    assert be.state_cache.stats()["prefix_hits"] >= 2 and be.state_cache.stats()["entries"] == 2
