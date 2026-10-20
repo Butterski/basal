@@ -1998,13 +1998,16 @@ class _PackedRow:
 class MLXBackend:
     """Apple Silicon (MLX / mlx-lm): the MLX exports (the -MLX-8bit / -MLX-fp4 repositories) or a bf16 Hugging Face
     directory. Same prompts, tokens and letter readout as the PyTorch backends. The shared prefix of a group (both
-    option orders of a question; with SOAM every question and order of a request, i.e. the state) is computed once: for
-    the Llama decoders (basal-1.x, 2.x), when the prefix and all suffixes fit in PACK_TOKENS, as one packed row (the
-    prefix, then every suffix, with explicit positions and a block mask), one forward per group and several groups per
-    batch; otherwise (Gemma 4, long groups) into a KV cache, and the remaining suffixes run as one right-padded batch
-    continuing that cache. Either way a suffix sees the prefix and its own earlier tokens only, so every readout equals
-    a separate forward of its prompt. All MLX work runs on one dedicated thread (the server calls the backend from an
-    executor)."""
+    option orders of a question; with SOAM every question and order of a request, i.e. the state) is computed once into
+    a KV cache, and the remaining suffixes run as one right-padded batch continuing that cache (the default). With
+    packed=True (basal-serve / basal-bench --mlx-packed, opt-in), a group of a Llama decoder (basal-1.x, 2.x) with a
+    static RoPE (default, linear, llama3) whose prefix and all suffixes fit in PACK_TOKENS runs instead as one packed
+    row (the prefix, then every suffix, with explicit positions and a block mask), several groups per forward; other
+    groups (Gemma 4, long groups, sequence-length-dependent RoPE) keep the KV cache. Either way a suffix sees the prefix
+    and its own earlier tokens only, so every readout equals a separate forward of its prompt; the packed row sums in a
+    different order, so in bf16 / quantised weights its probabilities differ slightly from the KV-cache path (identical
+    decisions in fp32) and the shipped CALIBRATION.mlx.json was fitted on the KV-cache path. All MLX work runs on one
+    dedicated thread (the server calls the backend from an executor)."""
 
     MAX_ROWS = 16      # suffix rows per forward
     TOKEN_BUDGET = 8192  # rows x padded length per forward without a shared prefix
@@ -2012,16 +2015,16 @@ class MLXBackend:
     # about 600 tokens a forward is compute-bound and the packed row's dense mask makes it no faster, M5 Max)
     CACHE_BYTES = 2 << 30  # MLX buffer cache limit (and wired headroom above the weights)
 
-    def __init__(self, model_dir, max_rows=None, quant=None):
+    def __init__(self, model_dir, max_rows=None, quant=None, packed=False):
         from concurrent.futures import ThreadPoolExecutor
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
         self.prefill = PREFILL
         self.max_rows = max_rows or self.MAX_ROWS
-        self.pool.submit(self._load, Path(model_dir), quant).result()
+        self.pool.submit(self._load, Path(model_dir), quant, packed).result()
 
-    def _load(self, md, quant=None):
+    def _load(self, md, quant=None, packed=False):
         """quant: None, or "q8": MLX affine 8-bit weights (group size 64) of the decoder blocks' linear layers, made at
         load time from bf16 weights (the embeddings and the LM head stay bf16); the -MLX-8bit exports need no quant."""
         import mlx.core as mx
@@ -2053,10 +2056,19 @@ class MLXBackend:
             rec = mx.device_info().get("max_recommended_working_set_size", weights)
             mx.set_wired_limit(min(rec, weights + self.CACHE_BYTES))
         mx.set_cache_limit(self.CACHE_BYTES)
-        self.packed = self._position_rope()
+        self.packed = bool(packed) and self._position_rope()
+
+    @staticmethod
+    def _static_rope(rope):
+        """RoPE layers whose frequencies do not depend on the sequence length (mlx-lm: default and linear = nn.RoPE,
+        llama3), so that rotating each token as its own length-1 row equals the contiguous run. Not packed: dynamic NTK
+        (its base grows with the length of the call), longrope / su, yarn and anything else."""
+        import mlx.nn as nn
+        from mlx_lm.models.rope_utils import Llama3RoPE
+        return type(rope) in (nn.RoPE, Llama3RoPE)
 
     def _position_rope(self):
-        """Llama decoders without sliding windows: wraps each layer's RoPE so that an offset of shape [B, L] (one
+        """Llama decoders without sliding windows and with a static RoPE (_static_rope): wraps each layer's RoPE so that an offset of shape [B, L] (one
         position per token, _PackedRow) rotates every token at its own position, each token as its own row of the same
         mx.fast.rope (bit-identical to a contiguous run); any other offset (the KV cache path) is passed on. Returns
         whether the packed rows can be used."""
@@ -2064,6 +2076,8 @@ class MLXBackend:
         from mlx_lm.models import llama
         if not isinstance(self.lm, llama.Model) or self.lm.model.swa_idx is not None:
             return False
+        if not all(self._static_rope(layer.self_attn.rope) for layer in self.lm.model.layers):
+            return False  # the KV-cache path
 
         class PositionRoPE(nn.Module):
             def __init__(self, rope):

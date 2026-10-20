@@ -639,6 +639,8 @@ class Server:
         if attn not in ("auto", "fa2") and kind not in ("graph", "exit"):
             raise SystemExit(f"--attn {attn} needs the CUDA graph engine (--mode fast, fast-nocompile, fast-exit, fp8, "
                              "nvfp4)")
+        if getattr(a, "mlx_packed", False) and kind != "mlx":
+            raise SystemExit("--mlx-packed needs --mode mlx (or mlx-q8)")
         if kind == "mps" and a.device == "cuda":
             raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
         # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
@@ -672,7 +674,7 @@ class Server:
         elif kind == "sglang":
             self.backend = SGLangBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len)
         elif kind == "mlx":
-            self.backend = MLXBackend(md, quant=quant)
+            self.backend = MLXBackend(md, quant=quant, packed=getattr(a, "mlx_packed", False))
         elif kind == "mps":
             self.backend = MPSBackend(md, a.dtype, shared=shared, device=a.device)
         elif kind == "gguf":
@@ -1285,6 +1287,12 @@ def add_engine_args(ap):
     ap.add_argument("--ple-offload", dest="ple_offload", choices=["off", "on"], default="off",
                     help="--mode eager with Gemma 4 E2B / E4B (basal-omni mini): keep the per-layer embedding table in "
                          "host memory and copy only the rows of each forward's tokens (E4B: 5.6 GB less GPU memory)")
+    ap.add_argument("--mlx-packed", dest="mlx_packed", action="store_true",
+                    help="--mode mlx, opt-in: a group of a Llama model (basal-1.x, 2.x; static RoPE) whose state and "
+                         "option orders fit in 512 tokens runs as one packed forward (explicit positions, block mask) "
+                         "instead of a KV cache plus a continuation; faster on short prompts, exact in fp32, but in "
+                         "bf16 / 8-bit the probabilities move slightly, so check it against CALIBRATION.mlx.json "
+                         "(fitted on the default path) before relying on the calibrated thresholds")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
                     help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu) "
                          "and --mode mps (mps or cpu; default: mps on Apple Silicon, else cpu: a request's state "
