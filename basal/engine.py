@@ -106,7 +106,7 @@ class EagerBackend:
     sdpa_kernels = None  # eager_sdpa_kernels: the SDPA kernels of the transformers forward (None: every enabled one)
 
     def __init__(self, model_dir, dtype="bfloat16", device=None, media=False, forward=None, ple_offload=False,
-                 attn="auto"):
+                 attn="math"):
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.padding_side = "left"
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token

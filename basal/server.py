@@ -641,13 +641,13 @@ class Server:
             raise SystemExit("--media on needs --mode eager (the media path of basal-omni runs in the eager backend)")
         if getattr(a, "ple_offload", "off") == "on" and kind != "eager":
             raise SystemExit("--ple-offload on needs --mode eager")
-        if getattr(a, "eager_attn", "auto") != "auto" and kind != "eager":
+        if getattr(a, "eager_attn", "math") != "math" and kind != "eager":
             raise SystemExit("--eager-attn needs --mode eager (the CUDA graph engine takes --attn)")
         if kind == "eager":
             self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on",
                                         forward=getattr(a, "eager_forward", None),
                                         ple_offload=getattr(a, "ple_offload", "off") == "on",
-                                        attn=getattr(a, "eager_attn", "auto"))
+                                        attn=getattr(a, "eager_attn", "math"))
         elif kind == "exit":
             self.backend = ExitGraphBackend(md, a.dtype, quant, compile=comp, heads_dir=a.exit_heads,
                                             default_policy=a.early_exit, attn=attn, merge=merge_arg(a.merge))
@@ -1260,12 +1260,12 @@ def add_engine_args(ap):
                     help="--mode eager with a Gemma 4 model (basal-omni): basal = the engine's own forward (the shared "
                          "prefix of a request once, the last layers at the answer rows only; default), hf = the "
                          "transformers forward of basal 2.2.0 (default: BASAL_EAGER_FORWARD, else basal)")
-    ap.add_argument("--eager-attn", dest="eager_attn", default="auto",
+    ap.add_argument("--eager-attn", dest="eager_attn", default="math",
                     help="--mode eager with a Gemma 4 model and the engine's own forward: the attention kernel per layer "
-                         "type. auto = on Hopper FlashAttention 3 in the sliding-window layers (the memory-efficient "
-                         "kernel without flash_attn_3) and the memory-efficient kernel in the global layers, the math "
-                         "kernel elsewhere; math = the math kernel everywhere (basal 2.2); or sliding=K,full=K with K in "
-                         "sdpa, efficient, cudnn, fa3, fa4")
+                         "type. math (default) = the math kernel everywhere, as basal 2.2; auto (opt-in) = on Hopper "
+                         "FlashAttention 3 in the sliding-window layers (the memory-efficient kernel without "
+                         "flash_attn_3) and the memory-efficient kernel in the global layers, the math kernel elsewhere; "
+                         "or sliding=K,full=K with K in sdpa, efficient, cudnn, fa3, fa4")
     ap.add_argument("--ple-offload", dest="ple_offload", choices=["off", "on"], default="off",
                     help="--mode eager with Gemma 4 E2B / E4B (basal-omni mini): keep the per-layer embedding table in "
                          "host memory and copy only the rows of each forward's tokens (E4B: 5.6 GB less GPU memory)")

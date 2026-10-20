@@ -310,6 +310,10 @@ def test_eager_forward_choice(tmp_path, monkeypatch):
     tok = type("Tok", (), {"pad_token": "<pad>", "eos_token": "<eos>", "pad_token_id": 0})
     monkeypatch.setattr(engine.AutoTokenizer, "from_pretrained", lambda *_a, **_k: tok())
     assert isinstance(EagerBackend(tmp_path, "float32", device="cpu").g4, Gemma4Forward)
+    assert EagerBackend(tmp_path, "float32", device="cpu").g4.attn == {}  # --eager-attn math by default (2.3)
+    import argparse
+    from basal.server import add_engine_args
+    assert add_engine_args(argparse.ArgumentParser()).get_default("eager_attn") == "math"
     assert EagerBackend(tmp_path, "float32", device="cpu", forward="hf").g4 is None
     monkeypatch.setenv("BASAL_EAGER_FORWARD", "hf")
     assert EagerBackend(tmp_path, "float32", device="cpu").g4 is None
