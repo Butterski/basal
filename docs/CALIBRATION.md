@@ -246,6 +246,17 @@ with that `max_error` then defer every decision (the defer action, the `refused`
 `"max_error": "no certified threshold for this type at this max_error"`), and `basal-calibrate` warns about it. With fewer than 200
 decisions it warns that the bounds are loose.
 
+`basal-calibrate` checks this before it runs the model (2.3.1). For each question type and task and each target, it
+counts the FIT decisions in your file. If they could not meet the bound even if all of them were accepted and correct,
+it says so on stderr and again at the end of the run, for example "verify: max_error 0.01 needs >= 299 accepted FIT
+decisions without an error (...); this file gives 192 FIT decisions of 275; label about 153 more verify claims".
+
+A threshold certified on FIT is written even when its CERT decisions are too few to confirm it. 2.3.1 then says so,
+in the report and on stderr: "noul at max_error 0.01: certified on FIT; CERT has 150 accepted, 1 error, upper bound
+3.12% > 1%, too few to confirm on CERT (0 errors would need >= 299 accepted CERT decisions)". If the error observed on
+CERT is above the target, it says that the threshold does not hold on CERT. The threshold and the exit status do not
+change (`--strict` checks only the leave-one-family-out ECE).
+
 ## Output
 
 `CALIBRATION.custom.json` has the shipped schema (`temperature_per_prim`, `thresholds[<target>].per_type`, and the

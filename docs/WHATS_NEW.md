@@ -46,6 +46,12 @@
   family (`--min-family`); with fewer in every family it passed without a test. It still passes, but now prints
   "0 families tested" for each such type on stderr and in the report. Reported by @agentGreg,
   [#19](https://github.com/rkinas/basal/issues/19).
+- **`basal-calibrate` says up front when a file is too small for a target.** Before any model readout, it checks
+  every question type and task against each `--targets` value. When the FIT decisions could not certify the target
+  even if all of them were accepted and correct (1% needs 299 without an error, 5% needs 59), it prints a warning with
+  the count, the gap and how many more items to label, and repeats it at the end of the run. A threshold certified on
+  FIT whose CERT decisions are too few to confirm it (CERT upper bound above the target) is now flagged in the report
+  and on stderr; the threshold is kept. Feedback from BRAUN SI / NovaraX.
 - **Apple M5 Pro in HARDWARE.md.** `basal-bench` tables for basal-1.0-4.5B and -1.5B on an M5 Pro (20-core GPU): bf16
   is 2.0-2.5x faster than on the 40-core M4 Max and 4.2-5.5x faster than fp32, so two sentences written for the M4
   Max (latency scaling with the core count, fp32 close to bf16) now say that they do not hold for the M5 chips.
