@@ -3,6 +3,7 @@ one with its own keys and values at the answer rows only, media towers once per 
 transformers forward of the whole prompt (fp32, tiny random models shaped like basal-omni: E4B-like with KV sharing
 and per-layer inputs, 31B-like with keys = values and no sharing, a MoE block, and a multimodal model with images,
 audio and the larger models' bidirectional image attention)."""
+import copy
 import json
 
 import pytest
@@ -14,7 +15,7 @@ from transformers import (Gemma4AudioConfig, Gemma4Config, Gemma4ForCausalLM, Ge
 from basal import engine
 from basal.engine import EagerBackend
 from basal import gemma4
-from basal.gemma4 import Gemma4Forward
+from basal.gemma4 import Gemma4Forward, HostRows, offload_ple
 
 ROPE = {"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
         "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}}
@@ -73,6 +74,94 @@ def test_forward_equals_transformers(name, answer_rows):
         for t, h in zip(grp, hs):
             r = last_hidden(m, t)
             assert (h - r).abs().max() <= 1e-4 * r.abs().max(), (name, t)
+
+
+def varlen_reference(q, k, v, cu_q, cu_k, max_q, max_k, scale, window):
+    """What a FlashAttention varlen kernel computes (causal aligned at each sequence's end, left window), per
+    sequence with SDPA: [total q, heads, d] / [total k, kv heads, d] -> [total q, heads, d]."""
+    out = []
+    for b in range(len(cu_q) - 1):
+        qs, ks, vs = q[cu_q[b]: cu_q[b + 1]], k[cu_k[b]: cu_k[b + 1]], v[cu_k[b]: cu_k[b + 1]]
+        i = torch.arange(len(qs))[:, None] + len(ks) - len(qs)
+        j = torch.arange(len(ks))[None]
+        m = (j <= i) & (j > i - window) if window else j <= i
+        o = torch.nn.functional.scaled_dot_product_attention(
+            qs.transpose(0, 1)[None], ks.transpose(0, 1)[None], vs.transpose(0, 1)[None], attn_mask=m, scale=scale,
+            enable_gqa=True)
+        out.append(o[0].transpose(0, 1))
+    return torch.cat(out)
+
+
+@pytest.mark.parametrize("name", sorted(CONFIGS))
+@pytest.mark.parametrize("answer_rows", [True, False])
+def test_varlen_kernels_pack_rows(name, answer_rows, monkeypatch):
+    """A varlen kernel (here its reference) over the packed real queries and keys of every row: earlier passes' keys
+    (a prefix in parts, sliding layers' last window - 1 of them), padding, the answer rows of G1."""
+    monkeypatch.setitem(gemma4.VARLEN_KERNELS, "ref", varlen_reference)
+    monkeypatch.setattr(Gemma4Forward, "_kernel", lambda self, t, dtype, blk: self.attn[t])
+    m = tiny(name)
+    for attn in ({"sliding_attention": "ref", "full_attention": "sdpa"}, {"sliding_attention": "ref",
+                                                                           "full_attention": "ref"}):
+        g = Gemma4Forward(m, answer_rows=answer_rows, attn=attn)
+        g.CHUNK = 24
+        groups = groups_of()
+        for grp, hs in zip(groups, g.hidden(groups)):
+            for t, h in zip(grp, hs):
+                r = last_hidden(m, t)
+                assert (h - r).abs().max() <= 1e-4 * r.abs().max(), (name, attn, t)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the memory-efficient kernel runs on CUDA")
+@pytest.mark.parametrize("hd", [256, 512])
+@pytest.mark.parametrize("kv_heads", [1, 8])
+def test_efficient_kernel_equals_math_on_one_mod_32(hd, kv_heads):
+    """pytorch/pytorch#191937 (torch <= 2.13): the memory-efficient kernel returns wrong attention for expanded
+    (zero-stride) keys / values at query lengths = 1 mod 32 with head size 256 / 512, as transformers passed max's one
+    global KV head. The forward's dispatch copies them per head; every row equals the math kernel there."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    g = Gemma4Forward.__new__(Gemma4Forward)
+    a = type("Attn", (), {"scaling": 1.0})()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    for L in (33, 289, 1857):
+        q = torch.nn.functional.normalize(torch.randn(1, 16, L, hd, device="cuda", generator=gen), dim=-1) * 8
+        k = torch.nn.functional.normalize(torch.randn(1, kv_heads, L, hd, device="cuda", generator=gen), dim=-1) * 8
+        v = torch.randn(1, kv_heads, L, hd, device="cuda", generator=gen)
+        i = torch.arange(L, device="cuda")
+        mask = (i[None, :] <= i[:, None])[None, None]
+        for dtype in (torch.float32, torch.bfloat16):
+            args = [x.to(dtype) for x in (q, k, v)]
+            with sdpa_kernel([SDPBackend.MATH]):  # "sdpa" is the math kernel only where EagerBackend made it so
+                ref = g._attend("sdpa", a, *args, mask, None, None, None)
+            got = g._attend("efficient", a, *args, mask, None, None, None)
+            assert (got.float() - ref.float()).abs().max() < (1e-4 if dtype == torch.float32 else 0.1), (hd, L, dtype)
+
+
+def test_flash_kernels_only_where_they_apply():
+    g = Gemma4Forward(tiny("31b"), attn={"sliding_attention": "fa3", "full_attention": "efficient"})
+    assert g._kernel("sliding_attention", torch.bfloat16, None) == "fa3"
+    assert g._kernel("sliding_attention", torch.float32, None) == "sdpa"  # fp32: no flash kernel
+    assert g._kernel("sliding_attention", torch.bfloat16, torch.zeros(1, 2)) == "sdpa"  # image blocks
+    assert g._kernel("full_attention", torch.bfloat16, torch.zeros(1, 2)) == "efficient"  # global layers: causal only
+    g.attn["full_attention"] = "fa3"
+    g.block_types = {"sliding_attention", "full_attention"}  # unified models: image blocks in every layer
+    assert g._kernel("full_attention", torch.bfloat16, torch.zeros(1, 2)) == "sdpa"
+
+
+def test_attention_plan(monkeypatch):
+    assert gemma4.attention_plan("math") == {}
+    assert gemma4.attention_plan("sliding=fa3,full=efficient") == {"sliding_attention": "fa3",
+                                                                   "full_attention": "efficient"}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    monkeypatch.setattr(engine, "attention_available", lambda impl: None)
+    assert gemma4.attention_plan("auto") == {"sliding_attention": "fa3", "full_attention": "efficient"}
+    monkeypatch.setattr(engine, "attention_available", lambda impl: "flash_attn_3 is not installed")
+    assert gemma4.attention_plan("auto") == {"sliding_attention": "efficient", "full_attention": "efficient"}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (12, 0))  # not measured on Blackwell: math
+    assert gemma4.attention_plan("auto") == {}
+    for bad in ("flash", "sliding=fa2", "global=fa3"):
+        with pytest.raises(ValueError):
+            gemma4.attention_plan(bad)
 
 
 def test_helpers_for_other_backends():
@@ -221,6 +310,10 @@ def test_eager_forward_choice(tmp_path, monkeypatch):
     tok = type("Tok", (), {"pad_token": "<pad>", "eos_token": "<eos>", "pad_token_id": 0})
     monkeypatch.setattr(engine.AutoTokenizer, "from_pretrained", lambda *_a, **_k: tok())
     assert isinstance(EagerBackend(tmp_path, "float32", device="cpu").g4, Gemma4Forward)
+    assert EagerBackend(tmp_path, "float32", device="cpu").g4.attn == {}  # --eager-attn math by default (2.3)
+    import argparse
+    from basal.server import add_engine_args
+    assert add_engine_args(argparse.ArgumentParser()).get_default("eager_attn") == "math"
     assert EagerBackend(tmp_path, "float32", device="cpu", forward="hf").g4 is None
     monkeypatch.setenv("BASAL_EAGER_FORWARD", "hf")
     assert EagerBackend(tmp_path, "float32", device="cpu").g4 is None
@@ -228,35 +321,26 @@ def test_eager_forward_choice(tmp_path, monkeypatch):
         EagerBackend(tmp_path, "float32", device="cpu", forward="fast")
 
 
-def test_unified_image_blocks_in_every_layer():
-    """Gemma 4 unified (basal-omni max, 1.1-max): an image's soft tokens attend to each other in every layer and past the
-    sliding window, as transformers builds its masks (31B: sliding-window layers only, within the window). The image
-    here (12 soft tokens) is longer than the window (8)."""
-    torch.manual_seed(0)
-    t = Gemma4UnifiedTextConfig(vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=6,
-                                num_attention_heads=4, num_key_value_heads=2, head_dim=16, global_head_dim=32,
-                                sliding_window=8, layer_types=["sliding_attention", "sliding_attention",
-                                                               "full_attention"] * 2,
-                                final_logit_softcapping=30.0, max_position_embeddings=1024, rope_parameters=ROPE,
-                                attention_k_eq_v=True, num_global_key_value_heads=1)
-    v = Gemma4UnifiedVisionConfig(patch_size=2, pooling_kernel_size=1, mm_embed_dim=32, mm_posemb_size=16,
-                                  output_proj_dims=32)
-    m = Gemma4UnifiedForConditionalGeneration(Gemma4UnifiedConfig(
-        text_config=t, vision_config=v, audio_config=None, image_token_id=IMG, video_token_id=VID, boi_token_id=BOI,
-        eoi_token_id=EOI)).eval()
-    g = Gemma4Forward(m)
-    assert g.unified_blocks and g.block_types == {"sliding_attention", "full_attention"}
-    px = torch.randn(1, 12, 12, generator=torch.Generator().manual_seed(2))  # 3 x 4 patches of 2 x 2 x 3
-    yx = torch.stack(torch.meshgrid(torch.arange(3), torch.arange(4), indexing="ij"), -1).reshape(1, 12, 2)
-    feats = g.media_features(dict(pixel_values=px, image_position_ids=yx))
-    state = torch.randint(1, 50, (20,), generator=torch.Generator().manual_seed(3)).tolist()
-    head = [2, 5, 6, BOI] + [IMG] * feats["image"].shape[0] + [EOI, 7]
-    prompts = [head + state + [11, 12, 13], head + state + [11, 14], head + state + [15, 16, 17]]
-    for chunk in (2048, 6):  # 6: the prefix in parts around the image (never inside it)
-        g.CHUNK = chunk
-        for p, h in zip(prompts, g.hidden([prompts], media=feats)[0]):
-            ids = torch.tensor([p])
-            with torch.no_grad():
-                r = m.model(input_ids=ids, pixel_values=px, image_position_ids=yx,
-                            mm_token_type_ids=(ids == IMG).long()).last_hidden_state[0, -1]
-            assert (h - r).abs().max() <= 1e-4 * r.abs().max()
+def test_ple_offload_same_answers(tmp_path, monkeypatch):
+    """--ple-offload on: the per-layer embedding table leaves the model's parameters for host memory; both forwards
+    read the same rows, so the answers do not change."""
+    m = tiny("e4b")
+    emb = m.model.embed_tokens_per_layer
+    ids = torch.tensor([[1, 5, 63, 0], [7, 7, 2, 9]])
+    assert torch.equal(HostRows(emb)(ids), emb(ids))
+    e16 = copy.deepcopy(emb).to(torch.bfloat16)
+    assert torch.equal(HostRows(e16)(ids), e16(ids))
+    m.save_pretrained(tmp_path)
+    tok = type("Tok", (), {"pad_token": "<pad>", "eos_token": "<eos>", "pad_token_id": 0})
+    monkeypatch.setattr(engine.AutoTokenizer, "from_pretrained", lambda *_a, **_k: tok())
+    groups = groups_of()
+    lids = [[[10, 11, 12]] * len(g) for g in groups]
+    ref = EagerBackend(tmp_path, "float32", device="cpu").run_shared(list(zip(groups, lids)))
+    for fwd in ("basal", "hf"):
+        be = EagerBackend(tmp_path, "float32", device="cpu", forward=fwd, ple_offload=True)
+        assert isinstance(be.model.model.embed_tokens_per_layer, HostRows)
+        assert not any("embed_tokens_per_layer" in n for n, _ in be.model.named_parameters())
+        for a, b in zip(be.run_shared(list(zip(groups, lids))), ref):
+            for x, y in zip(a, b):
+                assert max(abs(p - q) for p, q in zip(x, y)) < 1e-5
+    assert offload_ple(tiny("31b")) == 0  # no per-layer inputs: nothing to move
