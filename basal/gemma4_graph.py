@@ -175,8 +175,8 @@ class Gemma4Graph:
         self.kv_shapes = [(a.k_proj.out_features // a.head_dim, a.head_dim)
                           for a in (layer.self_attn for layer in self.layers[: self.n_kv])]
         self.ple = bool(getattr(cfg, "hidden_size_per_layer_input", 0))
-        if kernels == "fa3":  # FlashAttention 3 in the sliding-window layers, flex in the 512-wide global ones
-            kernels = {"sliding_attention": "fa3", "full_attention": "flex"}
+        if kernels in ("fa3", "fa3+math"):  # FlashAttention 3 in the sliding-window layers; flex or math in the
+            kernels = {"sliding_attention": "fa3", "full_attention": "flex" if kernels == "fa3" else "math"}  # global
         if isinstance(kernels, str):
             kernels = {t: kernels for t in set(self.types)}
         for k in kernels.values():

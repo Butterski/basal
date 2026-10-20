@@ -530,7 +530,8 @@ class GraphBackend(EagerBackend):
         # compact rows need FlashAttention 3's varlen kernel (Hopper); auto: compact where it runs. Gemma 4: with its
         # fa3 kernels (FA3 varlen in the sliding layers, a flex block mask per prompt in the 512-wide global ones)
         self.compact = batches in ("compact", "auto") and self.attn == "fa3" and self.dev.type == "cuda" \
-            and (self.gemma is None or self.gemma.kernels.get("sliding_attention") == "fa3")
+            and (self.gemma is None or self.gemma.kernels.get("sliding_attention") == "fa3"
+                 and self.gemma.kernels.get("full_attention") != "math")
         if batches == "compact" and not self.compact:
             raise ValueError("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper; Gemma 4: "
                              "--gemma-attn fa3)")
