@@ -12,8 +12,7 @@ Backends:
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
   MPSBackend        GraphBackend's shared prefix + token-budget batching on Apple MPS (PyTorch, no graphs)
-  VLLMBackend       vLLM: bf16 checkpoints, ModelOpt FP8 / NVFP4 ports, presets (FP8 KV cache, batch-invariant
-                    kernels), basal-omni media
+  VLLMBackend       vLLM: bf16 checkpoints, ModelOpt FP8 / NVFP4 ports, a repeatable preset, basal-omni media
   SGLangBackend     SGLang offline engine (1.5): the same letter readout from the log-probabilities of the option tokens
   MLXBackend        Apple Silicon, MLX / mlx-lm (1.5): MLX fp8 / fp4 exports or bf16 weights (optional 8-bit at load
                     time); shared-prefix KV cache
@@ -1704,12 +1703,10 @@ class MPSBackend(GraphBackend):
 
 
 VLLM_PRESETS = {
-    # --vllm-preset: (KV cache dtype, repeatable); the weights are always the checkpoint's own (bf16, or a ModelOpt
-    # FP8 / NVFP4 port): bf16 weights quantised to FP8 at load time cost basal-omni 0.5-9.5 points of automation at 1%
-    "default": ("auto", False),
-    "fp8-kv": ("fp8", False),          # keys and values cached in FP8: twice the states (with a -FP8 checkpoint: FP8
-                                       # weights and KV cache)
-    "deterministic": ("auto", True),   # batch-invariant kernels, no prefix cache: answers independent of load
+    # --vllm-preset: repeatable. The weights are the checkpoint's own (bf16, or a ModelOpt FP8 / NVFP4 port): bf16
+    # weights quantised to FP8 at load time cost basal-omni 0.5-9.5 points of automation at 1%
+    "default": False,
+    "deterministic": True,   # batch-invariant kernels, no prefix cache, no chunked prefill: answers independent of load
 }
 
 
@@ -1724,13 +1721,9 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
     (FlashAttention instead of Triton + FlashAttention) and keeps fewer KV tokens (mini: 911k instead of 978k)."""
     if preset not in VLLM_PRESETS:
         raise ValueError(f"unknown --vllm-preset {preset!r} (one of: {', '.join(VLLM_PRESETS)})")
-    kv, invariant = VLLM_PRESETS[preset]
+    invariant = VLLM_PRESETS[preset]
     text = cfg.get("text_config") or cfg
     kw, env = {}, {}
-    if kv != "auto":
-        kw["kv_cache_dtype"] = kv
-        if text.get("attention_k_eq_v"):  # Gemma 4 12B / 31B (values = keys): vLLM 0.31's FlashAttention with an FP8
-            kw["attention_backend"] = "TRITON_ATTN"  # cache fails at start-up (H100: "Expected strides ... got 0")
     if invariant:
         # batch-invariant kernels without the prefix cache and without chunked prefill: with them, a request's numbers
         # depend on the states earlier requests left in the cache and on where the scheduler cut a long prompt (the
@@ -1775,6 +1768,12 @@ class VLLMBackend:
             if not self.media_kinds:
                 raise SystemExit("--media on: the model has no image or audio encoder (config.json: vision_config, "
                                  "audio_config)")
+            if "Gemma4UnifiedForConditionalGeneration" in (cfg.get("architectures") or ()):
+                # basal-omni-1.1-max against --mode eager --media on (2.3 media check set): images 0.942 the same
+                # answer, accuracy -1.3 points; 19 of 285 audio clips expanded to other token counts
+                raise SystemExit("--media on with --mode vllm does not serve Gemma 4 Unified models (basal-omni-1.1-max): "
+                                 "vLLM 0.31 reads their images and audio differently from the model's processor; use "
+                                 "--mode eager --media on")
             pc = Path(model_dir) / "processor_config.json"
             self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
         os.environ.update(env)  # before vLLM starts its engine process, which reads it

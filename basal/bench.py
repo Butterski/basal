@@ -225,7 +225,7 @@ def main():
     ap.add_argument("--modes", nargs="+", default=None,
                     help="default: eager-fp32 and the serving default (fast on CUDA); on Apple Silicon bf16 mps and mlx "
                          "(--modes eager-fp32 mps mlx for fp32 agreement if memory allows). Modes: eager-fp32, eager, "
-                         "fast, fast-nocompile, fp8, nvfp4, vllm, vllm@fp8-kv|deterministic (--vllm-preset), "
+                         "fast, fast-nocompile, fp8, nvfp4, vllm, vllm@deterministic (--vllm-preset), "
                          "sglang, fast-exit@off|0.999|0.995|0.99|0.98; Apple Silicon: mlx, mlx-q8, mps; GGUF: gguf, "
                          "gguf@<file.gguf>, ollama, llamacpp; AMD Strix Halo: strix; Google TPU (basal[tpu]): tpu, "
                          "tpu-fp32")

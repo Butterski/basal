@@ -1280,11 +1280,10 @@ def add_engine_args(ap):
                     help="on = the whole request (every question and option order) is one packed row over the state")
     ap.add_argument("--gpu-memory", dest="gpu_memory", type=float, default=0.6, help="vLLM memory fraction")
     ap.add_argument("--vllm-preset", dest="vllm_preset", choices=list(VLLM_PRESETS), default="default",
-                    help="--mode vllm: default = as 2.2; fp8-kv = an FP8 KV cache (twice the tokens of state; with "
-                         "a -FP8 checkpoint: FP8 weights and KV cache); deterministic = batch-invariant kernels and no "
-                         "prefix cache "
-                         "(VLLM_BATCH_INVARIANT: answers independent of the other requests, lower throughput). Loads "
-                         "CALIBRATION.vllm.<preset>.json when the model ships one, else CALIBRATION.vllm.json")
+                    help="--mode vllm: default = as 2.2; deterministic = batch-invariant kernels without the prefix "
+                         "cache and chunked prefill (VLLM_BATCH_INVARIANT: answers independent of the other requests, "
+                         "lower throughput). Loads CALIBRATION.vllm.<preset>.json when the model ships one, else "
+                         "CALIBRATION.vllm.json")
     ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="off",
                     help="--mode vllm: auto = layers that reuse earlier layers' keys and values (Gemma 4 E2B / E4B) "
                          "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill; off by "
