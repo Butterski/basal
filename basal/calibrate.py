@@ -55,7 +55,8 @@ Method (the one the shipped files were fitted with):
     the ECE measured on its CERT decisions (mean and max over the families with at least --min-family CERT decisions
     of the type, and pooled over all of them), next to --reference (basal-1.5: the same statistic on our calibration
     split); automated_at, the share of CERT decisions at or above their type's certified threshold. --strict exits with
-    status 1 when a type's mean LOFO ECE is above the reference;
+    status 1 when a type's mean LOFO ECE is above the reference (a type without a family of --min-family CERT
+    decisions is not tested: a warning on stderr and in the report, status unchanged);
   * multi: per label set (its labels and fallback; id = basal.sets.label_set_id) the fallback_threshold with the best
     mean IoU on FIT over a log grid (null = the default rule wins), with IoU, empty-set accuracy and false-empty rate
     on CERT next to the default. basal-serve uses it for a request with the same label set and fallback and no
@@ -1079,7 +1080,8 @@ def warnings(report, targets):
         if g.get("regression"):
             out.append(f"{t}: the leave-one-family-out ECE {g['mean']:.3f} is above the reference {g['reference']:.3f}")
         elif g.get("mean") is None:
-            out.append(f"{t}: no leave-one-family-out ECE ({g['reason']})")
+            out.append(f"{t}: no leave-one-family-out ECE, 0 families tested ({g['reason']}); --strict does not check "
+                       f"{t}")
     for sid, m in (report.get("multi") or {}).items():
         if "reason" in m:
             out.append(f"multi label set {sid} (fallback {m['fallback']}): no fallback_threshold fitted "
@@ -1090,6 +1092,20 @@ def warnings(report, targets):
 def regressions(report):
     """Types whose mean LOFO ECE is above the reference (--strict)."""
     return [t for t, g in ((report.get("gates") or {}).get("ece_lofo") or {}).items() if g.get("regression")]
+
+
+def strict_check(report, min_family):
+    """--strict: on stderr, every type the family check did not test (no family with min_family CERT decisions of the
+    type, or one family: it passes them), then status 1 when a type's mean LOFO ECE is above the reference."""
+    for t, g in ((report.get("gates") or {}).get("ece_lofo") or {}).items():
+        if g.get("mean") is None:
+            why = (f"each needs >= {min_family} CERT decisions of the type" if g["reason"].startswith("no family")
+                   else g["reason"])
+            print(f"--strict: {t}: 0 families tested ({why}); the family check did not run", file=sys.stderr)
+    bad = regressions(report)
+    if bad:
+        print(f"--strict: leave-one-family-out ECE above the reference for {', '.join(bad)}", file=sys.stderr)
+        sys.exit(1)
 
 
 def engine_name(kind, quant, preset=None):
@@ -1135,10 +1151,8 @@ def refit(a, targets, reference, reference_name):
     else:
         Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
         print(f"\nwrote {a.out} (calibration file {head['fmt']}, engine {cal['engine']}, refitted from {a.input})")
-    bad = regressions(report)
-    if a.strict and bad:
-        print(f"--strict: leave-one-family-out ECE above the reference for {', '.join(bad)}", file=sys.stderr)
-        sys.exit(1)
+    if a.strict:
+        strict_check(report, a.min_family)
 
 
 # -- command line ----------------------------------------------------------------------------------------------------
@@ -1319,10 +1333,8 @@ def main(argv=None):
         Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
         print(f"\nwrote {a.out} (calibration file {fmt}, engine {cal['engine']})\n"
               f"  basal-serve --model {a.model or '<model>'} --mode {mode} --calibration {a.out}")
-    bad = regressions(report) if report else []
-    if a.strict and bad:
-        print(f"--strict: leave-one-family-out ECE above the reference for {', '.join(bad)}", file=sys.stderr)
-        sys.exit(1)
+    if a.strict and report:
+        strict_check(report, a.min_family)
 
 if __name__ == "__main__":
     main()

@@ -240,6 +240,19 @@ def test_end_to_end_gates_strict_and_multi(tmp_path, engine, capsys):
         main(argv + ["--strict"])
 
 
+def test_strict_says_when_no_family_was_tested(tmp_path, engine, capsys):
+    """#19: when no family has --min-family CERT decisions of a type, --strict has nothing to test for it. It still
+    passes (status 0), and says so on stderr and in the report."""
+    labelled(tmp_path / "l.jsonl", n=300)
+    main([str(tmp_path / "l.jsonl"), "--mode", "eager", "--model", "stub", "--out", str(tmp_path / "cal.json"),
+          "--strict", "--reference", "--min-family", "1000"])
+    cap = capsys.readouterr()
+    assert ("--strict: noul: 0 families tested (each needs >= 1000 CERT decisions of the type); the family check did "
+            "not run") in cap.err
+    assert "noul: no leave-one-family-out ECE, 0 families tested" in cap.out
+    assert "--strict does not check noul" in cap.out
+
+
 # -- certified thresholds per type ------------------------------------------------------------------------------------
 
 

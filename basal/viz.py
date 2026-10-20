@@ -24,7 +24,7 @@ import torch
 from .engine import default_device
 from .prompt import FORMATS, PREFILL
 from .run import to_request
-from .server import Server, certified, temperature, to_items
+from .server import Server, certified, http_status, temperature, to_items
 from .server import parser as serve_parser
 
 HERE = Path(__file__).resolve().parent
@@ -225,7 +225,7 @@ def main():
             res = await asyncio.get_running_loop().run_in_executor(None, ex.explain, body)
             return JSONResponse(compare_served(res, await ex.srv.decide(body)))
         except Exception as e:  # noqa: BLE001
-            return JSONResponse({"error": str(e)}, status_code=422)
+            return JSONResponse({"error": str(e)}, status_code=http_status(e))
 
     async def lifespan(_app):
         task = asyncio.get_running_loop().create_task(ex.srv.worker())  # the batching loop of basal-serve

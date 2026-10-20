@@ -37,6 +37,19 @@
   basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: three task requests (41, 24 and 10 prompts) 838 s -> 88 s, 9.6x,
   the same top answer on 75 of 75 readouts (max |Δp| 4e-6); single questions as fast as in `eager`. `--device cuda` is
   refused (that is `--mode fast`). Contributed by Milosz (@Butterski), [#26](https://github.com/rkinas/basal/pull/26).
+- **Status codes and load for process managers.** basal-serve answered every failed request with HTTP 422; now 422
+  means an invalid request, 503 that the GPU ran out of memory (retry later or elsewhere) and 500 any other server
+  error, with the same `{"error": ...}` body. `GET /health` also returns the requests in flight as `running` and
+  `queued` (waiting for the engine), so a manager can tell when the server is idle ([API.md](API.md)). Suggested by
+  @edurdias, [#22](https://github.com/rkinas/basal/issues/22).
+- **`basal-calibrate --strict` says when it tested nothing.** The family check needs 30 CERT decisions of a type in a
+  family (`--min-family`); with fewer in every family it passed without a test. It still passes, but now prints
+  "0 families tested" for each such type on stderr and in the report. Reported by @agentGreg,
+  [#19](https://github.com/rkinas/basal/issues/19).
+- **Apple M5 Pro in HARDWARE.md.** `basal-bench` tables for basal-1.0-4.5B and -1.5B on an M5 Pro (20-core GPU): bf16
+  is 2.0-2.5x faster than on the 40-core M4 Max and 4.2-5.5x faster than fp32, so two sentences written for the M4
+  Max (latency scaling with the core count, fp32 close to bf16) now say that they do not hold for the M5 chips.
+  Measured by Kamil (@kamilrosa), [#7](https://github.com/rkinas/basal/issues/7).
 
 # What is new in basal 2.3
 

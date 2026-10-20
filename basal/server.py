@@ -45,7 +45,8 @@ from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFB
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from . import tasks
-from .prompt import FORMATS, MAX_OPTIONS, lang_of, letter_ids, max_options, media_messages, model_format, render
+from .prompt import (FORMATS, MAX_OPTIONS, RequestError, lang_of, letter_ids, max_options, media_messages, model_format,
+                     reads_request, render)
 from .sets import label_set_id
 from .sets import select as select_set
 from .sets import validate as validate_set
@@ -136,7 +137,7 @@ def named_options(crit, option_keys="show"):
     (the format of the training data and of our PL/EN evaluation clients); descriptions that are not unique within the
     question still get their key, otherwise the options could not be told apart."""
     if option_keys not in ("show", "hide"):
-        raise ValueError(f'option_keys must be "show" or "hide", got {option_keys!r}')
+        raise RequestError(f'option_keys must be "show" or "hide", got {option_keys!r}')
     texts = [str(k) if v is None else _text(v) for k, v in crit.items()]
     dup = {t for t in texts if texts.count(t) > 1}
     shown = [t if v is None or (option_keys == "hide" and t not in dup) else f"{k}: {t}"
@@ -153,6 +154,18 @@ def yes_no(lang, crit=None):
                                 _text(crit.get("false") or ("Nie" if lang == "pl" else "No"))])
 
 
+def check_body(body):
+    """The shape of a decision request (its questions are read by to_items) -> RequestError (HTTP 422)."""
+    if not isinstance(body, dict):
+        raise RequestError("the request body must be a JSON object")
+    for k in ("state", "questions"):
+        if k not in body:
+            raise RequestError(f"missing field {k!r}")
+    if not isinstance(body["questions"], dict) or not all(isinstance(q, dict) for q in body["questions"].values()):
+        raise RequestError('"questions" must be an object of {name: question object}')
+
+
+@reads_request
 def to_items(state, questions, max_opts=MAX_OPTIONS, force_lang=None):
     """Questions of a request -> readout items (options as a list) + keys to assemble the answer. Every item has
     `branches` = [(question text, options)]: one for the decision types, one per label for `multi`. max_opts: the
@@ -171,7 +184,7 @@ def to_items(state, questions, max_opts=MAX_OPTIONS, force_lang=None):
             if isinstance(crit, list):
                 crit = {k: None for k in crit}
             if not crit:
-                raise ValueError(f"question {name!r}: multi needs criteria")
+                raise RequestError(f"question {name!r}: multi needs criteria")
             keys = list(crit)
             labels = [str(k) if v is None else _text(v) for k, v in crit.items()]
             yn = yes_no(lang)[1]
@@ -232,7 +245,7 @@ def to_items(state, questions, max_opts=MAX_OPTIONS, force_lang=None):
             keys, opts = named_options(crit, q.get("option_keys", "show"))
         if not 2 <= len(opts) <= max_opts:
             what = " (tools and extra options)" if t == "tool" else ""
-            raise ValueError(f"question {name!r}: {len(opts)} options{what} (supported: 2..{max_opts})")
+            raise RequestError(f"question {name!r}: {len(opts)} options{what} (supported: 2..{max_opts})")
         out.append(dict(name=name, type=t, keys=keys, state=state, question=instr, options=opts, lang=lang,
                         branches=[(instr, opts)], option_keys=q.get("option_keys", "show"), **extra))
     return out
@@ -242,7 +255,7 @@ def act_spec(name, q, outcomes):
     """Cost matrix C[action][outcome] from the full form or the short form {"wrong": W, "defer": D}."""
     costs = q.get("costs")
     if not isinstance(costs, dict) or not costs:
-        raise ValueError(f"question {name!r}: act needs costs")
+        raise RequestError(f"question {name!r}: act needs costs")
     if set(costs) <= {"wrong", "defer"} and not isinstance(costs.get("wrong"), dict):
         w = float(costs["wrong"])
         C = {y: {z: 0.0 if z == y else w for z in outcomes} for y in outcomes}
@@ -251,7 +264,7 @@ def act_spec(name, q, outcomes):
         return dict(costs=C, defer="defer" if "defer" in costs else None, max_error=q.get("max_error"))
     for a, row in costs.items():
         if not isinstance(row, dict) or set(row) != set(outcomes):
-            raise ValueError(f"question {name!r}: costs[{a!r}] must give a cost for every outcome {outcomes}")
+            raise RequestError(f"question {name!r}: costs[{a!r}] must give a cost for every outcome {outcomes}")
     C = {a: {z: float(v) for z, v in row.items()} for a, row in costs.items()}
     defer = q.get("defer_action") or next((a for a in ("defer", "human") if a in C), None)
     return dict(costs=C, defer=defer, max_error=q.get("max_error"))
@@ -286,7 +299,7 @@ def act_answer(q, probs, conf, cal):
             ans["max_error"] = NO_CERTIFICATE
         if (thr is None or conf < thr) and action != spec["defer"]:
             if spec["defer"] is None:
-                raise ValueError("max_error needs a defer action (\"defer\"/\"human\" or defer_action)")
+                raise RequestError("max_error needs a defer action (\"defer\"/\"human\" or defer_action)")
             ans["action"], ans["refused"] = spec["defer"], action
         ans["deferred"] = ans["action"] == spec["defer"]
     validated = bool(cal.get("temperature_per_prim") or cal.get("temperature_per_bucket")) and (
@@ -379,6 +392,21 @@ def deterministic_setup(kind):
 def _answer(fut, res):
     if not fut.done():
         fut.set_result(res)
+
+
+def out_of_memory(e):
+    """The GPU ran out of memory: torch.OutOfMemoryError (CUDA, MPS), or a CUDA / Metal error that says so."""
+    return isinstance(e, torch.OutOfMemoryError) or isinstance(e, RuntimeError) and (
+        "out of memory" in str(e).lower() or "OutOfMemory" in str(e))
+
+
+def http_status(e):
+    """The status code of a failed request: 422 for an invalid request (RequestError: the client must change it),
+    503 when the GPU ran out of memory (a retry may succeed: the server frees the request's memory), 500 for any other
+    server error."""
+    if isinstance(e, RequestError):
+        return 422
+    return 503 if out_of_memory(e) else 500
 
 
 class LaneGate:
@@ -610,6 +638,11 @@ class Server:
     LONG_BATCH, LONG_BATCH_TOKENS = 4, 32768  # --long-lane: long requests (and their tokens) per long-lane engine call
     SCHED_CALL_TOKENS = 8192  # --scheduler: prompt tokens of long requests per main-lane engine call (at least one)
     TRUNC_MARK, TRUNC_MARGIN = "\n[…]\n", 32  # --context-overflow truncate: the cut in the state, spare tokens
+    # GET /health: client requests in flight (serve) and the calls of ask whose queue entries all wait for an engine
+    # call (waiting: future of a queue entry -> [True while its call waits])
+    in_flight = queued = 0
+    waiting = None
+
     def __init__(self, a):
         validate_quant(a.mode, a.quant)
         kind, quant, comp = MODES[a.mode]
@@ -805,8 +838,32 @@ class Server:
         if q["type"] == "tool":
             hint = ("lower description_chars, give fewer tools, or shortlist the tools first (an embedding or keyword "
                     "prefilter to about 30-50)")
-        raise ValueError(f"question {q['name']!r}: the prompt is {longest[i]} tokens (state, question and options), "
-                         f"more than the {limit[0]} tokens of {limit[1]}; {hint}")
+        raise RequestError(f"question {q['name']!r}: the prompt is {longest[i]} tokens (state, question and options), "
+                           f"more than the {limit[0]} tokens of {limit[1]}; {hint}")
+
+    async def serve(self, body):
+        """One client request (POST /v1/systemone, /v1/basal or an MCP tool call): the body's shape, then decide.
+        Counted as in flight from here to its answer or error (GET /health)."""
+        self.in_flight += 1
+        try:
+            check_body(body)
+            return await self.decide(body)
+        finally:
+            self.in_flight -= 1
+
+    def load(self):
+        """GET /health: "queued" = requests waiting for the engine (every queue entry of their current engine work
+        still in the main queue, the --scheduler backlog or the --long-lane queue); "running" = the other requests in
+        flight (in an engine call, or in the server's own work before and after it). running + queued = 0: idle."""
+        return {"running": self.in_flight - self.queued, "queued": self.queued}
+
+    def started(self, entries):
+        """Queue entries that go into an engine call: their requests are no longer queued (GET /health)."""
+        for e in entries:
+            wait = self.waiting.pop(e[2], None) if self.waiting else None
+            if wait and wait[0]:
+                wait[0] = False
+                self.queued -= 1
 
     async def ask(self, branches, pol, cut=None, lane="main"):
         """Position probabilities of every prompt of every branch: [[probs per prompt] per branch]. cut: the number of
@@ -816,11 +873,15 @@ class Server:
         # SOAM: the whole request is one queue entry (one packed row: state once, every branch after it);
         # otherwise one entry per branch (all option orders of one question share the prefix)
         entries = [branches] if self.soam or lane == "long" else [[b] for b in branches]
-        futs = []
+        futs, wait = [], [True]  # this call waits (queued) until one of its entries starts an engine call
+        if self.waiting is None:
+            self.waiting = {}
+        self.queued += 1
         if lane == "main" and getattr(self, "gate", None) is not None:
             self.gate.main_add(len(entries))
         for e in entries:
             fut = loop.create_future()
+            self.waiting[fut] = wait
             entry = ([p for b in e for p in b[3]], [x for b in e for x in b[4]], fut, pol, cut)
             if lane == "long":
                 lens = [len(p) for p in entry[0]]
@@ -831,10 +892,16 @@ class Server:
                 await self.queue.put(entry)
             futs.append(fut)
         outs = []
-        for e, fut in zip(entries, futs):
-            res, j = await fut, 0
-            for b in e:
-                outs.append(res[j: j + len(b[3])]); j += len(b[3])
+        try:
+            for e, fut in zip(entries, futs):
+                res, j = await fut, 0
+                for b in e:
+                    outs.append(res[j: j + len(b[3])]); j += len(b[3])
+        finally:
+            for fut in futs:
+                self.waiting.pop(fut, None)
+            if wait[0]:
+                self.queued -= 1
         return outs
 
     def cut_of(self, q, branches):
@@ -987,6 +1054,7 @@ class Server:
                 total += e[6]
             for e in batch:
                 self.long_entries.remove(e)
+            self.started(batch)
             if not self.long_entries:
                 self.long_ready.clear()
             groups = [(e[0], e[1]) + ((e[4],) if e[4] else ()) for e in batch]
@@ -1021,6 +1089,7 @@ class Server:
         if not batch:
             slots.release()
             return
+        self.started(batch)
         try:
             for pol in {b[3] for b in batch}:  # requests with the same early-exit policy run together
                 ix = [i for i, b in enumerate(batch) if b[3] == pol]
@@ -1068,24 +1137,26 @@ class Server:
             pol = str(pol)
             allowed = sorted(getattr(self.backend, "policies", {}))
             if pol not in allowed:
-                raise ValueError(f"early_exit={pol!r} not available (server mode must be fast-exit); allowed: {allowed}")
+                raise RequestError(f"early_exit={pol!r} not available (server mode must be fast-exit); "
+                                   f"allowed: {allowed}")
         state = body["state"]
         if body.get("facts", "off") not in ("off", "auto"):
-            raise ValueError('facts must be "off" or "auto"')
+            raise RequestError('facts must be "off" or "auto"')
         if body.get("facts") == "auto":  # append computed calendar / arithmetic facts (PL dates, gaps, VAT)
             state = inject_facts(state if isinstance(state, str) else json.dumps(state, ensure_ascii=False))
         m = self.media_of(body, pol)
         lang = body.get("lang")  # the prompt language when the text alone does not show it (a state that is only media)
         if lang is not None and lang not in ("pl", "en"):
-            raise ValueError('lang must be "pl" or "en"')
+            raise RequestError('lang must be "pl" or "en"')
         qs = to_items(state, body["questions"], self.max_options, force_lang=lang)
         for q in qs:
             stored_fallback(self.cal, q)
         cap = getattr(self.backend, "max_codes", None)  # an engine that reads fewer option codes (Ollama: 20)
         for q in qs:
             if cap is not None and len(q["options"]) > cap:
-                raise ValueError(f"question {q['name']!r}: {len(q['options'])} options, but {type(self.backend).__name__} "
-                                 f"reads at most {cap} ({self.backend.max_codes_reason})")
+                raise RequestError(f"question {q['name']!r}: {len(q['options'])} options, but "
+                                   f"{type(self.backend).__name__} reads at most {cap} "
+                                   f"({self.backend.max_codes_reason})")
         # (question index, branch index, perms, prompts, code ids): every branch in the first pass's option orders
         branches = [self.branch(i, bi, q) for i, q in enumerate(qs) for bi in range(len(q["branches"]))]
         truncation, cut, lane, n_media = None, None, "main", 0
@@ -1119,6 +1190,7 @@ class Server:
             out["usage"]["latency_ms"] = round((time.perf_counter() - t0) * 1000, 2)
         return out
 
+    @reads_request
     def media_of(self, body, pol):
         """The request's media decoded (basal/media.py), or None without media."""
         if body.get("media") is None:
@@ -1126,12 +1198,12 @@ class Server:
         from .media import decode, detail_tokens
         kinds = getattr(self.backend, "media_kinds", ())
         if not kinds:
-            raise ValueError("this server does not take media (basal-serve --mode eager or vllm with --media on, and a "
-                             "model that has an image / audio encoder)")
+            raise RequestError("this server does not take media (basal-serve --mode eager or vllm with --media on, and "
+                               "a model that has an image / audio encoder)")
         if pol is not None:
-            raise ValueError("early_exit is not available with media")
+            raise RequestError("early_exit is not available with media")
         if any(q.get("evidence") for q in body["questions"].values() if isinstance(q, dict)):
-            raise ValueError("evidence is not available with media")
+            raise RequestError("evidence is not available with media")
         soft = detail_tokens(body.get("detail", "default"))
         images, audio, order = decode(body["media"], kinds, getattr(self.backend, "max_audio_s", None))
         return dict(images=images, audio=audio, kinds=order, max_soft_tokens=soft, detail=body.get("detail", "default"))
@@ -1214,14 +1286,14 @@ class Server:
             answers[q["name"]] = ans
         ev_q = [q for q in qs if body["questions"][q["name"]].get("evidence")]
         if ev_q and truncation:
-            raise ValueError("evidence is not available for a state truncated to the context (shorten the state)")
+            raise RequestError("evidence is not available for a state truncated to the context (shorten the state)")
         if ev_q:  # evidence spans: character offsets into the request's state (facts block excluded)
             if not (self.evidence and self.evidence.available):
-                raise ValueError("evidence is not available for this model (no evidence_head.pt)")
+                raise RequestError("evidence is not available for this model (no evidence_head.pt)")
             limit = len(_text(body["state"])) if body.get("facts") == "auto" else None
             for q in ev_q:
                 if q["type"] == "multi" or q.get("multi"):
-                    raise ValueError(f"question {q['name']!r}: evidence is not supported for multi")
+                    raise RequestError(f"question {q['name']!r}: evidence is not supported for multi")
                 answers[q["name"]]["evidence"] = await loop.run_in_executor(
                     None, self.evidence.spans, q["state"], q["question"], q["options"], q["lang"], limit)
         if getattr(self, "cal_unvalidated", None):  # the calibration was fitted on other option orders
@@ -1422,54 +1494,41 @@ def parser():
     return ap
 
 
-def main():
-    a = parser().parse_args()
-    a.mode = a.mode or default_mode(a.model, a.revision)
-    validate_quant(a.mode, a.quant)
-    if a.mcp == "on":
-        from .mcp_server import available
-        missing = available()
-        if missing:
-            raise SystemExit(missing)
+def http_app(srv, mode, mcp=None):
+    """The app of basal-serve: POST /v1/systemone and /v1/basal, GET /v1/models and /health; mcp: (routes, lifespan) of
+    --mcp on. A failed request answers {"error": message} with http_status: 422 invalid request, 503 out of GPU
+    memory, 500 any other server error."""
     from contextlib import asynccontextmanager, nullcontext
 
-    import uvicorn
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
-    t0 = time.time()
-    if a.think == "off":
-        srv = Server(a)
-    else:
-        from .think import ThinkServer
-        srv = ThinkServer(a)
-    attn = getattr(srv.backend, "attn", None)
-    print(f"basal: model {a.model} mode {a.mode}{f' attention {attn}' if attn else ''} ready in {time.time() - t0:.0f}s "
-          f"on port {a.port}", flush=True)
+    def failed(e):
+        print(f"basal: request failed: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr, flush=True)
+        if isinstance(e, torch.OutOfMemoryError):  # the failed forward's blocks back to the GPU: kept by the
+            torch.cuda.empty_cache()  # allocator, they failed the next requests too (ultra, 20 Oct)
+        return JSONResponse({"error": str(e)}, status_code=http_status(e))
 
     async def systemone(request):
         try:
-            return JSONResponse(await srv.decide(await request.json()))
+            body = await request.json()
+        except ValueError as e:  # not JSON (or not UTF-8)
+            return failed(RequestError(f"the request body is not valid JSON: {e}"))
+        try:
+            return JSONResponse(await srv.serve(body))
         except Exception as e:  # noqa: BLE001
-            print(f"basal: request failed: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr, flush=True)
-            if isinstance(e, torch.OutOfMemoryError):  # the failed forward's blocks back to the GPU: kept by the
-                torch.cuda.empty_cache()  # allocator, they failed the next requests too (ultra, 20 Oct)
-            return JSONResponse({"error": str(e)}, status_code=422)
+            return failed(e)
 
     async def models(_):
-        return JSONResponse(models_payload(srv.name, a.mode, getattr(srv.backend, "policies", {}), srv.temps,
+        return JSONResponse(models_payload(srv.name, mode, getattr(srv.backend, "policies", {}), srv.temps,
                                            srv.fmt, srv.orders, getattr(srv.backend, "media_kinds", ()),
                                            getattr(srv, "cal_mismatch", None), getattr(srv.backend, "preset", None)))
 
     async def health(_):
-        return JSONResponse({"status": "ok"})
+        return JSONResponse({"status": "ok", **srv.load()})
 
-    mcp_routes, mcp_run = [], None
-    if a.mcp == "on":
-        from .mcp_server import http
-        mcp_routes, mcp_run = http(srv, a.host)
-        print(f"basal: MCP (streamable HTTP) at http://{a.host}:{a.port}/mcp", flush=True)
+    mcp_routes, mcp_run = mcp or ([], None)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -1481,9 +1540,38 @@ def main():
         for task in tasks:
             task.cancel()
 
-    app = Starlette(routes=[Route("/v1/systemone", systemone, methods=["POST"]),
-                            Route("/v1/basal", systemone, methods=["POST"]), Route("/v1/models", models),
-                            Route("/health", health), *mcp_routes], lifespan=lifespan)
+    return Starlette(routes=[Route("/v1/systemone", systemone, methods=["POST"]),
+                             Route("/v1/basal", systemone, methods=["POST"]), Route("/v1/models", models),
+                             Route("/health", health), *mcp_routes], lifespan=lifespan)
+
+
+def main():
+    a = parser().parse_args()
+    a.mode = a.mode or default_mode(a.model, a.revision)
+    validate_quant(a.mode, a.quant)
+    if a.mcp == "on":
+        from .mcp_server import available
+        missing = available()
+        if missing:
+            raise SystemExit(missing)
+    import uvicorn
+
+    t0 = time.time()
+    if a.think == "off":
+        srv = Server(a)
+    else:
+        from .think import ThinkServer
+        srv = ThinkServer(a)
+    attn = getattr(srv.backend, "attn", None)
+    print(f"basal: model {a.model} mode {a.mode}{f' attention {attn}' if attn else ''} ready in {time.time() - t0:.0f}s "
+          f"on port {a.port}", flush=True)
+
+    mcp = None
+    if a.mcp == "on":
+        from .mcp_server import http
+        mcp = http(srv, a.host)
+        print(f"basal: MCP (streamable HTTP) at http://{a.host}:{a.port}/mcp", flush=True)
+    app = http_app(srv, a.mode, mcp)
     try:  # uvloop + httptools when available (uvicorn[standard]); plain asyncio otherwise
         import httptools  # noqa: F401
         import uvloop  # noqa: F401

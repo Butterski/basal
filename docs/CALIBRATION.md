@@ -44,7 +44,8 @@ answer `"calibration": "unvalidated"`. A format-2 model may ship an optional `CA
 - `--reference [basal-1.5 | FILE]`: what the leave-one-family-out ECE is compared with. The flag alone means the
   basal-1.5 values; a FILE is a calibration file whose `gates.ece_lofo` holds the means.
 - `--strict`: exit with status 1 when a type's leave-one-family-out ECE is above the reference. The file is still
-  written. Use it in CI.
+  written. Use it in CI. A type with no family of `--min-family` CERT decisions is not tested and does not fail;
+  2.3.1 says so on stderr ("0 families tested") and in the report.
 - `--min-family 30`: the CERT decisions of a type that a family needs for its own ECE.
 - `--min-per-set 30`: the FIT questions that a label set needs before its `fallback_threshold` is fitted.
 - `--save-rows FILE`: also write the uncalibrated probabilities of every decision (decision questions only: task
