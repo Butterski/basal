@@ -13,7 +13,9 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 
 - **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), since v2.1.0 `vllm` (text only;
   faster, with prefix caching and FlashAttention) and, since 2.3, `fast` / `fast-nocompile` (text only; the CUDA
-  graph engine, below; the default on CUDA). The `-FP8` checkpoints (mini, max, ultra) run on `--mode vllm`;
+  graph engine, below). Without `--mode`, basal-omni runs `fast` on Hopper GPUs with the `flash_attn_3` package (the
+  configuration its gate passed) and `eager` on other GPUs until they pass theirs (2.2.0 had no working default for
+  basal-omni on CUDA: `fast` stopped while loading the model). The `-FP8` checkpoints (mini, max, ultra) run on `--mode vllm`;
   basal-omni-1.0-mini-FP8 also on `--mode fast` (its port gate below).
   With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max and the `-FP8` checkpoints) uses
   it; the others use their `CALIBRATION.json`.
@@ -65,26 +67,29 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
     port gate (0.9892 at margin >= 0.2 on 2-10 options, bar 0.9893). Serve an `-FP8` checkpoint instead.
 
   Measured 2026-10-20 on one H100 against `--mode eager` of the same engine (the gate of the FP8 ports, as above;
-  dev v2, 10,606 decisions, one order; automated share at 1% on the calibration test split, each engine with its own
-  calibration fit, paired bootstrap, bar: 95% lower bound of the difference >= -0.5 points; `basal-loadtest` at 16 in
+  dev v2, 10,606 decisions, one order; automated share at 1% on the calibration test split with the calibration file
+  the mode loads, paired bootstrap, bar: 95% lower bound of the difference >= -0.5 points; `basal-loadtest` at 16 in
   flight: one question over a ~1.5k-token state, and five questions over 3k-10k-token states):
 
   | model, configuration | agreement (all / at margin >= 0.2) | accuracy | ECE | automated at 1% (eager) | decisions/s, one question (eager) | questions/s, five over a long state (eager) |
   |---|---|---|---|---|---|---|
-  | mini, `fast` (auto: fa3, compact rows) | 0.9937 / 0.9994 | +0.00 pt | +0.000 | 41.82% (41.99%) | 61.2 (10.0) | 21.4 (1.6) |
-  | 1.1-max, `fast` (auto: fa3, compact rows) | 0.9891 / 0.9990 | +0.04 pt | -0.001 | 47.00% (47.10%) | 16.2 (4.8) | 10.6 (0.7) |
-  | mini, `fast --gemma-attn math` | 0.9984 / 0.9997 | -0.02 pt | +0.000 | 41.83% (41.99%) | 15.8 | 7.9 |
-  | 1.1-max, `fast --gemma-attn math` | 0.9992 / 0.9997 | +0.01 pt | -0.000 | 47.04% (47.10%) | 3.8 | 2.0 |
-  | ultra, `fast` (auto: fa3, compact rows) | 0.9918 / 0.9985 | -0.06 pt | +0.002 | 56.26% (56.82%) | 6.1 (2.0 at 4 in flight) | 4.8 (0.3 at 2 in flight) |
+  | mini, `fast` (auto: fa3, compact rows) | 0.9937 / 0.9994 | +0.00 pt | +0.000 | 41.97% (41.99%) | 61.2 (10.0) | 21.4 (1.6) |
+  | 1.1-max, `fast` (auto: fa3, compact rows) | 0.9891 / 0.9990 | +0.04 pt | -0.001 | 47.16% (47.10%) | 16.2 (4.8) | 10.6 (0.7) |
+  | mini, `fast --gemma-attn math` | 0.9984 / 0.9997 | -0.02 pt | +0.000 | | 15.8 | 7.9 |
+  | 1.1-max, `fast --gemma-attn math` | 0.9992 / 0.9997 | +0.01 pt | -0.000 | | 3.8 | 2.0 |
+  | ultra, `fast` (auto: fa3, compact rows) | 0.9918 / 0.9985 | -0.06 pt | +0.002 | 56.73% (56.82%) | 6.1 (2.0 at 4 in flight) | 4.8 (0.3 at 2 in flight) |
   | mini-FP8 checkpoint, `fast` | 0.9635 / 0.9908 | -0.26 pt | +0.002 | | 80.6 | 19.6 |
 
-  The automated shares are each engine's own calibration fit; served with the shipped `CALIBRATION.json` (what
-  `--mode fast` loads) the fast engine automates 41.97% (mini), 47.16% (1.1-max) and 56.73% (ultra) at 1%. On ultra
-  the fast engine's own fit misses the automation bar (-0.56 points, 95% interval -0.76 to -0.36) although its readouts
-  are as close to eager's as on the other tiers (top answer 0.997 of the calibration test, mean confidence +0.0001):
-  the refit's yes / no temperature (0.958 against 0.944) certifies fewer answers; serve it with the shipped file. On
-  one 80 GB H100 ultra answers five questions over 3k-10k-token states at 4.8 per second (vLLM bf16 with `--max-len
-  8192`: 3.8). For comparison, vLLM bf16 on 1.1-max: 0.9866 / 0.9994, 16.7 decisions/s, 10.8 questions/s.
+  `--mode fast` has no calibration file of its own (it never loads a `CALIBRATION.fast.json`): it loads the model's
+  `CALIBRATION.json`, fitted on eager readouts, and the automated shares above are measured with that file. A
+  calibration refitted on fast-mode readouts is not shipped: the refit moves the certified thresholds by fit noise, not
+  because the readouts differ (top answer 0.996-0.997 of the calibration test against eager's, no mean shift of the
+  confidence). Refits of four fast configurations of 1.1-max with equally close readouts automated -0.49, -0.39, -0.05
+  and -0.11 points against eager's own fit at 1% (the default configuration: -0.11), ultra's -0.56 (its refit's yes /
+  no temperature is 0.958 against 0.944, so fewer yes / no answers clear the threshold), and mini's refit certifies
+  choice questions only at confidence 0.9998 at the 5% target (32.7% automated instead of 77.4%). On one 80 GB H100
+  ultra answers five questions over 3k-10k-token states at 4.8 per second (vLLM bf16 with `--max-len 8192`: 3.8). For
+  comparison, vLLM bf16 on 1.1-max: 0.9866 / 0.9994, 16.7 decisions/s, 10.8 questions/s.
   With the math kernel (fp32 scores, without tensor cores) 1.1-max's single questions are slower than eager's larger
   batches. In fp32 every path of `fast` (fa3's compiled code with flex in place of FA3) gives the answers of separate
   prompts (identity gate: max |dp| 1.6e-5). Start-up: about 5 minutes (compile and graph capture).
