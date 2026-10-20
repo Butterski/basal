@@ -677,6 +677,7 @@ class GraphBackend(EagerBackend):
         self.graphs = {}
         if warm:
             self.warm()
+        self.one_forward = self._one_forward_tokens()
 
     def _gemma_init(self, kernels, quant, compile, merge):
         """basal-omni (Gemma 4): the forward of basal/gemma4_graph.py under the same packing, graphs and caches. Its
@@ -973,6 +974,25 @@ class GraphBackend(EagerBackend):
             return self.gemma.forward_suffix(ids, mask, pos, prefix, ro, compiled=False, kv=kv)
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
                                 basal_prefix=prefix, basal_kv=kv).last_hidden_state
+
+    one_forward = 0  # tokens of the longest state run as one forward (_one_forward_tokens; 0: every one in chunks)
+    ONE_FORWARD_SHARE = 0.5  # of the free memory after warm-up a state beyond the largest graph may take in one forward
+
+    def _one_forward_tokens(self):
+        """The longest prompt or state beyond the largest graph that runs as one forward (2.3.0's path, the fastest);
+        longer ones are prefilled in chunks (_continue). From the free memory after warm-up and an estimate of one
+        forward's memory per token: the MLP's gate / up / product rows, a few hidden-size rows, and the keys / values a
+        root keeps (Gemma 4: its global layers; sliding layers keep their window)."""
+        if self.dev.type != "cuda":
+            return 1 << 30
+        cfg = self.gemma.cfg if self.gemma is not None else self.model.config
+        b = self._dtype.itemsize
+        kept = self.gemma.kv_lens(1 << 30) if self.gemma is not None else [1 << 30] * len(self.kv_shapes)
+        kv = sum(2 * H * D * b for (H, D), t in zip(self.kv_shapes, kept) if t >= 1 << 30)
+        per = (4 * cfg.intermediate_size + 8 * cfg.hidden_size) * b + kv
+        n = int(self.ONE_FORWARD_SHARE * torch.cuda.mem_get_info(self.dev)[0] / per)
+        print(f"basal: states beyond {n} tokens are prefilled in chunks of {self.CHUNK}", flush=True)
+        return n
 
     CHUNK = 2048  # tokens per forward of a long state (and of a state's new part over a cached one): _continue
 
@@ -1291,8 +1311,13 @@ class GraphBackend(EagerBackend):
         if n > self.PLAIN_LENS[-1]:
             assert len(idx) == 1
             t, _, _, last, _ = packs[idx[0]]
-            assert all(i == len(t) - 1 for i in last)  # a single prompt (or duplicates) reads out at its last token
-            return self._continue(list(t))[1][None].expand(len(last), -1)  # in chunks (_continue)
+            if n > self.one_forward:  # in chunks (_continue)
+                assert all(i == len(t) - 1 for i in last)  # a single prompt (or duplicates) reads out at its last token
+                return self._continue(list(t))[1][None].expand(len(last), -1)
+            if self.gemma is not None:  # a single prompt (or duplicates) reads out at its last token
+                return self._forward(self._to_dev(torch.tensor([t])), ro=self._to_dev(torch.tensor([[last[0]]])))[
+                    0, [0] * len(last)]
+            return self._forward(self._to_dev(torch.tensor([t])))[0, last]
         L, b = self._bucket(n, self.PLAIN_LENS), self._bucket(len(idx), self.BATCHES)
         g, ids, _, *ro, out = self._graph(b, L)
         h_ids, _, _, rows, cols, _ = self._host_rows(packs, idx, b, L)
@@ -1418,8 +1443,13 @@ class GraphBackend(EagerBackend):
             # uncompiled one costs a few percent of a forward that is rare and long anyway
             assert b == 1
             L, B = P[0], 1
-            kv, h1 = self._continue(list(packs[idx[0]][0][:L]))  # in chunks (_continue)
-            kv, h1 = [(k[None], v[None]) for k, v in kv], h1[None, None]  # pass 1 holds the root's last token only
+            if L > self.one_forward:  # in chunks (_continue); pass 1 holds the root's last token only
+                kv, h1 = self._continue(list(packs[idx[0]][0][:L]))
+                kv, h1 = [(k[None], v[None]) for k, v in kv], h1[None, None]
+            else:
+                kv = self._kv_new(L)
+                ro = self._to_dev(torch.tensor([[L - 1]])) if self.gemma is not None else None
+                h1 = self._forward(self._to_dev(torch.tensor([packs[idx[0]][0][:L]])), kv, ro)
         else:
             L, B = self._bucket(max(P), self.PLAIN_LENS), self._bucket(b, self.BATCHES)
             g, ids, kv, *ro, h1 = self._graph(B, L)

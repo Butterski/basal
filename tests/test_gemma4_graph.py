@@ -204,6 +204,18 @@ def test_long_state_keeps_the_window_of_sliding_layers():
     assert s["entries"] == 1 and s["hits"] == 1
 
 
+def test_one_forward_below_the_threshold_equals_separate():
+    """States and prompts beyond the largest graph but within one_forward run as one forward (2.3.0's path)."""
+    m = tiny("e4b", torch.float32)
+    be = Stub(m)
+    be.one_forward = 1 << 20
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
+    toks = [state + [20, 21, 30 + o, 31 - o] for o in range(2)]
+    res = be.run_shared([(toks, [[7, 8], [7, 8]]), ([state + [40, 41]], [[7, 9]])])
+    for r, e in zip(res[0] + res[1], separate(m, toks, [[7, 8], [7, 8]]) + separate(m, [state + [40, 41]], [[7, 9]])):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+
+
 def test_long_lane_equals_separate():
     """The long lane (run_long): every unit alone, one decoder layer at a time (between(i) before layer i)."""
     m = tiny("31b", torch.float32)
