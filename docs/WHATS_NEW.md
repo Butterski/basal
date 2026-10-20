@@ -7,6 +7,14 @@
   questions over a 3k-10k-token state: mini 1.6 -> 15.3 questions/s, max 0.7 -> 4.5; one question: mini 10.0 -> 17.2
   decisions/s. Agreement with the 2.2 forward on dev v2: 1.000 (mini) and 0.9997 (max) on decisions with margin >=
   0.2. `--eager-forward hf` keeps the 2.2 path. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+- **`--eager-attn auto` (opt-in, basal-omni in `--mode eager` on Hopper):** FlashAttention 3 in the sliding-window
+  layers and the memory-efficient kernel (keys and values copied per head) in the 512-wide global layers. One H100 at
+  16 in flight, against the default math kernel: mini 17.2 -> 24.4 decisions/s and 15.3 -> 19.0 questions/s over long
+  states, max 5.0 -> 8.7 and 4.5 -> 7.6. Top answers equal to the 2.2 forward on 0.9995 (mini) and 0.9991 (max) of the
+  dev v2 decisions with margin >= 0.2.
+- **`--ple-offload on` (basal-omni mini, `--mode eager`):** the 5.6 GB per-layer embedding table stays in host memory
+  and only the rows of each forward's tokens go to the GPU: 5.2 GB less GPU memory at about 4% fewer decisions per
+  second, the same answers. For mini on smaller GPUs.
 - **`--mode eager` avoids a torch attention bug.** Before torch 2.14.1, SDPA's memory-efficient kernel returns wrong
   attention for keys and values expanded from one key / value head at some query lengths (pytorch/pytorch#191937):
   transformers passes such a view with an attention mask, and basal-omni-1.0-max was off by 6.2 in code log-prob on a

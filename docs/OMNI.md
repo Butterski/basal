@@ -46,12 +46,23 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   - **Media once per request.** The image and audio encoders run once per request and the soft tokens are part of the
     shared beginning. The soft tokens of one image attend to each other as transformers builds the masks: on max and
     1.1-max (Gemma 4 unified) in every layer, on ultra in the sliding-window layers within the window.
-  - **Attention kernel:** SDPA's math kernel, as in 2.2. The memory-efficient kernel returned wrong attention in 2.2's
-    transformers forward of max: it was given an expanded (zero-stride) view of the one global key / value head, which
-    torch before 2.14.1 reads wrong at query lengths = 1 mod 32 (pytorch/pytorch#191937). Since 2.3 `--mode eager`
-    runs the transformers forward of every model without that kernel on such torch versions.
+  - **Attention kernel** (`--eager-attn`): `math` (default) is 2.2's kernel in every layer. `auto` (opt-in) runs on
+    Hopper FlashAttention 3 (varlen; the sliding window as its left window) in the sliding-window layers and SDPA's
+    memory-efficient kernel in the 512-wide global layers (no flash kernel takes 512 on Hopper), elsewhere the math
+    kernel; fp32 and the image rows of max, 1.1-max and ultra keep the masked math kernel. Every attention call of mini
+    and max on a 1,857-token prompt and three 12.6k-token ones, against float64: FlashAttention 3 and the
+    memory-efficient kernel within bf16 rounding of the math kernel, at 11x and 3x its speed (max). With both option
+    orders, the share automated at 5% is 0.6 points lower than the reference path (mini; at 1% within 0.3 points). The
+    memory-efficient kernel gets keys and values copied per head: 2.2's transformers forward gave it an expanded
+    (zero-stride) view of max's one global key / value head, which torch before 2.14.1 reads wrong at query lengths
+    = 1 mod 32 (pytorch/pytorch#191937). Since 2.3 `--mode eager` runs the transformers forward of every model without
+    that kernel on such torch versions.
   - **Padding:** the prompts of a batch are padded on the right and read at their last real token, so a padded prompt
     gives the answer it gives alone.
+  - **Per-layer embeddings off the GPU** (`--ple-offload on`, mini): mini looks up 256 extra numbers per layer for
+    every token in a 5.6 GB table (a third of its weights). With the option the table stays in host memory and only the
+    rows of each forward's tokens go to the GPU: 5.2 GB less GPU memory (peak 21.1 -> 15.9 GB) at about 4% fewer
+    decisions per second, the same answers (dev v2: 10,606 of 10,606). For mini on smaller GPUs.
 
   Measured 2026-10-20 on one H100 against `--eager-forward hf` of the same engine (dev v2, 10,606 decisions, one
   option order; automated share at 1% on the calibration test split, each forward with its own calibration fit,
@@ -60,8 +71,10 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
 
   | model | agreement (all / at margin >= 0.2) | accuracy | ECE | automated at 1% | decisions/s, one question | questions/s, five over a long state |
   |---|---|---|---|---|---|---|
-  | mini | 0.9982 / 1.0000 | -0.06 pt | +0.001 | 41.82% (2.2: 41.99%) | 17.2 (2.2: 10.0) | 15.3 (2.2: 1.6) |
-  | max | 0.9994 / 0.9997 | -0.01 pt | +0.000 | 47.35% (2.2: 47.39%) | 5.0 (2.2: 4.8) | 4.5 (2.2: 0.7) |
+  | mini, `--eager-attn math` | 0.9982 / 1.0000 | -0.06 pt | +0.001 | 41.82% (2.2: 41.99%) | 17.2 (2.2: 10.0) | 15.3 (2.2: 1.6) |
+  | max, `--eager-attn math` | 0.9994 / 0.9997 | -0.01 pt | +0.000 | 47.35% (2.2: 47.39%) | 5.0 (2.2: 4.8) | 4.5 (2.2: 0.7) |
+  | mini, `--eager-attn auto` (Hopper) | 0.9940 / 0.9995 | +0.05 pt | -0.000 | 41.95% | 24.4 | 19.0 |
+  | max, `--eager-attn auto` (Hopper) | 0.9894 / 0.9991 | -0.10 pt | +0.001 | 47.66% | 8.7 | 7.6 |
 
   With both option orders (`--orders 2`, every decision over the shared question) agreement is 0.9980 / 1.0000 on
   mini and 0.9953 / 0.9999 on max. The disagreements are close calls (eager's margin under 0.05 on mini); the
