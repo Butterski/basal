@@ -14,6 +14,9 @@
   basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: three task requests (41, 24 and 10 prompts) 838 s -> 88 s, 9.6x,
   the same top answer on 75 of 75 readouts (max |Δp| 4e-6); single questions as fast as in `eager`. `--device cuda` is
   refused (that is `--mode fast`). Contributed by Milosz (@Butterski), [#26](https://github.com/rkinas/basal/pull/26).
+- **`--lean on --tree flex` is refused before the model is resolved** also on CUDA GPUs without FlashAttention 3,
+  where choosing the default mode resolved the model first (offline: a download error instead of the refusal;
+  `tests/test_lean.py` failed on those GPUs). Contributed by Milosz (@Butterski).
 
 # What is new in basal 2.3
 

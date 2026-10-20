@@ -101,7 +101,9 @@ def test_flex_tree_mask_is_the_dense_mask():
 
 
 def test_flex_with_lean_on_refused_before_loading(monkeypatch):
-    """--lean on with --tree flex fails at CUDA graph capture (FlexAttention falls back to its uncompiled kernel)."""
+    """--lean on with --tree flex fails at CUDA graph capture (FlexAttention falls back to its uncompiled kernel). The
+    refusal comes first on any machine, also on a CUDA GPU without FlashAttention 3, where choosing the default mode
+    resolves the model (to see whether it is Gemma 4)."""
     import sys
 
     import pytest
@@ -109,8 +111,12 @@ def test_flex_with_lean_on_refused_before_loading(monkeypatch):
     import basal.server as server_module
     monkeypatch.setattr(sys, "argv", ["basal-serve", "--lean", "on", "--tree", "flex"])
     monkeypatch.setattr(server_module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
-    with pytest.raises(SystemExit, match="--tree flex runs with --lean pass2"):
-        server_module.main()
+    for no_fa3_gpu in (False, True):
+        if no_fa3_gpu:  # e.g. an RTX 4060 Ti: CUDA, no FlashAttention 3
+            monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+            monkeypatch.setattr(server_module, "attention_available", lambda impl: None if impl == "fa2" else "no")
+        with pytest.raises(SystemExit, match="--tree flex runs with --lean pass2"):
+            server_module.main()
 
 
 def test_lean_tree_auto():

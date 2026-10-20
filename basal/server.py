@@ -465,6 +465,13 @@ def lean_tree(lean, tree, kind, compiled=True, quant=None):
     return lean, tree
 
 
+def refuse_lean_flex(lean, tree):
+    """--lean on with --tree flex (both explicit, so refused before a mode is chosen or a model resolved)."""
+    if lean == "on" and tree == "flex":
+        raise SystemExit("--tree flex runs with --lean pass2; with --lean on its FlexAttention falls back to an "
+                         "uncompiled kernel during CUDA graph capture and the engine fails to start")
+
+
 def merge_arg(value):
     """--merge auto / on / off -> the GraphBackend argument ("auto", True, False)."""
     return {"on": True, "off": False}.get(value, "auto")
@@ -628,9 +635,7 @@ class Server:
             raise SystemExit("--prefix-cache needs the CUDA graph engine (fast, fast-nocompile, fp8, nvfp4) and is not "
                              "combined with --deterministic")
         a.lean, a.tree = lean_tree(getattr(a, "lean", "off"), getattr(a, "tree", "dense"), kind, comp, a.quant or quant)
-        if a.lean == "on" and a.tree == "flex":
-            raise SystemExit("--tree flex runs with --lean pass2; with --lean on its FlexAttention falls back to an "
-                             "uncompiled kernel during CUDA graph capture and the engine fails to start")
+        refuse_lean_flex(a.lean, a.tree)
         if getattr(a, "batches", "default") not in ("default", "auto") and kind not in ("graph", "exit"):
             raise SystemExit("--batches needs the CUDA graph engine (fast, fast-nocompile, fast-exit, fp8, nvfp4)")
         if getattr(a, "vllm_preset", "default") != "default" and kind != "vllm":
@@ -1424,6 +1429,7 @@ def parser():
 
 def main():
     a = parser().parse_args()
+    refuse_lean_flex(a.lean, a.tree)  # before default_mode, which resolves the model on CUDA GPUs without FA3
     a.mode = a.mode or default_mode(a.model, a.revision)
     validate_quant(a.mode, a.quant)
     if a.mcp == "on":
