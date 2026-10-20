@@ -26,6 +26,7 @@ import json
 import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -375,6 +376,15 @@ def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scal
     if (direct is not None and attention_mask is None and basal_prefix is None and query.shape[2] > 1
             and query.dtype in (torch.bfloat16, torch.float16)):
         return direct(query, key, value, scaling), None
+    groups = getattr(module, "num_key_value_groups", 1)
+    if attention_mask is not None and key.shape[1] == 1 and groups > 1:
+        # one key / value head: transformers' repeat_kv would hand SDPA a stride-0 view, and the memory-efficient
+        # kernel (the dispatcher's pick for a masked call) then returns a wrong last query row on torch < 2.14.1 at
+        # query lengths 1 mod 64 (head size 128; 1 mod 32 at 256 and 512): pytorch/pytorch#191937, fp32 last rows off
+        # by ~3 on an H100 (20 Oct). The heads are copied here instead (basal-2.0 has 2 or 8 key / value heads, which
+        # repeat_kv already copies)
+        key, value = (x.expand(-1, groups, -1, -1).contiguous() for x in (key, value))
+        module = SimpleNamespace(num_key_value_groups=1, is_causal=getattr(module, "is_causal", True))
     return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
                                   is_causal=is_causal, **kwargs)
 
