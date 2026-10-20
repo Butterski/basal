@@ -976,20 +976,22 @@ class GraphBackend(EagerBackend):
                                 basal_prefix=prefix, basal_kv=kv).last_hidden_state
 
     one_forward = 0  # tokens of the longest state run as one forward (_one_forward_tokens; 0: every one in chunks)
-    ONE_FORWARD_SHARE = 0.5  # of the free memory after warm-up a state beyond the largest graph may take in one forward
+    # of the free memory after warm-up a state beyond the largest graph may take in one forward: ultra on an 80 GB
+    # H100 has 8.4 GB free after warm-up and one forward of 32k tokens peaked 7.5 GB above it (48k ran out of memory)
+    ONE_FORWARD_SHARE = 0.8
 
     def _one_forward_tokens(self):
         """The longest prompt or state beyond the largest graph that runs as one forward (2.3.0's path, the fastest);
         longer ones are prefilled in chunks (_continue). From the free memory after warm-up and an estimate of one
-        forward's memory per token: the MLP's gate / up / product rows, a few hidden-size rows, and the keys / values a
-        root keeps (Gemma 4: its global layers; sliding layers keep their window)."""
+        forward's memory per token: the MLP's gate / up rows, a few hidden-size rows, and the keys / values a root keeps
+        (Gemma 4: its global layers; sliding layers keep their window). Ultra: 32k tokens on an 80 GB H100."""
         if self.dev.type != "cuda":
             return 1 << 30
         cfg = self.gemma.cfg if self.gemma is not None else self.model.config
         b = self._dtype.itemsize
         kept = self.gemma.kv_lens(1 << 30) if self.gemma is not None else [1 << 30] * len(self.kv_shapes)
         kv = sum(2 * H * D * b for (H, D), t in zip(self.kv_shapes, kept) if t >= 1 << 30)
-        per = (4 * cfg.intermediate_size + 8 * cfg.hidden_size) * b + kv
+        per = (2 * cfg.intermediate_size + 4 * cfg.hidden_size) * b + kv
         n = int(self.ONE_FORWARD_SHARE * torch.cuda.mem_get_info(self.dev)[0] / per)
         print(f"basal: states beyond {n} tokens are prefilled in chunks of {self.CHUNK}", flush=True)
         return n
@@ -1313,7 +1315,9 @@ class GraphBackend(EagerBackend):
             t, _, _, last, _ = packs[idx[0]]
             if n > self.one_forward:  # in chunks (_continue)
                 assert all(i == len(t) - 1 for i in last)  # a single prompt (or duplicates) reads out at its last token
-                return self._continue(list(t))[1][None].expand(len(last), -1)
+                h = self._continue(list(t))[1][None].expand(len(last), -1).clone()
+                torch.cuda.empty_cache()
+                return h
             if self.gemma is not None:  # a single prompt (or duplicates) reads out at its last token
                 return self._forward(self._to_dev(torch.tensor([t])), ro=self._to_dev(torch.tensor([[last[0]]])))[
                     0, [0] * len(last)]
@@ -1528,6 +1532,9 @@ class GraphBackend(EagerBackend):
                 rows = self._to_dev(torch.tensor([sel[n][1] for n in j]))
                 cols = self._to_dev(torch.tensor([sel[n][2] for n in j]))
                 out[self._to_dev(torch.tensor(j))] = h[rows, cols]
+        if max(P) > self.PLAIN_LENS[-1] and self.dev.type == "cuda":  # a long root: its passes' cached blocks back to
+            del kv, h1, h2  # the GPU (an 82k-token ultra request left 6 GB of them behind, 20 Oct)
+            torch.cuda.empty_cache()
         return out
 
     def _gemma_suffix(self, ids2, mask, pos2, kv, sel, B):
