@@ -354,9 +354,12 @@ Two more runs for basal-2.0 (4.5B): `mlx` 133.8 / 134.6 ms, `mps` 72.6 / 72.5 ms
 one order 95-99 ms in both), basal-1.0-4.5B 388 vs 506 ms (one run; one order 295 vs 339 ms). The cause is the
 backend: when #4 was merged into basal 1.5 (`4c11a87`), the `mlx` backend of 1.5 replaced the one of #4. It runs the
 prefix that the two orders share as one forward into a KV cache and both option blocks as a second forward, where #4
-ran the prefix and both blocks as one packed forward, and every forward reads all the weights again. A packed forward
-for the Llama-based models brought the 1.5B back to 124 ms in a test, but it changed probabilities (up to 0.045 with
-8-bit weights) and was slower than two forwards for prompts over about 900 tokens, so 2.3.1 keeps the 1.5 backend.
+ran the prefix and both blocks as one packed forward, and every forward reads all the weights again
+([#27](https://github.com/rkinas/basal/issues/27)). 2.3.1 adds that packed forward back as `--mlx-packed`
+(opt-in; [#28](https://github.com/rkinas/basal/pull/28) by Grzegorz Brzezinka). Two orders on the M5 Max (his
+measurement): basal-1.0-4.5B 118 -> 68 ms, basal-2.0-4.5B-MLX-8bit 134 -> 77 ms. On the M4 Pro: basal-1.0-1.5B
+158 -> 130-136 ms, basal-2.0-4.5B-MLX-8bit 379-390 -> 330 ms. Its checks and why it is not the default yet:
+[QUANTIZATION.md](QUANTIZATION.md#mlx-apple-silicon).
 
 - **Same generation, twice the GPU cores** (M5 Max 40 vs M5 Pro 20, basal-1.0 at `3fa2eea`, 2 orders): bf16 and 8-bit
   modes are 1.35–1.63× faster, `eager-fp32` 1.71–1.88×; the 1.5B gains less than the 4.5B.
