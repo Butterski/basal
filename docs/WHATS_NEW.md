@@ -1,5 +1,12 @@
 # What is new in basal 2.3.1 (not released yet)
 
+- **basal-omni's fast mode on Blackwell workstation GPUs** (sm_120, such as the RTX PRO 6000): `--gemma-attn auto` is
+  FlexAttention there, with tiles for their 99 KB of shared memory per block, and basal-omni without `--mode` runs
+  `fast` on them as on Hopper. Gate on an RTX PRO 6000: every path of the fp32 identity check 1.000 (mini, 1.0-max),
+  dev v2 port gates pass, automated share at 1% with the shipped calibration within 0.07 points of eager's (mini
+  -0.07, 1.0-max -0.05), 2.2-4.1x eager on single questions and 14-22x with five over a long state. vLLM stays faster
+  for single 1.0-max questions there (8.9 against 5.0 decisions per second).
+
 - **Incremental states** (`--mode fast` with `--state-cache-gb N`): a request whose state begins with a cached state - a
   growing agent trace or chat history, or an edited one up to the edit - computes only its new tokens over the cached
   keys and values, and the grown state replaces the old entry. Same answers as computing the whole state (fp32: every
