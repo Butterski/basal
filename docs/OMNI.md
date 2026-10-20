@@ -63,6 +63,14 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   |---|---|---|---|---|---|---|
   | mini, `fast` (math) | 0.9984 / 0.9997 | -0.02 pt | +0.000 | 41.83% (eager 41.99%) | 15.8 (eager 10.0) | 7.9 (eager 1.6) |
   | 1.1-max, `fast` (math) | 0.9992 / 0.9997 | +0.01 pt | -0.000 | 47.04% (eager 47.10%) | 3.8 (eager 4.8) | 2.0 (eager 0.7) |
+  | mini, `fast --gemma-attn fa3 --merge on` | 0.9933 / 0.9998 | -0.05 pt | +0.000 | 41.88% (shipped file: 41.95%) | 58.8; compact rows 61.2 | 21.5 |
+  | 1.1-max, `fast --gemma-attn fa3 --merge on` | 0.9894 / 0.9990 | -0.01 pt | +0.000 | 46.61% (shipped file: 47.10%) | 13.6; compact rows 16.2 | 10.4 |
+  | 1.1-max, `fast --gemma-attn fa3+math --merge on` | (running) | | | 47.06% | 10.0 | 6.0 |
+  | mini-FP8 checkpoint, `fast --gemma-attn fa3` | 0.9635 / 0.9908 | -0.26 pt | +0.002 | | 80.6 | 19.6 |
+
+  "automated at 1%": the share with each engine's own calibration fit on its readouts (in brackets: with the shipped
+  `CALIBRATION.json`, which `--mode fast` loads). For comparison, vLLM bf16 on 1.1-max (E0): 0.9866 / 0.9994, 16.7
+  decisions/s, 10.8 questions/s.
 
   On 1.1-max the math kernel (fp32 scores, without tensor cores) dominates single questions.
 - **Not yet for Gemma 4:** the engine's `nvfp4` mode and SGLang.

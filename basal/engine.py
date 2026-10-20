@@ -568,6 +568,8 @@ class GraphBackend(EagerBackend):
             quantize(self.model, quant, gemma4_graph.text_model(self.model).layers)
         if kernels == "auto":
             kernels = "math"
+        if "fa3" in str(kernels) and attention_available("fa3"):
+            raise ValueError(f"--gemma-attn {kernels}: {attention_available('fa3')}")
         # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
         # agreement with eager 0.998-0.999 on dev v2, mini and 1.1-max); the compiled forward comes with the flex /
         # fa3 kernels
