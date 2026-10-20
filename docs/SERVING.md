@@ -27,7 +27,8 @@ benchmarking a GPU.
 | `tpu` *(experimental, community-maintained)* | JAX / XLA on one TPU chip: SOAM packing, one compiled program per shape, `--max-len` (extra `basal[tpu]`, [install](INSTALL.md#google-tpu-experimental-community-maintained)) | Google TPU (v5e measured) |
 
 - Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `tpu` on a TPU VM with
-  `basal[tpu]`, `eager` otherwise.
+  `basal[tpu]`, `eager` otherwise. On a CPU, `--mode mps` computes a request's state once for all its prompts and is
+  faster for requests with several questions or option orders; `eager` stays the default there (the reference path).
 - **basal-omni (Gemma 4) in `eager`** (2.3): the engine's own Gemma 4 forward: a request's state (and media) once,
   then every question over it, and mini's last layers at the answer rows only; `--eager-forward hf` keeps the
   transformers forward of 2.2. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)

@@ -113,9 +113,11 @@ def test_mps_backend_on_cpu_equals_separate():
     groups = [g1, g2, g3]
     for lens in ([64], [12]):  # 12: g1's packed row (34 tokens) is over the largest length and takes the long path
         be.LENS = lens
-        for (toks, lids), res in zip(groups, be.run_shared(groups)):
-            for r, e in zip(res, separate(m, toks, lids)):
-                assert torch.allclose(torch.tensor(r), e, atol=1e-5), lens
+        out = be.run_shared(groups)
+        assert [len(r) for r in out] == [len(t) for t, _ in groups], lens  # every request, every readout
+        for (toks, lids), res in zip(groups, out):
+            for r, e, ids in zip(res, separate(m, toks, lids), lids):
+                assert len(r) == len(ids) and torch.allclose(torch.tensor(r), e, atol=1e-5), lens
 
 
 def test_row_only_readout_equals_full_softmax():

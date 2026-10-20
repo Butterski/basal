@@ -639,6 +639,8 @@ class Server:
         if attn not in ("auto", "fa2") and kind not in ("graph", "exit"):
             raise SystemExit(f"--attn {attn} needs the CUDA graph engine (--mode fast, fast-nocompile, fast-exit, fp8, "
                              "nvfp4)")
+        if kind == "mps" and a.device == "cuda":
+            raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
         # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
         md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp"))
         self.fmt = model_format(md)  # prompt format of the model (basal.json "prompt"; 1 when absent)
@@ -654,8 +656,6 @@ class Server:
             raise SystemExit("--ple-offload on needs --mode eager")
         if getattr(a, "eager_attn", "math") != "math" and kind != "eager":
             raise SystemExit("--eager-attn needs --mode eager (the CUDA graph engine takes --attn)")
-        if kind == "mps" and a.device == "cuda":
-            raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
         if kind == "eager":
             self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on",
                                         forward=getattr(a, "eager_forward", None),

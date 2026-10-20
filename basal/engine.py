@@ -12,7 +12,7 @@ Backends:
   GraphBackend      static shapes + CUDA graphs, optional torch.compile, shared prefix for the two option orders,
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
-  MPSBackend        GraphBackend's shared prefix + token-budget batching on Apple MPS (PyTorch, no graphs)
+  MPSBackend        GraphBackend's shared prefix + token-budget batching without graphs, on Apple MPS or the CPU
   VLLMBackend       vLLM: bf16 checkpoints, ModelOpt FP8 / NVFP4 ports, a repeatable preset, basal-omni media
   SGLangBackend     SGLang offline engine (1.5): the same letter readout from the log-probabilities of the option tokens
   MLXBackend        Apple Silicon, MLX / mlx-lm (1.5): MLX fp8 / fp4 exports or bf16 weights (optional 8-bit at load
