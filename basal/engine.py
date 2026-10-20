@@ -2228,6 +2228,8 @@ class MLXBackend:
     TOKEN_BUDGET = 8192  # rows x padded length per forward without a shared prefix
     PACK_TOKENS = 512  # longest packed row (prefix + all suffixes of a group); longer groups use the KV cache (above
     # about 600 tokens a forward is compute-bound and the packed row's dense mask makes it no faster, M5 Max)
+    PACK_BUDGET = 2048  # packed rows x padded length per forward: on an M4 Pro 16 rows of ~250 tokens in one forward
+    # (TOKEN_BUDGET) gave 9-11% fewer decisions/s than chunks of 2,048 tokens (44 bench examples, two orders)
     CACHE_BYTES = 2 << 30  # MLX buffer cache limit (and wired headroom above the weights)
 
     def __init__(self, model_dir, max_rows=None, quant=None, packed=False):
@@ -2419,12 +2421,12 @@ class MLXBackend:
             out += self._letters(h, lids[i: i + self.max_rows])
         return out
 
-    def _chunks(self, lens):
+    def _chunks(self, lens, budget=None):
         """Indices of rows of these lengths, sorted by length, in right-padded batches of at most max_rows rows and
-        TOKEN_BUDGET tokens."""
-        chunks, cur = [], []
+        `budget` (default TOKEN_BUDGET) tokens."""
+        chunks, cur, budget = [], [], budget or self.TOKEN_BUDGET
         for k in sorted(range(len(lens)), key=lambda k: lens[k]):
-            if cur and (len(cur) >= self.max_rows or (len(cur) + 1) * lens[k] > self.TOKEN_BUDGET):
+            if cur and (len(cur) >= self.max_rows or (len(cur) + 1) * lens[k] > budget):
                 chunks.append(cur); cur = []
             cur.append(k)
         return chunks + [cur]
@@ -2448,7 +2450,7 @@ class MLXBackend:
             n = {k: sum(map(len, t)) - (len(t) - 1) * self._shared_len(t)
                  for k, (t, _) in enumerate(enc) if out[k] is None}
             fit = [k for k in n if n[k] <= self.PACK_TOKENS]
-            for c in self._chunks([n[k] for k in fit]) if fit else []:
+            for c in self._chunks([n[k] for k in fit], self.PACK_BUDGET) if fit else []:
                 ks = [fit[j] for j in c]
                 probs = self._letters(self._packed([enc[k][0] for k in ks]), [x for k in ks for x in enc[k][1]])
                 for k in ks:
