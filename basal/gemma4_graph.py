@@ -325,9 +325,23 @@ class Gemma4Graph:
         return o.reshape(q.shape[0], q.shape[2], -1)
 
     @staticmethod
+    def _fa3_varlen(q, k, v, W, cu):
+        """FlashAttention 3's varlen kernel over compact rows (prompts back to back in one row [1, T], cu: cumulative
+        token counts, int32), causal with a window of W tokens within each prompt -> [1, T, H * d]."""
+        import flash_attn_interface as fa3
+        T = q.shape[2]
+        o = fa3.flash_attn_varlen_func(q[0].transpose(0, 1), k[0].transpose(0, 1), v[0].transpose(0, 1), cu, cu, T, T,
+                                       softmax_scale=1.0, causal=True, window_size=(W - 1 if W else -1, 0))
+        o = o[0] if isinstance(o, (tuple, list)) else o
+        return o.reshape(1, T, -1)
+
+    @staticmethod
     def _attend(q, k, v, m):
-        """Attention with the kernel the mask is for: a boolean mask (math), a block mask (flex) or ("fa3", window)."""
+        """Attention with the kernel the mask is for: a boolean mask (math), a block mask (flex), ("fa3", window) or
+        ("fa3v", window, cu) (compact rows)."""
         if isinstance(m, tuple):
+            if m[0] == "fa3v":
+                return Gemma4Graph._fa3_varlen(q, k, v, m[1], m[2])
             return Gemma4Graph._fa3(q, k, v, m[1])
         if isinstance(m, torch.Tensor):
             return Gemma4Graph._math(q, k, v, m)
@@ -436,6 +450,43 @@ class Gemma4Graph:
         return self._dense_block(sp.shape[0], S if R is None else R, P + S, mod, sp.device)
 
     # -- the forward --------------------------------------------------------------------------------------------------
+    def _compact_masks(self, kernels, T, cu, ro, pads):
+        """Masks of compact rows: each prompt attends to itself only. Sliding layers: FlashAttention 3's varlen kernel
+        with the window; global layers: a flex block mask that visits, for each query block, the key blocks from the
+        start of its first query's prompt on (the prompts are contiguous); the readout rows: a dense block mask over
+        the row (one query per prompt)."""
+        from torch.nn.attention.flex_attention import BlockMask
+        Bk, dev = self.BLOCK, cu.device
+        tok = torch.arange(T, device=dev)
+        doc = torch.bucketize(tok, cu[1:], right=True)                 # the prompt of every token
+        start = cu[doc]                                                  # its prompt's first token
+        n = -(-T // Bk)
+        qb = torch.arange(n, device=dev)
+        lo = start[qb * Bk] // Bk                                        # first key block of each query block
+        idx = torch.minimum(lo[:, None] + qb[None], qb[:, None]).to(torch.int32)
+        num = (qb - lo + 1).to(torch.int32)
+        docp, rop = pads["doc"], pads["ro"]
+
+        m_all, m_ro = {}, {}
+        for t in set(self.types):
+            W = self._window(t)
+
+            def same(b, h, q, kv, W=W):  # the same prompt, causal (and the window: positions advance with indices)
+                ok = (docp[q] == docp[kv]) & (q >= kv)
+                return ok & (q - kv < W) if W else ok
+            if kernels[t] == "fa3":
+                m_all[t] = ("fa3v", W, cu)
+            else:
+                m_all[t] = BlockMask.from_kv_blocks(num[None, None], idx[None, None].contiguous(), BLOCK_SIZE=Bk,
+                                                    mask_mod=same, seq_lengths=(T, T))
+
+            def rows(b, h, q, kv, W=W):
+                p = rop[0, q]
+                ok = (docp[p] == docp[kv]) & (p >= kv)
+                return ok & (p - kv < W) if W else ok
+            m_ro[t] = self._dense_block(1, ro.shape[1], T, rows, dev)
+        return m_all, m_ro
+
     def _masks(self, kernels, L, pos, prefix, mask, ro, pads):
         """The attention masks of one forward per layer type, for every query and for the readout rows ro: boolean
         masks for "math", block masks for "flex" (reading pads), ("fa3", window) for FlashAttention 3 over plain
@@ -472,7 +523,7 @@ class Gemma4Graph:
         return m_all, m_ro
 
     def _run(self, kernels, ids, pos, kv=None, prefix=None, mask=None, ro=None, between=None, pads=None,
-             compiled=False):
+             compiled=False, cu=None):
         """kernels: per layer type; ids / pos [b, L]; kv: per own layer (K, V) buffers [b, kv heads, L, d] that receive
         this pass's keys and values (pass 1); prefix: per own layer (K, V) [b, kv heads, P, d] the rows continue (pass
         2) with mask (the trie: additive, or a TreeMask for flex); ro [b, R]: readout positions -> final hidden states
@@ -481,7 +532,10 @@ class Gemma4Graph:
         query and of the readout rows are built here (_masks; the kernel follows the mask). A layer is two functions
         (_pre, _post), so the rows-only layers can split after the keys and values; a shared layer's keys and values
         are those its source layer kept."""
-        m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro, pads or {})
+        if cu is not None:  # compact rows (forward_compact)
+            m_all, m_ro = self._compact_masks(kernels, ids.shape[1], cu, ro, pads)
+        else:
+            m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro, pads or {})
         pre, post, embed = (self.pre, self.post, self.embed) if compiled else (_pre, _post, self._embed)
         h, pli = embed(ids)
         types = set(self.types)
@@ -527,6 +581,18 @@ class Gemma4Graph:
         compiled = compiled and between is None
         return self._run(self.kernels, ids, pos, kv=kv, ro=ro, between=between, pads=self._pads(pos, None, ro),
                          compiled=compiled and self.compiled)
+
+    @torch.no_grad()
+    def forward_compact(self, ids, pos, cu, ro, compiled=True):
+        """Compact rows (--batches compact, with the fa3 kernels): single prompts packed back to back in one row
+        [1, T] (positions from 0 per prompt, cu: cumulative token counts [prompts + 2], int32; the padding after the
+        last prompt is one more prompt nobody reads) -> final hidden states at ro [R] (one readout per prompt): [R, D].
+        No padding of rows to graph lengths or of row counts."""
+        T = ids.shape[1]
+        doc = torch.bucketize(torch.arange(T, device=ids.device), cu[1:], right=True)
+        pads = dict(ro=F.pad(ro[None], (0, self.BLOCK)), doc=F.pad(doc, (0, self.BLOCK), value=-1))
+        out = self._run(self.kernels, ids, pos, ro=ro[None], pads=pads, compiled=compiled and self.compiled, cu=cu)
+        return out[0]
 
     @torch.no_grad()
     def forward_suffix(self, ids, mask, pos, prefix, ro=None, compiled=True):

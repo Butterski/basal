@@ -527,13 +527,16 @@ class GraphBackend(EagerBackend):
         self._wrows = {}
         if batches == "fine":
             self.BATCHES = self.FINE_BATCHES
-        # compact rows need FlashAttention 3's varlen kernel (Hopper); auto: compact where it runs (not Gemma 4: its
-        # 512-wide global heads have no varlen kernel)
+        # compact rows need FlashAttention 3's varlen kernel (Hopper); auto: compact where it runs. Gemma 4: with its
+        # fa3 kernels (FA3 varlen in the sliding layers, a flex block mask per prompt in the 512-wide global ones)
         self.compact = batches in ("compact", "auto") and self.attn == "fa3" and self.dev.type == "cuda" \
-            and self.gemma is None
+            and (self.gemma is None or self.gemma.kernels.get("sliding_attention") == "fa3")
         if batches == "compact" and not self.compact:
-            raise ValueError("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper) and a Llama model")
-        if self.compact:
+            raise ValueError("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper; Gemma 4: "
+                             "--gemma-attn fa3)")
+        if self.compact and self.gemma is not None:  # its forward reads out at one row per prompt
+            self.fwd_c, self.readout_layer = self.gemma.forward_compact, True
+        elif self.compact:
             self.fwd_c = torch.compile(self._forward_compact, dynamic=True) if compile else self._forward_compact
             last = self.model.model.layers[-1]
             self.readout_layer = readout_layer in ("on", "auto") and type(last).__name__ == "LlamaDecoderLayer" \
@@ -543,7 +546,7 @@ class GraphBackend(EagerBackend):
         self.state_cache = StateCache(gb * 2 ** 30) if gb and shared else None
         self._alloc_kv()
         self.template = []  # --template-prefix (with compact rows): [(start in template_kv, prefix token ids)]
-        if self.compact and template in ("on", "auto"):
+        if self.compact and template in ("on", "auto") and self.gemma is None:  # (Gemma 4's template: 7 tokens)
             self._template_prefixes(model_dir)
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs = {}
