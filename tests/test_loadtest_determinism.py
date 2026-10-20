@@ -3,6 +3,7 @@ flips (answers whose top option changed)."""
 import argparse
 import asyncio
 import json
+import sys
 
 import httpx
 
@@ -25,3 +26,16 @@ def test_flips_and_differences(monkeypatch, tmp_path):
     d = json.loads((tmp_path / "d.json").read_text())["determinism"]
     assert d["requests"] == 2 and d["identical"] == 1 and d["decision_flips"] == 1
     assert abs(d["max_abs_diff"] - 0.2) < 1e-9
+
+
+def test_seed_gives_other_synthetic_states(monkeypatch):
+    """--seed: a second load test with another seed asks states a prefix-caching server has not seen yet."""
+    seen = []
+    monkeypatch.setattr(loadtest, "run", lambda a: seen.append(a.seed))
+    monkeypatch.setattr(loadtest.asyncio, "run", lambda x: None)
+    for argv in (["--synthetic", "200"], ["--synthetic", "200", "--seed", "2"]):
+        monkeypatch.setattr(sys, "argv", ["basal-loadtest"] + argv)
+        loadtest.main()
+    assert seen == [0, 2]
+    from basal import synth
+    assert synth.items(3, 200, 1)[0]["state"] != synth.items(3, 200, 2)[0]["state"]
