@@ -11,8 +11,9 @@ uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags
 basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000    # or Remek/basal-omni-1.0-mini
 ```
 
-- **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), since v2.1.0 `vllm` (text only;
-  faster, with prefix caching and FlashAttention) and, since 2.3, `fast` / `fast-nocompile` (text only; the CUDA
+- **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), since v2.1.0 `vllm` (faster, with
+  prefix caching and FlashAttention; since 2.3 also images and audio for mini, [below](#vllm---mode-vllm)) and, since
+  2.3, `fast` / `fast-nocompile` (text only; the CUDA
   graph engine, below). Without `--mode`, basal-omni runs `fast` on Hopper GPUs with the `flash_attn_3` package (the
   configuration its gate passed) and `eager` on other GPUs until they pass theirs (2.2.0 had no working default for
   basal-omni on CUDA: `fast` stopped while loading the model). The `-FP8` checkpoints (mini, max, ultra) run on `--mode vllm`;
@@ -20,10 +21,9 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max and the `-FP8` checkpoints) uses
   it; the others use their `CALIBRATION.json`.
 - **Repeatable answers with vLLM:** vLLM's numbers depend on what the server computed before (prefix cache,
-  batching), so a decision near a tie can change between runs. Start the server with `VLLM_BATCH_INVARIANT=1` for
-  repeatable answers: on basal-omni-1.0-max-FP8 (RTX PRO 6000, 2,000 decisions at 32 in flight) two runs then gave the
-  same top answer on all of them (without it, 94.7%), at about 23% fewer decisions per second. `--mode eager
-  --deterministic` is the other way.
+  batching, where a long prompt was cut), so a decision near a tie can change between runs. `--vllm-preset
+  deterministic` (2.3) serves with batch-invariant kernels and without the prefix cache and chunked prefill
+  ([below](#vllm---mode-vllm)); `--mode eager --deterministic` is the other way.
 - **GGUF and MLX (text only):** `--mode gguf --gguf <file>` runs a GGUF conversion in process through llama.cpp
   (Metal, CUDA or CPU) and `--mode mlx` / `mlx-q8` runs the bf16 weights through mlx-lm on Apple Silicon (below).
 - **Option orders:** like every prompt-format-2 model, it asks one option order by default and loads
@@ -126,6 +126,47 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   prompts (identity gate: max |dp| 1.6e-5). Start-up: about 5 minutes (compile and graph capture).
 - **Not yet for Gemma 4:** the engine's `nvfp4` mode and SGLang.
 
+## vLLM (`--mode vllm`)
+
+The vLLM path of 2.2 is unchanged by default (vLLM 0.31.0). Added in 2.3, each measured on one H100 against
+`--mode eager` bf16 on dev v2 (10,606 decisions, 32 in flight) and with the calibration file the mode loads on the
+calibration test split:
+
+- **KV-sharing fast prefill** (`--vllm-fast-prefill auto`, the default; `off` restores 2.2): Gemma 4 E2B / E4B (mini)
+  run their last 18 of 42 layers, which reuse earlier layers' keys and values, at the answer position only during
+  prefill (vLLM's `kv_sharing_fast_prefill`). The generated token, the only one basal reads, is computed the same way.
+  mini: the same top answer as eager on 0.9994 of the decisions where eager's margin is at least 0.2 (2.2's vLLM path:
+  0.9993), accuracy +0.04 points; with the shipped `CALIBRATION.json` it automates 41.8% of the calibration test at
+  1% error against eager's 42.0% (-0.18 points [-0.35, 0.00]; observed error 0.70%, at 5% 3.63%); 1.43x the decisions
+  per second of 2.2's vLLM path for one question over a ~1.5k-token state (60.8 vs 41.5 at 16 in flight) and 1.60x the
+  questions per second for five questions over a 3k-10k-token state (39.0 vs 24.2). Models without KV-shared layers
+  are not affected.
+- **`--vllm-preset deterministic`**: batch-invariant kernels (`VLLM_BATCH_INVARIANT=1`, Triton attention) without the
+  prefix cache and without chunked prefill, so an answer does not depend on the other requests or on what the server
+  computed before. basal-omni-1.1-max, two dev v2 runs at 32 in flight: bit-identical probabilities on every decision
+  with 2-10 options (8,545) and on all 2,061 with 11-255 options; the same top answer as eager on 0.9990 of the
+  decisions with margin >= 0.2;
+  automation at 1% with the shipped `CALIBRATION.vllm.json` -0.12 points [-0.30, +0.07] against eager (mini -0.19,
+  ultra +0.01, each with its shipped file). It costs throughput, most where a request asks several questions over one
+  state (no prefix cache): 1.1-max 0.64x the decisions per second of the default for single questions and 0.22x the
+  questions per second for five questions over a long state; mini 0.66x and 0.26x. A model ships
+  `CALIBRATION.vllm.deterministic.json` only if its own file fails there; none does.
+- **Images and audio** (`--media on`, as with `--mode eager`, below): the prompts of a media request go to vLLM in one
+  call with the chat-template text of the eager media path, and vLLM's Gemma 4 processor expands the media
+  placeholders to the same tokens. Checked on basal-omni-1.0-mini only: on the omni media check set (310 images and
+  285 audio clips with their text twins) the same top answer as `--mode eager --media on` on 96.5% of images and 98.3%
+  of clips (all where eager's margin is at least 0.2), accuracy +0.3 / +0.7 points, every prompt of the same length;
+  6.0x / 7.9x the requests per second at 8 in flight (75.7 vs 12.7 images, 84.9 vs 10.8 clips) and 17.7 / 42.6 ms
+  per request one at a time (eager 102 / 104 ms). basal-omni-1.1-max (Gemma 4 Unified, no image or audio encoder) is
+  refused: through vLLM its images got the eager answer on 94.2% only (accuracy -1.3 points) and 19 of 285 clips other
+  token counts. Ultra (images) is not checked yet.
+- **Not in 2.3:** FP8 weights quantised at load time (automation at 1% -0.5 to -9.5 points on the three tiers) and an
+  FP8 KV cache (on mini -0.36 points [-0.57, -0.15] at 1% with the shipped file; on 12B / 31B it needs Triton attention
+  and is slower than 2.2's path). The `-FP8` checkpoints are served as they are.
+- `basal-loadtest --seed N` draws other synthetic states, so a repeated load test does not hit the prefix cache of an
+  earlier one (all numbers above: two runs with fresh states each, the slower one reported against the faster
+  baseline run).
+
 ## GGUF (llama.cpp, Ollama) and MLX (text)
 
 llama.cpp (b11312, the build in llama-cpp-python 0.3.36) and mlx-lm 0.32.2 implement Gemma 4's text decoder: sliding
@@ -202,7 +243,8 @@ move too many close decisions.
 
 ## Images and audio (`--media on`)
 
-`basal-serve --model <basal-omni model> --mode eager --media on` loads the model with Gemma 4's image and audio encoders
+`basal-serve --model <basal-omni model> --mode eager --media on` (or `--mode vllm --media on` for basal-omni-1.0-mini,
+[above](#vllm---mode-vllm)) loads the model with Gemma 4's image and audio encoders
 and its processor (install `basal[media]`: pillow, soundfile, scipy, torchvision matching torch). A request may then
 carry `"media": [{"type": "image" | "audio", "data": "<base64>"}]`, `"detail": "default" | "high"` (280 or 1,120
 image tokens) and `"lang": "pl" | "en"`; see `basal/media.py` for the formats and limits. The media go where the state

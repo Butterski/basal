@@ -1,5 +1,22 @@
 # What is new in basal 2.3 (not released yet)
 
+- **vLLM: KV-sharing fast prefill for basal-omni-1.0-mini, 1.43x / 1.60x** (`--mode vllm`, on by default for Gemma 4
+  E2B / E4B; `--vllm-fast-prefill off` restores 2.2). Its last 18 of 42 layers reuse earlier layers' keys and values,
+  so during prefill they run at the answer position only. One H100, against 2.2's vLLM path: 60.8 vs 41.5 decisions/s
+  for one question over a ~1.5k-token state, 39.0 vs 24.2 questions/s for five questions over 3k-10k tokens; the same
+  top answer as eager on 0.9994 of dev v2 decisions with margin >= 0.2, automation at 1% with the shipped calibration
+  within 0.2 points of eager. [OMNI.md](OMNI.md#vllm---mode-vllm)
+- **vLLM: images and audio for basal-omni-1.0-mini** (`--mode vllm --media on`): the same prompts and media tokens as
+  `--mode eager --media on`, all prompts of a request in one vLLM call. On the omni media check set: 96.5% / 98.3% the
+  same top answer as the eager media path (all where eager's margin >= 0.2), 6.0x / 7.9x the requests per second
+  (images / audio, 8 in flight). basal-omni-1.1-max is refused (its images and audio did not match the eager path).
+- **vLLM: `--vllm-preset deterministic`** for repeatable answers: batch-invariant kernels without the prefix cache and
+  chunked prefill; two runs of basal-omni-1.1-max at 32 in flight gave bit-identical probabilities. Costs throughput (1.1-max 0.64x single questions, 0.22x five questions over a long state); automation
+  at 1% with each model's shipped calibration within 0.2 points of eager. Presets load `CALIBRATION.vllm.<preset>.json`
+  when a model ships one.
+- **`basal-loadtest --seed`:** synthetic states from another seed, so a repeated load test does not answer from the
+  prefix cache of an earlier one.
+
 - **basal-omni in `--mode eager` computes a request's state once for all its questions.** The eager backend runs
   Gemma 4 through the engine's own forward (`basal/gemma4.py`, transformers' modules and weights): a request's state
   and media run once and every question and option order runs over them, the image and audio encoders once per
