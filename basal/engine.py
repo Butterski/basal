@@ -2202,13 +2202,10 @@ class MLXBackend:
     option orders of a question; with SOAM every question and order of a request, i.e. the state) is computed once into
     a KV cache, and the remaining suffixes run as one right-padded batch continuing that cache: a suffix sees the
     prefix and its own earlier tokens only, so every readout equals a separate forward of its prompt. All MLX work
-    runs on one dedicated thread (the server calls the backend from an executor). Llama decoders (basal-1.x, basal-2.0)
-    run a group of at most PACK_TOKENS tokens as one packed row instead (_packed): one forward, not two."""
+    runs on one dedicated thread (the server calls the backend from an executor)."""
 
     MAX_ROWS = 16      # suffix rows per forward
     TOKEN_BUDGET = 8192  # rows x padded length per forward without a shared prefix
-    PACK_TOKENS = 512    # Llama decoders: a group up to this many tokens (prefix + suffixes) is one packed row
-    PACK_BUDGET = 2048   # packed rows x padded length per forward (16 rows of ~250 tokens: 9-21% fewer decisions/s)
     CACHE_BYTES = 2 << 30  # MLX buffer cache limit (and wired headroom above the weights)
 
     def __init__(self, model_dir, max_rows=None, quant=None):
@@ -2227,7 +2224,6 @@ class MLXBackend:
         from mlx_lm.utils import load_model
         self.mx = mx
         cfg = json.loads((md / "config.json").read_text())
-        self.packs = cfg.get("model_type") == "llama"  # Gemma 4 (sliding windows, its own RoPE): the KV-cache path
         if quant not in (None, "q8"):
             raise ValueError(f"unknown MLX quantisation {quant!r} (q8)")
         # lazy for q8: the weights are materialised once, after quantisation (never the full bf16 copy)
@@ -2337,74 +2333,6 @@ class MLXBackend:
             out += self._letters(h, lids[i: i + self.max_rows])
         return out
 
-    def _packs(self, toks):
-        """A group for _packed: a Llama decoder, two or more prompts over a shared prefix, at most PACK_TOKENS."""
-        import os
-        if not self.packs or len(toks) < 2:
-            return False
-        P = min(len(os.path.commonprefix(toks)), min(map(len, toks)) - 1)
-        return P > 0 and P + sum(len(t) - P for t in toks) <= self.PACK_TOKENS
-
-    def _packed(self, groups):
-        """Groups [(token lists, code ids)] of a Llama decoder, each as one row: the shared prefix once, then every
-        suffix (an option order, with SOAM also every question) continuing at the prefix's end (RoPE positions) and
-        seeing the prefix and its own earlier tokens only (a block mask). One forward per chunk of rows, where _group
-        needs one for the prefix and one for the suffixes: every forward on an Apple GPU reads all the weights, so two
-        option orders took about 1.2-1.7x one order (#27). Rows of similar length share a forward (MAX_ROWS rows,
-        PACK_BUDGET padded tokens), so groups of several requests are batched as well."""
-        import os
-        rows = []  # (tokens, positions, segments, readout positions)
-        for toks, _ in groups:
-            P = min(len(os.path.commonprefix(toks)), min(map(len, toks)) - 1)
-            ids, pos, seg, last = list(toks[0][:P]), list(range(P)), [0] * P, []
-            for i, t in enumerate(toks, 1):
-                ids += t[P:]; pos += range(P, len(t)); seg += [i] * (len(t) - P); last.append(len(ids) - 1)
-            rows.append((ids, pos, seg, last))
-        chunks, cur = [], []
-        for k in sorted(range(len(rows)), key=lambda k: len(rows[k][0])):
-            if cur and (len(cur) >= self.max_rows or (len(cur) + 1) * len(rows[k][0]) > self.PACK_BUDGET):
-                chunks.append(cur); cur = []
-            cur.append(k)
-        res = [None] * len(rows)
-        for c in chunks + [cur]:
-            h = self._forward_packed([rows[k][:3] for k in c])
-            at = [(j, x) for j, k in enumerate(c) for x in rows[k][3]]
-            probs = self._letters(h[self.mx.array([j for j, _ in at]), self.mx.array([x for _, x in at])],
-                                  [ids for k in c for ids in groups[k][1]])
-            for k in c:
-                n = len(groups[k][1]); res[k] = probs[:n]; probs = probs[n:]
-        return res
-
-    def _forward_packed(self, rows):
-        """Packed rows [(tokens, positions, segments)] (segment 0: the shared prefix, i > 0: suffix i) -> final hidden
-        states [B, L, d]. The decoder layers of mlx-lm's Llama with the positions given per token (its RoPE, one row
-        per token at its position: the same rotation as the cache path's offsets) and a block mask."""
-        mx, m = self.mx, self.lm.model
-        B, L = len(rows), max(len(r[0]) for r in rows)
-        ids = mx.array([r[0] + [self.tok.pad_token_id] * (L - len(r[0])) for r in rows])
-        flat = mx.array([x for r in rows for x in r[1] + [0] * (L - len(r[1]))])
-        seg = mx.array([r[2] + [-1] * (L - len(r[2])) for r in rows])
-        si, sj = seg[:, :, None], seg[:, None, :]
-        allow = mx.tril(mx.ones((L, L), dtype=mx.bool_))[None] & (sj >= 0) & ((sj == 0) | (sj == si))
-        mask = (allow | mx.eye(L, dtype=mx.bool_)[None])[:, None]  # padding rows attend to themselves (no NaN)
-
-        def rope(at, x):  # [B, heads, L, d] -> each token rotated at its own position
-            H, D = x.shape[1], x.shape[3]
-            y = at.rope(x.transpose(0, 2, 1, 3).reshape(B * L, H, 1, D), offset=flat)
-            return y.reshape(B, L, H, D).transpose(0, 2, 1, 3)
-
-        h = m.embed_tokens(ids)
-        for layer in m.layers:
-            at = layer.self_attn
-            x = layer.input_layernorm(h)
-            q = at.q_proj(x).reshape(B, L, at.n_heads, -1).transpose(0, 2, 1, 3)
-            k = at.k_proj(x).reshape(B, L, at.n_kv_heads, -1).transpose(0, 2, 1, 3)
-            v = at.v_proj(x).reshape(B, L, at.n_kv_heads, -1).transpose(0, 2, 1, 3)
-            o = mx.fast.scaled_dot_product_attention(rope(at, q), rope(at, k), v, scale=at.scale, mask=mask)
-            h = h + at.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
-            h = h + layer.mlp(layer.post_attention_layernorm(h))
-        return m.norm(h)
-
     def _singles(self, toks, lids):
         """Unrelated prompts: right-padded batches of similar length, no cache."""
         chunks, cur = [], []
@@ -2425,10 +2353,6 @@ class MLXBackend:
         if single:
             for k, p in zip(single, self._singles([enc[k][0][0] for k in single], [enc[k][1][0] for k in single])):
                 out[k] = [p]
-        packed = [k for k, (t, _) in enumerate(enc) if out[k] is None and self._packs(t)]
-        if packed:
-            for k, p in zip(packed, self._packed([enc[k] for k in packed])):
-                out[k] = p
         for k, (t, x) in enumerate(enc):
             if out[k] is None:
                 out[k] = self._group(t, x)

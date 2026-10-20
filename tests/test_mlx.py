@@ -80,27 +80,6 @@ def test_mlx_equals_torch(tmp_path):
     assert max(abs(x - y) for x, y in zip(mixed[1][1], ref[1])) < 2e-4
 
 
-def test_mlx_packed_rows_equal_the_cache_path(tmp_path):
-    """Llama decoders run a group of at most PACK_TOKENS tokens as one packed row (#27): the readouts of the KV-cache
-    path (a prefix forward, then the suffixes), also with groups of different lengths in one forward and over two
-    forwards (max_rows 3); a longer group takes the cache path."""
-    pytest.importorskip("mlx.core")
-    tiny_llama(tmp_path)
-    be = mlx_stub(tmp_path)
-    short = ([STATE[:50] + [9, 10], STATE[:50] + [10, 9]], [[10, 11]] * 2)
-    groups = [(TOKS, LIDS), (TOKS[:2], LIDS[:2]), short, (TOKS[2:4], LIDS[2:4])]
-    assert be.packs and all(be._packs(t) for t, _ in groups)
-    forwards = []
-    be._forward_packed = lambda rows, f=be._forward_packed: forwards.append(len(rows)) or f(rows)
-    packed = be.run_shared(groups)
-    assert sorted(forwards) == [1, 3]
-    for (t, x), got in zip(groups, packed):
-        for r, g in zip(be.pool.submit(be._group, t, x).result(), got):
-            assert max(abs(a - b) for a, b in zip(r, g)) < 1e-4
-    be.PACK_TOKENS = 100
-    assert not be._packs(TOKS) and be._packs(short[0])
-
-
 def test_mlx_without_override_differs(tmp_path):
     """Guard for the override: with mlx-lm's default rope_theta (10000) the readout changes."""
     pytest.importorskip("mlx.core")
@@ -216,7 +195,7 @@ def test_mlx_gemma4_equals_torch(tmp_path):
     pytest.importorskip("mlx.core")
     m = tiny_gemma4(tmp_path)
     be = mlx_stub(tmp_path)
-    assert be.softcap == 30.0 and not be.packs  # sliding windows and its own RoPE: always the KV-cache path
+    assert be.softcap == 30.0
     ref = reference(m, TOKS, LIDS)
     got = be.run_shared([(TOKS, LIDS)])[0]
     for r, g in zip(ref, got):
