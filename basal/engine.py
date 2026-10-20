@@ -1772,7 +1772,7 @@ VLLM_PRESETS = {
 }
 
 
-def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
+def vllm_args(cfg, preset="default", media=False, fast_prefill=True):
     """vLLM engine arguments and environment of a --vllm-preset for a model's config.json -> (kwargs, env).
     fast_prefill:
     models whose last layers reuse earlier layers' keys and values (Gemma 4 E2B / E4B: num_kv_shared_layers) run those
@@ -1820,7 +1820,7 @@ class VLLMBackend:
     media_kinds, max_audio_s = (), None
 
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
-                 fast_prefill=False, media=False):
+                 fast_prefill=True, media=False):
         cfg_file = Path(model_dir) / "config.json"
         cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
         kw, env = vllm_args(cfg, preset, media=media, fast_prefill=fast_prefill)

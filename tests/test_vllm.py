@@ -31,8 +31,9 @@ def test_presets():
 
 def test_text_only_and_kv_shared_layers():
     assert vllm_args(BF16)[0] == {}                                         # the encoders load (attention backend)
-    assert vllm_args(E4B)[0] == {}                                                  # --vllm-fast-prefill off
-    assert vllm_args(E4B, fast_prefill=True)[0] == {"kv_sharing_fast_prefill": True}
+    assert vllm_args(E4B)[0] == {"kv_sharing_fast_prefill": True}                  # E2B / E4B: on by default
+    assert vllm_args(E4B, fast_prefill=False)[0] == {}                              # --vllm-fast-prefill off
+    assert vllm_args(BF16)[0] == {}                                                 # no KV-shared layers: unaffected
     assert vllm_args(E4B, "deterministic", fast_prefill=True)[0]["kv_sharing_fast_prefill"]
 
 
@@ -57,7 +58,7 @@ def test_backend_passes_the_preset_to_vllm(tmp_path, fake_vllm):
     assert fake_vllm["kv_sharing_fast_prefill"] and "language_model_only" not in fake_vllm
     assert fake_vllm["enable_prefix_caching"] and fake_vllm["max_model_len"] == 16384 and fake_vllm["env"] is None
     fake_vllm.clear()
-    VLLMBackend(tmp_path, preset="deterministic")
+    VLLMBackend(tmp_path, preset="deterministic", fast_prefill=False)
     assert fake_vllm["env"] == "1" and "kv_sharing_fast_prefill" not in fake_vllm and "quantization" not in fake_vllm
     assert fake_vllm["enable_prefix_caching"] is False  # the preset's value wins over the backend's default
 
@@ -72,9 +73,9 @@ def test_bench_mode_with_a_preset(tmp_path, fake_vllm):
 
 def test_flags():
     a = parser().parse_args([])
-    assert a.vllm_preset == "default" and a.vllm_fast_prefill == "off"   # off until its gate passes
-    a = parser().parse_args(["--mode", "vllm", "--vllm-preset", "deterministic", "--vllm-fast-prefill", "auto"])
-    assert a.vllm_preset == "deterministic" and a.vllm_fast_prefill == "auto"
+    assert a.vllm_preset == "default" and a.vllm_fast_prefill == "auto"   # on for E2B / E4B (gated on mini, 2.3)
+    a = parser().parse_args(["--mode", "vllm", "--vllm-preset", "deterministic", "--vllm-fast-prefill", "off"])
+    assert a.vllm_preset == "deterministic" and a.vllm_fast_prefill == "off"
     for name in ("nvfp4", "fp8", "fp8-kv"):  # no NVFP4; FP8 weights at load failed, the FP8 KV cache is not gated
         with pytest.raises(SystemExit):
             parser().parse_args(["--mode", "vllm", "--vllm-preset", name])
@@ -121,7 +122,8 @@ def test_preset_reported_and_named():
 
 
 def test_media_engine_args():
-    assert vllm_args(E4B, media=True)[0] == {"limit_mm_per_prompt": {"image": 8, "audio": 8, "video": 0}}
+    assert vllm_args(E4B, media=True, fast_prefill=False)[0] == {"limit_mm_per_prompt": {"image": 8, "audio": 8,
+                                                                                         "video": 0}}
     assert vllm_args(BF16, media=True)[0] == {"limit_mm_per_prompt": {"image": 8, "audio": 0, "video": 0}}  # ultra
 
 

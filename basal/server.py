@@ -659,7 +659,7 @@ class Server:
         elif kind == "vllm":
             self.backend = VLLMBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len, max_options=self.max_options,
                                        preset=getattr(a, "vllm_preset", "default"),
-                                       fast_prefill=getattr(a, "vllm_fast_prefill", "off") == "auto",
+                                       fast_prefill=getattr(a, "vllm_fast_prefill", "auto") == "auto",
                                        media=getattr(a, "media", "off") == "on")
         elif kind == "sglang":
             self.backend = SGLangBackend(md, a.dtype, mem=a.gpu_memory, max_len=a.max_len)
@@ -1289,10 +1289,9 @@ def add_engine_args(ap):
                          "cache and chunked prefill (VLLM_BATCH_INVARIANT: answers independent of the other requests, "
                          "lower throughput). Loads CALIBRATION.vllm.<preset>.json when the model ships one, else "
                          "CALIBRATION.vllm.json")
-    ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="off",
+    ap.add_argument("--vllm-fast-prefill", dest="vllm_fast_prefill", choices=["auto", "off"], default="auto",
                     help="--mode vllm: auto = layers that reuse earlier layers' keys and values (Gemma 4 E2B / E4B) "
-                         "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill; off by "
-                         "default until gated)")
+                         "run at the answer position only during prefill (vLLM's kv_sharing_fast_prefill); off = as 2.2")
     ap.add_argument("--max-len", dest="max_len", type=int, default=4096,
                     help="--mode vllm / sglang / tpu: context length in tokens (longer states are refused; raise it for "
                          "long documents)")
