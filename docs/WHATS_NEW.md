@@ -56,15 +56,15 @@
   is 2.0-2.5x faster than on the 40-core M4 Max and 4.2-5.5x faster than fp32, so two sentences written for the M4
   Max (latency scaling with the core count, fp32 close to bf16) now say that they do not hold for the M5 chips.
   Measured by Kamil (@kamilrosa), [#7](https://github.com/rkinas/basal/issues/7).
-- **`--mode mlx` with two option orders: one forward again** (basal-1.x and basal-2.0 on Apple Silicon). Since 1.5.0
-  the MLX backend computed the prefix shared by a question's option orders (with SOAM, by all questions of a request)
-  in one forward and the option blocks in a second, and every forward reads all the weights. A group of at most 512
-  tokens is now one packed row with a block mask, as before 1.5.0, and the rows of several requests share a forward.
-  M4 Pro, 2 orders: basal-1.0-1.5B 150 -> 124-129 ms (decisions/s +24%), basal-1.0-4.5B 483-488 -> 408-425 ms; one
-  order unchanged; the same top answer as before on every frozen dev v2 decision with margin >= 0.2, and the shipped
-  `CALIBRATION.mlx.json` of basal-2.0-4.5B-MLX-8bit automates the same share (1 of 486 two-question decisions
-  changed at 5%). basal-omni keeps its path. Reported with the root cause by @agentGreg,
-  [#27](https://github.com/rkinas/basal/issues/27).
+- **`--mlx-packed`: two option orders in one forward on Apple Silicon** (opt-in, `--mode mlx`, basal-1.x and
+  basal-2.0). Since 1.5.0 the MLX backend computed the prefix shared by a question's option orders in one forward and
+  the option blocks in a second, and every forward reads all the weights. With `--mlx-packed` a group of at most 512
+  tokens is one packed row with explicit positions and a block mask, and the rows of several requests share a forward
+  (at most 2,048 tokens each). Two orders: basal-1.0-4.5B 118 -> 68 ms on an M5 Max, basal-1.0-1.5B 158 -> 130-136 ms
+  on an M4 Pro; the same decisions as the default path at margin >= 0.2. It stays opt-in because the automated share
+  at 5% of basal-2.0-4.5B-MLX-8bit's shipped calibration moved by -0.20 pt [-0.60, +0.20] (QUANTIZATION.md).
+  Root cause in [#27](https://github.com/rkinas/basal/issues/27), contributed by Grzegorz Brzezinka (@agentGreg),
+  [#28](https://github.com/rkinas/basal/pull/28).
 
 # What is new in basal 2.3
 

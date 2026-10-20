@@ -406,8 +406,10 @@ Thank you to the people whose work is in this repository, by pull request:
   there too ([#26](https://github.com/rkinas/basal/pull/26)).
 - Grzegorz Brzezinka ([@agentGreg](https://github.com/agentGreg)): the calibration report's per-type ECE as
   `basal-serve` applies the temperatures ([#24](https://github.com/rkinas/basal/pull/24)), the per-type label count
-  for the 1% target in CALIBRATION.md ([#25](https://github.com/rkinas/basal/pull/25)), and the Apple M5 Max
-  benchmark tables in [HARDWARE.md](docs/HARDWARE.md) ([#18](https://github.com/rkinas/basal/pull/18)).
+  for the 1% target in CALIBRATION.md ([#25](https://github.com/rkinas/basal/pull/25)), the Apple M5 Max
+  benchmark tables in [HARDWARE.md](docs/HARDWARE.md) ([#18](https://github.com/rkinas/basal/pull/18)), and
+  `--mlx-packed`, two option orders in one forward on Apple Silicon, with its root cause
+  ([#27](https://github.com/rkinas/basal/issues/27), [#28](https://github.com/rkinas/basal/pull/28)).
 - [@piotrkowski](https://github.com/piotrkowski): `--mode strix` reproduced on a second Strix Halo (ROG Flow Z13),
   bit-identical edge cases and a similar speed-up ([#21](https://github.com/rkinas/basal/pull/21)).
 

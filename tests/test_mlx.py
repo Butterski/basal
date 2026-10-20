@@ -8,12 +8,12 @@ from transformers import LlamaConfig, LlamaForCausalLM
 from basal.engine import MLXBackend, mlx_config_overrides
 
 
-def tiny_llama(path):
+def tiny_llama(path, rope=None):
     torch.manual_seed(0)
     cfg = LlamaConfig(vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
                       num_key_value_heads=2, head_dim=16, max_position_embeddings=256, attention_bias=True,
-                      mlp_bias=True, tie_word_embeddings=False, rope_parameters={"rope_type": "default",
-                                                                                   "rope_theta": 1000000.0})
+                      mlp_bias=True, tie_word_embeddings=False,
+                      rope_parameters=rope or {"rope_type": "default", "rope_theta": 1000000.0})
     m = LlamaForCausalLM(cfg).eval()
     with torch.no_grad():  # random biases (initialised to zero), so that a dropped bias would be noticed
         for n, p in m.named_parameters():
@@ -38,11 +38,11 @@ class _Tok:
     pad_token_id = 0
 
 
-def mlx_stub(path, quant=None):
+def mlx_stub(path, quant=None, packed=False):
     from concurrent.futures import ThreadPoolExecutor
     be = MLXBackend.__new__(MLXBackend)  # no tokenizer files in the tiny model directory
     be.pool, be.tok, be.max_rows = ThreadPoolExecutor(max_workers=1), _Tok(), 3
-    be.pool.submit(be._load, path, quant).result()
+    be.pool.submit(be._load, path, quant, packed).result()
     return be
 
 
@@ -78,27 +78,6 @@ def test_mlx_equals_torch(tmp_path):
     mixed = be.run_shared([([singles[0]], [sl[0]]), (TOKS[:2], LIDS[:2])])
     assert max(abs(x - y) for x, y in zip(mixed[0][0], ref_s[0])) < 2e-4
     assert max(abs(x - y) for x, y in zip(mixed[1][1], ref[1])) < 2e-4
-
-
-def test_mlx_packed_rows_equal_the_cache_path(tmp_path):
-    """Llama decoders run a group of at most PACK_TOKENS tokens as one packed row (#27): the readouts of the KV-cache
-    path (a prefix forward, then the suffixes), also with groups of different lengths in one forward and over two
-    forwards (max_rows 3); a longer group takes the cache path."""
-    pytest.importorskip("mlx.core")
-    tiny_llama(tmp_path)
-    be = mlx_stub(tmp_path)
-    short = ([STATE[:50] + [9, 10], STATE[:50] + [10, 9]], [[10, 11]] * 2)
-    groups = [(TOKS, LIDS), (TOKS[:2], LIDS[:2]), short, (TOKS[2:4], LIDS[2:4])]
-    assert be.packs and all(be._packs(t) for t, _ in groups)
-    forwards = []
-    be._forward_packed = lambda rows, f=be._forward_packed: forwards.append(len(rows)) or f(rows)
-    packed = be.run_shared(groups)
-    assert sorted(forwards) == [1, 3]
-    for (t, x), got in zip(groups, packed):
-        for r, g in zip(be.pool.submit(be._group, t, x).result(), got):
-            assert max(abs(a - b) for a, b in zip(r, g)) < 1e-4
-    be.PACK_TOKENS = 100
-    assert not be._packs(TOKS) and be._packs(short[0])
 
 
 def test_mlx_without_override_differs(tmp_path):
@@ -216,7 +195,7 @@ def test_mlx_gemma4_equals_torch(tmp_path):
     pytest.importorskip("mlx.core")
     m = tiny_gemma4(tmp_path)
     be = mlx_stub(tmp_path)
-    assert be.softcap == 30.0 and not be.packs  # sliding windows and its own RoPE: always the KV-cache path
+    assert be.softcap == 30.0
     ref = reference(m, TOKS, LIDS)
     got = be.run_shared([(TOKS, LIDS)])[0]
     for r, g in zip(ref, got):
@@ -238,3 +217,60 @@ def test_gemma4_per_layer_config_override():
     o = mlx_config_overrides({"model_type": "gemma4", "text_config": t})
     assert o["text_config"]["global_head_dim"] == 512 and o["text_config"]["head_dim"] == 256
     assert mlx_config_overrides({"text_config": {**t, "global_head_dim": 512}}) == {}
+
+
+def test_mlx_packed_rows_equal_kv_cache(tmp_path):
+    """--mlx-packed, Llama: a group whose prefix and suffixes fit in PACK_TOKENS runs as one packed row (explicit
+    positions, block mask), several groups of different lengths in one padded batch; the readouts equal the KV-cache
+    path (PACK_TOKENS = 0) and the PyTorch readout. Without the flag (the default) and for Gemma 4 the KV cache stays."""
+    pytest.importorskip("mlx.core")
+    m = tiny_llama(tmp_path)
+    assert not mlx_stub(tmp_path).packed  # opt-in
+    be = mlx_stub(tmp_path, packed=True)
+    assert be.packed
+    q2 = [list(range(30, 60)) + [4, 10, 11], list(range(30, 60)) + [4, 11, 10]]  # a shorter question, two orders
+    groups = [(TOKS, LIDS), (q2, LIDS[:2]), (TOKS[2:4], LIDS[2:4])]
+    calls = []
+    packed_fwd = be._packed
+    be._packed = lambda g: calls.append(len(g)) or packed_fwd(g)
+    got = be.run_shared(groups)
+    assert calls == [3]  # one forward for the three groups
+    be.PACK_BUDGET = 100  # rows longer than a third of the budget: one forward each, the same readouts
+    alone = be.run_shared(groups)
+    assert calls == [3, 1, 1, 1]
+    assert max(abs(a - b) for g, h in zip(got, alone) for x, y in zip(g, h) for a, b in zip(x, y)) < 1e-5
+    calls.clear()
+    be.PACK_TOKENS = 0
+    cached = be.run_shared(groups)
+    assert calls == []  # PACK_TOKENS = 0: every group through _group (_shared_len, KV cache)
+    assert len(got) == len(cached) == len(groups)
+    for (toks, lids), g, c in zip(groups, got, cached):
+        ref = reference(m, toks, lids)
+        assert len(g) == len(c) == len(ref) == len(toks)
+        for r, x, y, ids in zip(ref, g, c, lids):
+            assert len(r) == len(x) == len(y) == len(ids)
+            assert max(abs(a - b) for a, b in zip(x, y)) < 1e-5
+            assert max(abs(a - b) for a, b in zip(r, x)) < 2e-4
+    tiny_gemma4(tmp_path / "g4")
+    assert not mlx_stub(tmp_path / "g4", packed=True).packed
+
+
+@pytest.mark.parametrize("rope, packed", [
+    ({"rope_type": "linear", "rope_theta": 1e6, "factor": 2.0}, True),
+    ({"rope_type": "llama3", "rope_theta": 1e6, "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+      "original_max_position_embeddings": 64}, True),
+    ({"rope_type": "dynamic", "rope_theta": 1e6, "factor": 2.0}, False),  # base depends on the length of the call
+    ({"rope_type": "yarn", "rope_theta": 1e6, "factor": 2.0, "original_max_position_embeddings": 64}, False),
+])
+def test_mlx_packed_needs_static_rope(tmp_path, rope, packed):
+    """--mlx-packed rotates each token as its own length-1 row: only RoPE layers whose frequencies do not depend on the
+    sequence length are packed; the others (dynamic NTK, yarn, longrope) fall back to the KV cache, with the same
+    readouts as PyTorch."""
+    pytest.importorskip("mlx.core")
+    m = tiny_llama(tmp_path, rope)
+    be = mlx_stub(tmp_path, packed=True)
+    assert be.packed is packed
+    groups = [(TOKS[:2], LIDS[:2])]
+    got = be.run_shared(groups)
+    for r, x in zip(reference(m, *groups[0]), got[0]):
+        assert max(abs(a - b) for a, b in zip(r, x)) < 2e-4
