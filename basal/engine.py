@@ -570,11 +570,13 @@ class GraphBackend(EagerBackend):
                  readout_layer="off", template="off", gemma_attn="auto"):
         torch.backends.cuda.enable_cudnn_sdp(False)  # before capture: a captured graph keeps its attention kernel
         from . import gemma4_graph
-        if gemma4_graph.is_gemma4_dir(model_dir):
-            # every captured graph keeps its own cuBLAS workspace (32 MB on an H100): basal-omni-1.1-max's ~400 graphs
-            # held 37 GB of graph pool and ran out of memory in warm-up; 8 MB workspaces made no difference to its
-            # forwards (1.1-max, H100, 20 Oct). Read when the first cuBLAS handle is made, so set before any GEMM
-            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:2")
+        # every captured graph keeps its own cuBLAS workspace (32 MB on an H100): basal-omni-1.1-max's ~400 graphs held
+        # 37 GB of graph pool and ran out of memory in warm-up; 8 MB workspaces made no difference to its forwards
+        # (1.1-max, H100, 20 Oct). basal-2.0 (2.3.1): the same speed, 0.6-0.9 GB less GPU memory, 4.5B's start-up
+        # 452 s instead of 554 s, dev v2 top answers as two runs differ (H100, 20 Oct). Read when the first cuBLAS
+        # handle is made, so set before any GEMM; a value the user set is kept, and --deterministic has set :4096:8 before
+        # (deterministic cuBLAS needs it)
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:2")
         self.fp8_checkpoint = modelopt_fp8(model_dir)  # the -FP8 repositories: FP8 weights with static scales
         # likewise: the kernel of the causal forwards (--attn; auto keeps FlashAttention 2 for FP8 GEMMs)
         self.attn = set_attention(attn, fp8=self.fp8_checkpoint or quant == "fp8")

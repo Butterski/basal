@@ -126,3 +126,21 @@ def test_sglang_letter_readout_parsing_and_equivalence():
     assert torch.allclose(got, ref, atol=1e-6)
     meta = {"output_token_ids_logprobs": [[(float(lsm[3]), 3, None)]]}  # a missing letter gets no mass
     assert SGLangBackend._letters(meta, [3, 1])[1] == -1e9
+
+
+def test_graph_engine_sets_the_small_cublas_workspace_unless_set(monkeypatch, tmp_path):
+    """Every model in the graph engine gets 8 MB cuBLAS workspaces per captured graph (CUBLAS_WORKSPACE_CONFIG,
+    :4096:2) before any GEMM; a value already set (the user's, or --deterministic's :4096:8) is kept."""
+    import os
+
+    from basal.engine import GraphBackend
+    for preset, want in ((None, ":4096:2"), (":4096:8", ":4096:8")):
+        if preset is None:
+            monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+        else:
+            monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", preset)
+        try:
+            GraphBackend(str(tmp_path))  # no model there: it stops after the environment is set
+        except Exception:
+            pass
+        assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == want

@@ -1,3 +1,10 @@
+# What is new in basal 2.3.1 (not released yet)
+
+- **Less GPU memory for basal-2.0 in the graph engine:** 8 MB cuBLAS workspaces per captured CUDA graph for every model
+  (2.3.0: basal-omni only; `CUBLAS_WORKSPACE_CONFIG` unless you set it): 0.6-0.9 GB less GPU memory, 100 s faster
+  start-up on basal-2.0-4.5B (452 s instead of 554 s on an H100), the same speed; dev v2 top answers as two runs of
+  2.3.0 differ.
+
 # What is new in basal 2.3
 
 - **vLLM: KV-sharing fast prefill for basal-omni-1.0-mini, 1.43x / 1.60x** (`--mode vllm`, on by default for Gemma 4
