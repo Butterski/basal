@@ -217,6 +217,49 @@ def test_budgets_split_forwards(monkeypatch):
             assert torch.allclose(x, y, atol=1e-5) and torch.allclose(x, z, atol=1e-5)
 
 
+@pytest.mark.parametrize("chunk,heads", [(8, 4), (16, 2), (32, 1)])
+def test_split_attention_equals_one_call(chunk, heads, monkeypatch):
+    """An SDPA call past the budgets of a 16k-token context (ATTN_PAIRS // CHUNK keys; only states over 16k tokens
+    reach them) runs as calls by query heads and rows; together they equal the one call (fp32)."""
+    g = Gemma4Forward(tiny("31b"))
+    a = g.layers[2].self_attn  # a global layer
+    torch.manual_seed(2)
+    B, H, G, Sq, Lk, d = 1, 4, 2, 37, 90, 32
+    q, k, v = torch.randn(B, H, Sq, d), torch.randn(B, G, Lk, d), torch.randn(B, G, Lk, d)
+    mask = (torch.arange(Lk)[None, None, :] <= torch.arange(Lk - Sq, Lk)[None, :, None])[:, None]
+    calls, sdpa = [], gemma4.F.scaled_dot_product_attention
+    monkeypatch.setattr(gemma4.F, "scaled_dot_product_attention",
+                        lambda q, *x, **kw: calls.append(q.shape) or sdpa(q, *x, **kw))
+    one = g._attend("sdpa", a, q, k, v, mask, None, None, None)
+    assert calls == [q.shape]
+    calls.clear()
+    g.ATTN_PAIRS, g.CHUNK = 10 * Lk, chunk  # 10 query rows a call; heads within H x ATTN_PAIRS // CHUNK keys
+    split = g._attend("sdpa", a, q, k, v, mask, None, None, None)
+    assert len(calls) == H // heads * 4 and {c[1] for c in calls} == {heads} and max(c[2] for c in calls) == 10
+    torch.testing.assert_close(split, one, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("name", sorted(CONFIGS))
+def test_long_states_split_equal_one_call(name, monkeypatch):
+    """Every forward with the budgets of a 30-token "16k" context (the 50-token state and the 70-token single past it:
+    their attention calls split, the state's global keys in buffers) equals the forward without splits and the
+    transformers forward."""
+    m = tiny(name)
+    g = Gemma4Forward(m)
+    g.CHUNK = 24
+    groups = groups_of()
+    ref = g.hidden(groups)
+    n, split = [0], Gemma4Forward._split
+    monkeypatch.setattr(Gemma4Forward, "_split", lambda self, *x: n.__setitem__(0, n[0] + 1) or split(self, *x))
+    g.ATTN_PAIRS, g.KV_BYTES = 24 * 30, 30 * g.kv_row_bytes
+    got = g.hidden(groups)
+    assert n[0] > 10
+    for grp, a, b in zip(groups, ref, got):
+        for t, x, y in zip(grp, a, b):
+            r = last_hidden(m, t)
+            assert torch.allclose(x, y, atol=1e-5) and (y - r).abs().max() <= 1e-4 * r.abs().max()
+
+
 class Stub(EagerBackend):
     def __init__(self, model, g4=True, proc=None):  # the real __init__ minus loading
         self.model, self.dev, self.prefill, self.proc = model, torch.device("cpu"), "", proc

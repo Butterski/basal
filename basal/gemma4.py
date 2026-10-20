@@ -237,11 +237,11 @@ class Gemma4Forward:
         if block is not None and self.unified_blocks:
             m = m | block  # unified: the whole image, past the window too
         m = m & (valid[:, None, :] | (d == 0))
-        if kc is not None:
-            dc = qpos[:, :, None] - kc[:, None, :]
-            mc = (kc[:, None, :] >= 0) & (dc >= 0)
+        if kc is not None:  # (comparisons, not distances: over an 82k-token state those were 1.3 GB of int64)
+            kq = kc[:, None, :]
+            mc = (kq >= 0) & (kq <= qpos[:, :, None])
             if sliding:
-                mc = mc & (dc < self.window)
+                mc = mc & (qpos[:, :, None] - kq < self.window)
             m = torch.cat([mc, m], -1)
         return m[:, None]
 
@@ -265,6 +265,28 @@ class Gemma4Forward:
             return "sdpa"
         return k
 
+    def _split(self, a, q, k, v, mask):
+        """An SDPA call past the budgets of a forward over a 16k-token context (ATTN_PAIRS query-key pairs, KV_BYTES of
+        keys and values repeated per query head; only states over 16k tokens reach them) as calls within them: query
+        heads in groups whose repeated keys stay within those of all heads over 16k keys, query rows within
+        ATTN_PAIRS pairs. Each call is the same kernel on its rows and heads (keys and values per query head copied,
+        enable_gqa's repetition). Without it 2,048 queries of ultra over a 76k-token state were one math-kernel call
+        of 32 heads x 2,048 x 76k scores (fp32: 20 GB)."""
+        B, H, Sq, d = q.shape
+        G, Lk = k.shape[1], k.shape[2]
+        r = H // G
+        hc = max([c for c in range(1, H + 1) if H % c == 0 and (r % c == 0 or c % r == 0)
+                  and B * c * Lk <= H * (self.ATTN_PAIRS // self.CHUNK)] or [1])
+        n = max(1, self.ATTN_PAIRS // (B * Lk))
+        out = q.new_empty(B, H, Sq, d)
+        for h0 in range(0, H, hc):
+            kk, vv = (x[:, h0 // r: (h0 + hc - 1) // r + 1].repeat_interleave(min(r, hc), 1) for x in (k, v))
+            for s0 in range(0, Sq, n):
+                out[:, h0: h0 + hc, s0: s0 + n] = F.scaled_dot_product_attention(
+                    q[:, h0: h0 + hc, s0: s0 + n], kk, vv, attn_mask=mask[:, :, s0: s0 + n], scale=a.scaling)
+            del kk, vv
+        return out
+
     def _attend(self, kind, a, q, k, v, mask, kval, qval, window):
         """Attention of one layer: q [B, H, Sq, d], k / v [B, kv heads, Lk, d] -> [B, H, Sq, d]. SDPA kernels take the
         boolean mask; varlen kernels the real queries (qval [B, Sq]) and keys (kval [B, Lk]) of each row packed back to
@@ -273,6 +295,11 @@ class Gemma4Forward:
         if kind in SDPA_KERNELS:
             from torch.nn.attention import SDPBackend, sdpa_kernel
             name = SDPA_KERNELS[kind]
+            B, H, Sq, d = q.shape
+            G, Lk = k.shape[1], k.shape[2]
+            if B * Sq * Lk > self.ATTN_PAIRS or B * Lk * H * d * k.element_size() * 2 > self.KV_BYTES:
+                with sdpa_kernel([getattr(SDPBackend, name)]) if name else nullcontext():
+                    return self._split(a, q, k, v, mask)
             gqa = name is None
             if not gqa:  # the memory-efficient and cuDNN kernels take no enable_gqa: keys and values per query head,
                 # copied (an expanded, zero-stride view gives the memory-efficient kernel wrong attention at query
@@ -422,19 +449,30 @@ class Gemma4Forward:
 
     def _prefix(self, seqs, media=None):
         """Keys and values of prefixes: short ones in one forward, a long one (alone) in parts through the keys of the
-        parts before it."""
+        parts before it: global layers write theirs into buffers of the whole prefix (no copy of the earlier ones per
+        part; an 82k-token state of ultra holds 6.7 GB of them), sliding-window layers keep their last window - 1
+        after each part, layer by layer (_trim's keys)."""
         if len(seqs) == 1 and len(seqs[0]) > self.CHUNK:
-            ctx = None
-            for s0, s1 in self._parts(seqs[0], len(seqs[0])):
-                h, pli, pos, valid, blk, _ = self._rows([seqs[0][s0:s1]], [s0], media, seqs)
-                new, _ = self._pass(h, pli, pos, valid, ctx=ctx, blk=blk)
-                if ctx is None:
-                    ctx = (new, {t: pos for t in set(self.types)})
-                else:
-                    ctx = ({i: (torch.cat([ctx[0][i][0], k], 2), torch.cat([ctx[0][i][1], v], 2))
-                            for i, (k, v) in new.items()}, {t: torch.cat([p, pos], 1) for t, p in ctx[1].items()})
-                ctx = self._trim(*ctx)
-            return ctx
+            seq, keep = seqs[0], self.window - 1
+            kv, bufs = {}, {}
+            at = torch.arange(len(seq), device=self.lm.embed_tokens.weight.device)[None]
+            for s0, s1 in self._parts(seq, len(seq)):
+                h, pli, pos, valid, blk, _ = self._rows([seq[s0:s1]], [s0], media, seqs)
+                new, _ = self._pass(h, pli, pos, valid, ctx=(kv, kpos) if kv else None, blk=blk)
+                for i in list(new):
+                    k, v = new.pop(i)
+                    if self.types[i] == "sliding_attention":
+                        if i in kv:
+                            k, v = torch.cat([kv[i][0], k], 2), torch.cat([kv[i][1], v], 2)
+                        kv[i] = (k[:, :, -keep:].clone(), v[:, :, -keep:].clone())
+                    else:
+                        if i not in bufs:
+                            bufs[i] = tuple(x.new_empty(*x.shape[:2], len(seq), x.shape[3]) for x in (k, v))
+                        bufs[i][0][:, :, s0:s1], bufs[i][1][:, :, s0:s1] = k, v
+                        kv[i] = (bufs[i][0][:, :, :s1], bufs[i][1][:, :, :s1])
+                kpos = {t: at[:, max(0, s1 - keep): s1] if t == "sliding_attention" else at[:, :s1]
+                        for t in set(self.types)}
+            return kv, kpos
         h, pli, pos, valid, blk, _ = self._rows(seqs, [0] * len(seqs), media, seqs)
         new, _ = self._pass(h, pli, pos, valid, blk=blk)
         return self._trim(new, {t: torch.where(valid, pos, -1) for t in set(self.types)})
@@ -518,6 +556,9 @@ class Gemma4Forward:
                 self._shared([jb], groups, out, media)
             elif jb is not None:
                 cur = [jb]
+        if jobs and jobs[-1][2] > self.ATTN_PAIRS // self.CHUNK and self.lm.embed_tokens.weight.is_cuda:
+            torch.cuda.empty_cache()  # a state over 16k tokens: its parts' cached blocks back to the GPU (as the fast
+            # engine's long roots: after one large request the next ones ran out of memory sooner, ultra, 20 Oct)
         return out
 
     @torch.no_grad()
