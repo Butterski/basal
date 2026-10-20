@@ -552,11 +552,15 @@ class GraphBackend(EagerBackend):
         why = gemma4_graph.supports(self.model)
         if why:
             raise ValueError(why)
-        if quant:
-            raise ValueError(f"--quant {quant} is not available for Gemma 4 in the CUDA graph engine yet")
+        if quant == "nvfp4":  # NVFP4 ports of basal-omni failed their gate (W4A16 on H100; vLLM, 15 Oct)
+            raise ValueError("--mode nvfp4 is not available for basal-omni (Gemma 4); use fp8")
+        if quant:  # torchao on the decoder layers' linears only (not the towers, embeddings or per-layer projection)
+            quantize(self.model, quant, gemma4_graph.text_model(self.model).layers)
         if kernels == "auto":
             kernels = "math"
-        self.gemma = gemma4_graph.Gemma4Graph(self.model, kernels, compile=compile, merge=merge is True)
+        # merged projections: bf16 linears only (an FP8 checkpoint's FP8Linear layers keep theirs); not with torchao,
+        # which would quantise the modules but not the merged copies the forward reads
+        self.gemma = gemma4_graph.Gemma4Graph(self.model, kernels, compile=compile, merge=merge is True and not quant)
         self.softcap, self.merged, self.lean = self.gemma.softcap, self.gemma.merged, None
         self.fwd, self.fwd_sfx = self.gemma.forward, self.gemma.forward_suffix
         self.flex = all(k != "math" for k in self.gemma.kernels.values())
@@ -2396,8 +2400,9 @@ def load_modelopt_fp8(model_dir, device="cuda", dtype=torch.bfloat16):
     return model.eval()
 
 
-def quantize(model, quant):
-    """On-the-fly torchao quantisation of the decoder layers (the LM head stays in bf16).
+def quantize(model, quant, target=None):
+    """On-the-fly torchao quantisation of the decoder layers (the LM head stays in bf16); target: the module to
+    quantise instead of model.model (Gemma 4: the text decoder's layers).
     fp8   -- dynamic FP8 activations + FP8 weights, per-row scales (Ada, Hopper, Blackwell)
     nvfp4 -- NVFP4 activations + weights (Blackwell); for best FP4 speed prefer the ModelOpt NVFP4 checkpoint + vLLM"""
     from torchao.quantization import quantize_
@@ -2409,4 +2414,4 @@ def quantize(model, quant):
         cfg = NVFP4DynamicActivationNVFP4WeightConfig(use_triton_kernel=False)
     else:
         raise ValueError(f"unknown quantisation {quant!r} (fp8 | nvfp4)")
-    quantize_(model.model, cfg)
+    quantize_(model.model if target is None else target, cfg)

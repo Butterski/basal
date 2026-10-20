@@ -60,13 +60,13 @@ _FLEX = []
 
 def _flex_attention():
     """flex_attention as it is inside the compiled forward (Inductor generates its kernel there); from uncompiled code
-    (fast-nocompile, shapes without a graph, the long lane) one compiled instance with dynamic shapes, since
+    (fast-nocompile, shapes without a graph, the long lane) one compiled instance (automatic dynamic shapes), since
     uncompiled flex_attention is a slow reference implementation."""
     from torch.nn.attention.flex_attention import flex_attention
     if torch.compiler.is_compiling():
         return flex_attention
     if not _FLEX:
-        _FLEX.append(torch.compile(flex_attention, dynamic=True))
+        _FLEX.append(torch.compile(flex_attention))
     return _FLEX[0]
 
 
@@ -116,7 +116,10 @@ class Gemma4Graph:
         if compile:
             import torch._dynamo as dynamo
             dynamo.config.cache_size_limit = 64
-        self.run = torch.compile(self._run, dynamic=True) if compile else self._run
+        # automatic dynamic shapes (a static compile, then the dimensions that change, rows and tokens): with every
+        # dimension symbolic (dynamic=True) the head sizes and buffer shapes went symbolic too and tracing the 42 E4B
+        # layers did not finish in 12 minutes (sympy floor divisions in every view, 2026-10-20)
+        self.run = torch.compile(self._run) if compile else self._run
 
     @staticmethod
     def _fuse(mods):
@@ -225,10 +228,10 @@ class Gemma4Graph:
     @staticmethod
     def _flex(q, k, v, bm):
         """FlexAttention with a block mask. The 512-wide global heads take 32 x 32 tiles: Inductor's default tiles
-        need more shared memory than an H100 has (Triton "out of resource", 2026-10-20)."""
+        need more shared memory than an H100 has (Triton "out of resource", 2026-10-20); in fp32 one stage as well."""
         opts = {"FORCE_USE_FLEX_ATTENTION": True}
         if q.shape[-1] > 256:
-            opts.update(BLOCK_M=32, BLOCK_N=32)
+            opts.update(BLOCK_M=32, BLOCK_N=32, **({"num_stages": 1} if q.dtype == torch.float32 else {}))
         o = _flex_attention()(q, k, v, block_mask=bm, scale=1.0, enable_gqa=True, kernel_options=opts)
         return o.transpose(1, 2).reshape(q.shape[0], q.shape[2], -1)
 
