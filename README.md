@@ -1,4 +1,4 @@
-# basal 2.2
+# basal 2.3
 
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--2.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-20-6acd1712a8e443c86cd576fc)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--omni--1.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f)
@@ -24,14 +24,44 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 
 ## Contents
 
-- [What is new in basal 2.2](#what-is-new-in-basal-22) · [What is new in basal 2.1](#what-is-new-in-basal-21) ·
-  [What is new in basal-2.0](#what-is-new-in-basal-20)
+- [What is new in basal 2.3](#what-is-new-in-basal-23) · [What is new in basal 2.2](#what-is-new-in-basal-22) ·
+  [What is new in basal 2.1](#what-is-new-in-basal-21) · [What is new in basal-2.0](#what-is-new-in-basal-20)
 - [Models](#models) · [Results](#results)
 - [Quick start](#quick-start) · [API](#api)
 - [Images and audio: basal-omni](#images-and-audio-basal-omni-experimental) · [MCP for agents](#mcp-basal-as-a-tool-for-agents)
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
 - [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) ·
   [Contributors](#contributors) · [License](#license)
+
+## What is new in basal 2.3
+
+- **basal-omni on the fast engine** (`--mode fast`, text): the CUDA graph engine now runs basal-omni (Gemma 4). A
+  request's state is computed once for every question, mini's last 18 layers run only where answers are read, and the
+  layers are compiled with FlashAttention 3 and FlexAttention. Decisions per second at 16 requests in flight, against
+  2.2's `--mode eager` on the same GPU:
+
+  | model | GPU | one question | five questions about a long document |
+  |---|---|---|---|
+  | basal-omni-1.0-mini | H100 | 10.0 -> 61.2 (6.1x) | 1.6 -> 21.4 (13.7x) |
+  | basal-omni-1.1-max | H100 | 4.8 -> 16.2 (3.4x) | 0.72 -> 10.6 (14.7x) |
+  | basal-omni-1.0-ultra | H100 | 2.0 -> 6.1 (3.0x) | 0.28 -> 4.8 (17x) |
+  | basal-omni-1.0-mini | RTX PRO 6000 Blackwell, `--gemma-attn flex` | 5.6 -> 23.2 (4.1x) | 0.85 -> 18.4 (21.6x) |
+
+  The same answers within bf16 rounding: on 10,606 development decisions the top answer matches 2.2 on 99.85-99.99% of
+  those where the model is sure, and with the shipped calibration files the share automated at 1% error moves by at
+  most 0.1 points. Without `--mode`, basal-omni now runs `fast` on Hopper GPUs with FlashAttention 3 and `eager`
+  elsewhere (in 2.2 it stopped at start-up). [docs/OMNI.md](docs/OMNI.md#what-the-engine-does-differently-for-gemma-4)
+- **A faster `--mode eager` for basal-omni** (images, audio, `--deterministic`): the state, and the image and audio
+  encoders, run once per request instead of once per question: mini 1.6 -> 15.3 questions per second about a long
+  document. Opt-in: `--eager-attn auto` (faster attention on Hopper) and `--ple-offload on` (mini in 5.2 GB less GPU
+  memory).
+- **vLLM for basal-omni:** mini's shared layers are skipped at prefill (1.43x / 1.60x, on by default);
+  `--vllm-preset deterministic` gives bit-identical answers run to run; `--mode vllm --media on` for mini.
+- **Fixes:** a PyTorch attention bug (pytorch/pytorch#191937) is avoided for every model in `--mode eager`; the prompt
+  language is detected once per request (#17, Milosz, @Butterski).
+
+Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the
+[release notes](https://github.com/rkinas/basal/releases/tag/v2.3.0).
 
 ## What is new in basal 2.2
 
@@ -157,7 +187,7 @@ NVIDIA GPU, with [uv](https://docs.astral.sh/uv/) in a fresh environment:
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -170,7 +200,7 @@ Apple Silicon:
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -236,7 +266,7 @@ The basal-omni models answer the same questions, and with `--media on` a request
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 
@@ -252,7 +282,7 @@ calibration, so validate them on your own media. Request format and limits:
 `decide_many`; `basal-mcp` is a stdio bridge for hosts that start local processes.
 
 ```bash
-uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.2.0.tar.gz"
+uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --host 127.0.0.1 --port 8000 --mcp on
 claude mcp add --transport http basal http://127.0.0.1:8000/mcp     # Claude Code; other hosts take the same URL
 ```
