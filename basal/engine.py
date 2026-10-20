@@ -1544,9 +1544,9 @@ class GraphBackend(EagerBackend):
                 rows = self._to_dev(torch.tensor([sel[n][1] for n in j]))
                 cols = self._to_dev(torch.tensor([sel[n][2] for n in j]))
                 out[self._to_dev(torch.tensor(j))] = h[rows, cols]
-        if max(P) > self.PLAIN_LENS[-1] and self.dev.type == "cuda":  # a long root: its passes' cached blocks back to
-            del kv, h1, h2  # the GPU (an 82k-token ultra request left 6 GB of them behind, 20 Oct)
-            torch.cuda.empty_cache()
+        if max(P) > max(self.PLAIN_LENS[-1], self.one_forward) and self.dev.type == "cuda":  # a root in chunks: its
+            del kv, h1, h2  # passes' cached blocks back to the GPU (an 82k-token ultra request left 6 GB of them
+            torch.cuda.empty_cache()  # behind; after every long root it cost ultra's multi profile 4%, 20 Oct)
         return out
 
     def _gemma_suffix(self, ids2, mask, pos2, kv, sel, B):
