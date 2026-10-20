@@ -17,7 +17,7 @@ benchmarking a GPU.
 | `sglang` | SGLang backend, same readout | CUDA GPUs supported by SGLang |
 | `eager` | plain PyTorch reference; `--device cuda\|mps\|cpu` (default: `BASAL_DEVICE`, else CUDA, else Apple Silicon, else CPU) | any GPU, Apple Silicon (MPS) or CPU |
 | `fast-exit` | `fast` + trained early-exit heads, exit policy chosen per request | models that ship `exit_heads/` (basal-1.0 only) |
-| `mlx` *(default on Apple Silicon with `basal[mlx]`)* | Apple Silicon with MLX / mlx-lm: the `-MLX-8bit` ports or bf16 weights; shared-prefix KV cache | Apple Silicon |
+| `mlx` *(default on Apple Silicon with `basal[mlx]`)* | Apple Silicon with MLX / mlx-lm: the `-MLX-8bit` ports or bf16 weights; shared-prefix KV cache (opt-in `--mlx-packed`: short Llama groups as one packed forward, [QUANTIZATION.md](QUANTIZATION.md#mlx-apple-silicon)) | Apple Silicon |
 | `mlx-q8` | `mlx` with 8-bit weights made from bf16 at load time (about half the memory, not faster) | Apple Silicon |
 | `mps` | the PyTorch engine without CUDA graphs: SOAM packing + token-budget batching; on the Mac's GPU, or on the CPU (`--device cpu`, the default without MPS), where a request's state runs once instead of once per prompt as in `eager` | Apple Silicon, CPU |
 | `gguf` | a GGUF file in process through llama.cpp (`--gguf <file>`, extra `basal[gguf]`) | Apple Silicon (Metal), CUDA, CPU |
@@ -97,6 +97,10 @@ benchmarking a GPU.
   documents. The `fast` mode is not affected.
 - `--log-decisions file.jsonl` appends one line per request with the served probabilities (a propensity log, for later
   use of production feedback).
+- **Status codes and load (2.3.1)**: an invalid request answers HTTP 422, the GPU out of memory 503 (retry later or
+  elsewhere) and any other server error 500, all with `{"error": "..."}`. `GET /health` returns the requests in flight
+  as `running` and `queued` (waiting for the engine); both 0 means idle, for a process manager that stops or restarts
+  the server. Definitions: [API.md](API.md).
 
 ## Inference on a JSONL file
 

@@ -400,7 +400,18 @@ Thank you to the people whose work is in this repository, by pull request:
   ([#2](https://github.com/rkinas/basal/pull/2)).
 - Milosz ([@Butterski](https://github.com/Butterski)): the prompt language is detected once per request instead of
   once per question, so a large task request on a long English state is prepared in milliseconds instead of half a
-  second ([#17](https://github.com/rkinas/basal/pull/17)).
+  second ([#17](https://github.com/rkinas/basal/pull/17)); sentence splitting for `compress` in linear time
+  ([#16](https://github.com/rkinas/basal/pull/16)); `--mode gguf` on every physical core
+  ([#20](https://github.com/rkinas/basal/pull/20)); and `--mode mps` on the CPU, so a request's state is computed once
+  there too ([#26](https://github.com/rkinas/basal/pull/26)).
+- Grzegorz Brzezinka ([@agentGreg](https://github.com/agentGreg)): the calibration report's per-type ECE as
+  `basal-serve` applies the temperatures ([#24](https://github.com/rkinas/basal/pull/24)), the per-type label count
+  for the 1% target in CALIBRATION.md ([#25](https://github.com/rkinas/basal/pull/25)), the Apple M5 Max
+  benchmark tables in [HARDWARE.md](docs/HARDWARE.md) ([#18](https://github.com/rkinas/basal/pull/18)), and
+  `--mlx-packed`, two option orders in one forward on Apple Silicon, with its root cause
+  ([#27](https://github.com/rkinas/basal/issues/27), [#28](https://github.com/rkinas/basal/pull/28)).
+- [@piotrkowski](https://github.com/piotrkowski): `--mode strix` reproduced on a second Strix Halo (ROG Flow Z13),
+  bit-identical edge cases and a similar speed-up ([#21](https://github.com/rkinas/basal/pull/21)).
 
 `--mode tpu` and `--mode strix` are community-maintained: their numbers in [HARDWARE.md](docs/HARDWARE.md) are the
 contributors' own measurements.
