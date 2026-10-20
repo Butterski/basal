@@ -188,7 +188,9 @@ class Gemma4Graph:
         self.flex = any(k != "math" for k in kernels.values())  # fa3 is flex where a mask is needed
         self.qkv, self.gu = {}, {}  # merged projections per layer: (linear, output sizes)
         self.merged = self._merge() if merge else 0
-        if compile:
+        if compile or self.flex:  # flex: uncompiled code calls one compiled flex_attention (_flex_attention), an
+            # entry per mask kind, head size and rows-only pass: 13 for mini's long states, past the default 8, after
+            # which flex_attention runs its unfused reference (fast-nocompile, 2026-10-20)
             import torch._dynamo as dynamo
             dynamo.config.cache_size_limit = 64
         self.args = self._layer_args()
