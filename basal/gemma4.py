@@ -8,7 +8,10 @@ model (the same modules and weights) in its own loop, for three things the trans
   tokens only, so its readout equals the forward of its whole prompt (up to float rounding). Prefixes of several groups
   are batched together, a long one runs alone in CHUNK-token parts; a single prompt longer than CHUNK runs its parts
   the same way (the transformers path's chunked prefill). Sliding-window layers keep the last window - 1 keys of a
-  prefix only (the most a later token can see), global layers all of them.
+  prefix only (the most a later token can see), global layers all of them. A state over 16k tokens (ATTN_PAIRS //
+  CHUNK) writes its global layers' keys and values into buffers of the whole state, and their attention runs in calls
+  of at most SCORES scores, each KV head's query heads as one block of queries (_split); up to 16k tokens every call
+  is as before.
 - **Answer rows only (G1):** the layers from the last one with its own keys and values onwards matter only at the
   readout positions: Gemma 4 E2B / E4B reuse the keys and values of earlier layers in their last layers (E4B: 18 of
   42), so those layers produce nothing a later token reads. Such layers, and the attention and MLP of the last layer
