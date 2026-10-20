@@ -16,7 +16,8 @@
   refused (that is `--mode fast`). Contributed by Milosz (@Butterski), [#26](https://github.com/rkinas/basal/pull/26).
 - **`--lean on --tree flex` is refused before the model is resolved** also on CUDA GPUs without FlashAttention 3,
   where choosing the default mode resolved the model first (offline: a download error instead of the refusal;
-  `tests/test_lean.py` failed on those GPUs). Contributed by Milosz (@Butterski).
+  `tests/test_lean.py` failed on those GPUs). Contributed by Milosz (@Butterski),
+  [#30](https://github.com/rkinas/basal/pull/30).
 
 # What is new in basal 2.3
 
