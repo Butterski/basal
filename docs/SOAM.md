@@ -44,7 +44,8 @@ letters.
    its own prompt (W = 512 or 1,024). Positions in the packed row are each token's position in its own prompt, so the
    window is one more condition of the mask: a branch token at position p sees an ancestor at position j only when
    p - j < W, in pass 2 over the root's keys as well. Every answer therefore still sees exactly what it sees as a
-   separate prompt.
+   separate prompt. Since every branch comes after the root, pass 2 of a sliding layer reads only the root's last W
+   tokens: for a state beyond its largest graph the engine keeps only those.
 
 ### Which kernel runs
 

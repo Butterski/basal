@@ -70,6 +70,31 @@ def test_default_mode_prefers_cuda_over_mlx(monkeypatch):
     assert default_mode() == "fast"
 
 
+def test_default_mode_gemma4_fast_only_where_its_gate_passed(monkeypatch, tmp_path):
+    """basal-omni (Gemma 4) without --mode: fast on Hopper with FlashAttention 3 (the configuration its gate passed),
+    eager on other GPUs; every other model fast on any CUDA GPU."""
+    omni, llama = tmp_path / "omni", tmp_path / "llama"
+    for d, t in ((omni, "gemma4"), (llama, "llama")):
+        d.mkdir()
+        (d / "config.json").write_text(f'{{"model_type": "{t}"}}')
+    monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(server_module, "attention_available", lambda impl: None)
+    assert default_mode(str(omni)) == "fast"
+    monkeypatch.setattr(server_module, "attention_available", lambda impl: "FlashAttention 3 runs on Hopper only")
+    assert default_mode(str(omni)) == "eager"
+    assert default_mode(str(llama)) == default_mode() == "fast"
+
+
+def test_fast_mode_loads_the_eager_fitted_calibration(tmp_path):
+    """The graph engine (--mode fast) has no calibration file of its own: CALIBRATION.json, also next to a
+    CALIBRATION.fast.json. basal-omni's fast mode passed its automation gate with the eager-fitted file; refits on its
+    readouts did not (OMNI.md), so a fast-only file must not be picked up unnoticed."""
+    from basal.server import calibration_file
+    for name in ("CALIBRATION.json", "CALIBRATION.fast.json"):
+        (tmp_path / name).write_text("{}")
+    assert calibration_file(tmp_path, "graph") == tmp_path / "CALIBRATION.json"
+
+
 def test_default_mode_requires_both_mlx_packages_on_mps(monkeypatch):
     monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(server_module.torch.backends.mps, "is_available", lambda: True)

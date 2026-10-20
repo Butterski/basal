@@ -99,6 +99,30 @@ def test_two_passes_equal_separate(kind):
         assert torch.allclose(torch.tensor(r), e, atol=1e-6)
 
 
+def test_attention_never_reaches_memory_efficient_sdpa(monkeypatch):
+    """Every SDPA call of the Gemma 4 forward (plain rows, readout rows, both passes, the long lane) runs with the math
+    backend only, grouped key / value heads unexpanded: memory-efficient SDPA reads wrong keys from expanded
+    (zero-stride) heads (every global layer of 12B wrong, the 7 Oct bug); flex and FlashAttention 3 take grouped heads
+    natively."""
+    import torch.nn.functional as F
+    calls, real = [], F.scaled_dot_product_attention
+
+    def spy(q, k, *a, **kw):
+        b = torch.backends.cuda
+        calls.append((b.mem_efficient_sdp_enabled(), b.flash_sdp_enabled(), b.cudnn_sdp_enabled(),
+                      k.shape[1] < q.shape[1] and kw.get("enable_gqa")))
+        return real(q, k, *a, **kw)
+    monkeypatch.setattr(F, "scaled_dot_product_attention", spy)
+    m = tiny("31b", torch.float32)
+    be = Stub(m)
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
+    toks = [state + [20, 21, 30 + o, 31 - o] for o in range(2)]
+    be.run_shared([(toks, [[7, 8], [7, 8]])])
+    be.run_long([(toks, [[7, 8], [7, 8]])])
+    be.gemma.forward(torch.tensor([toks[0]]), ro=torch.tensor([[3, 15]]))
+    assert calls and all(c == (False, False, False, True) for c in calls)
+
+
 def test_moe_not_supported():
     cfg = Gemma4TextConfig(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                            num_attention_heads=2, num_key_value_heads=1, head_dim=16, enable_moe_block=True,
@@ -157,6 +181,28 @@ def test_state_cache_second_round_equals_separate():
     assert s["entries"] == 1 and s["hits"] == 1 and s["misses"] == 1
 
 
+def test_long_state_keeps_the_window_of_sliding_layers():
+    """A root longer than the largest graph gets fresh key / value buffers whose sliding layers keep its last `window`
+    tokens only (pass 2 reads no further back). A state cached that way by the long lane is reused by the main lane
+    over a graph's buffers, its sliding layers' keys placed where the root ends. Both equal separate prompts."""
+    from basal.engine import StateCache
+    m = tiny("e4b", torch.float32)
+    be = Stub(m)
+    assert [k.shape[2] for k, _ in be._kv_new(12)] == [5, 5, 12, 5]  # own layers: sliding, sliding, global, sliding
+    be.state_cache = StateCache(1 << 30)
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
+    first = [state + [20, 21, 30 + o, 31 - o] for o in range(2)]
+    second = [state + [22, 23, 24, 30 + o] for o in range(2)]
+    lids = [[7, 8], [7, 8]]
+    for r, e in zip(be.run_long([(first, lids, len(state))])[0], separate(m, first, lids)):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+    be.PLAIN_LENS = be.LENS = [16]  # the state now fits the graphs' buffers: the main lane's pass 2 over them
+    for r, e in zip(be.run_shared([(second, lids, len(state))])[0], separate(m, second, lids)):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+    s = be.state_cache.stats()
+    assert s["entries"] == 1 and s["hits"] == 1
+
+
 def test_long_lane_equals_separate():
     """The long lane (run_long): every unit alone, one decoder layer at a time (between(i) before layer i)."""
     m = tiny("31b", torch.float32)
@@ -169,3 +215,39 @@ def test_long_lane_equals_separate():
     for r, e in zip(res[0] + res[1], separate(m, toks, lids)):
         assert torch.allclose(torch.tensor(r), e, atol=1e-6)
     assert calls == list(range(6)) * 2  # the root and the single prompt layer by layer; pass 2 runs whole
+
+
+def test_modelopt_fp8_gemma4_loads_tied_and_runs(tmp_path):
+    """A ModelOpt FP8 Gemma 4 checkpoint (the -FP8 repositories): the decoder linears become FP8Linear, the output head
+    is tied to the embedding (not in the checkpoint), and the graph engine's forward equals transformers' forward of
+    the loaded model (the FP8 product emulated on CPU)."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from basal.engine import FP8Linear, load_modelopt_fp8
+    m = tiny("e4b", torch.float32)
+    m.save_pretrained(tmp_path)
+    sd = {}
+    for name, mod in m.named_modules():
+        if isinstance(mod, torch.nn.Linear) and ".layers." in name and "per_layer" not in name:
+            w = mod.weight.detach().float()
+            ws = w.abs().max() / 448.0
+            sd[f"{name}.weight"] = (w / ws).to(torch.float8_e4m3fn)
+            sd[f"{name}.weight_scale"], sd[f"{name}.input_scale"] = ws.reshape(()), torch.tensor(0.05)
+    for k, v in m.state_dict().items():
+        if k != "lm_head.weight" and k.rsplit(".", 1)[0] + ".weight_scale" not in sd:
+            sd.setdefault(k, v.detach().clone())
+    for f in tmp_path.glob("*.safetensors"):
+        f.unlink()
+    save_file({k: v.contiguous() for k, v in sd.items()}, str(tmp_path / "model.safetensors"))
+    cfg = json.loads((tmp_path / "config.json").read_text())
+    cfg["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "FP8"}
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    q = load_modelopt_fp8(tmp_path, "cpu", torch.float32)
+    assert q.lm_head.weight.data_ptr() == q.model.embed_tokens.weight.data_ptr()
+    assert sum(isinstance(x, FP8Linear) for x in q.modules()) > 0
+    ids = torch.randint(0, 64, (1, 13), generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        ref = q.model(input_ids=ids).last_hidden_state[0, -1]
+    assert torch.allclose(Gemma4Graph(q).forward(ids, ro=torch.tensor([[12]]))[0, 0], ref, atol=1e-5)
