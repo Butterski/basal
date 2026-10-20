@@ -320,37 +320,55 @@ class Gemma4Graph:
         idx = torch.arange(nk, dtype=torch.int32, device=dev).expand(B, 1, nq, nk).contiguous()
         return BlockMask.from_kv_blocks(num, idx, BLOCK_SIZE=self.BLOCK, mask_mod=mod, seq_lengths=(Lq, Lk))
 
-    def _rows_block(self, ro, L, t):
-        """Block mask of the readout rows ro [b, R] of plain causal rows of length L."""
-        W, R = self._window(t), ro.shape[1]
+    def _pads(self, pos, mask, ro):
+        """The index tensors the flex masks read, each padded by a block: flex evaluates a mask on whole blocks, so
+        query (and branch key) indices run up to a block past the rows; padded copies keep every read in bounds. Made
+        outside the compiled forward and passed in (a clamp of the index in the mask broke Inductor's flex template,
+        "XBLOCK is not defined", and tensors made inside it cannot be read by a mask: "'function' object has no
+        attribute 'graph'", 2026-10-20)."""
+        from .lean import TreeMask
+        if not self.flex:
+            return {}
+        Bk, out = self.BLOCK, {}
+        if ro is not None:
+            out["ro"] = F.pad(ro, (0, Bk))
+        if isinstance(mask, TreeMask):  # padding tokens are block S, which sees nothing but itself
+            out["s"] = F.pad(mask.s, (0, Bk), value=pos.shape[1])
+            out["pos"] = F.pad(pos, (0, Bk))
+        return out
 
-        def mod(b, h, q, kv):  # indices past the end (the last block's padding) are clamped, their result unused
-            p = ro[b, q.clamp(max=R - 1)]
-            return (p >= kv) & (p - kv < W) if W else p >= kv
-        return self._dense_block(ro.shape[0], R, L, mod, ro.device)
-
-    def _tree_block(self, tm, pos, P, t, ro=None):
-        """Block mask of pass 2 (the TreeMask of basal/lean.py: root tokens per row, block of every branch token,
-        ancestors per block) with the window on positions in sliding layers; ro: the readout rows only."""
-        from .lean import tree_mask_mod
+    def _rows_block(self, rop, R, L, t):
+        """Block mask of the readout rows (rop: their positions, padded) of plain causal rows of length L."""
         W = self._window(t)
-        base = tree_mask_mod(tm, P)
-        S = pos.shape[1]
 
         def mod(b, h, q, kv):
-            qq = ro[b, q.clamp(max=ro.shape[1] - 1)] if ro is not None else q.clamp(max=S - 1)
-            ok = base(b, h, qq, kv)
+            p = rop[b, q]
+            return (p >= kv) & (p - kv < W) if W else p >= kv
+        return self._dense_block(rop.shape[0], R, L, mod, rop.device)
+
+    def _tree_block(self, tm, pads, S, P, t, R=None):
+        """Block mask of pass 2 (the TreeMask of basal/lean.py: root tokens per row, block of every branch token,
+        ancestors per block; lean.tree_mask_mod's mask) with the window on positions in sliding layers; R: the
+        readout rows only (pads["ro"])."""
+        W = self._window(t)
+        sp, posp, rop = pads["s"], pads["pos"], pads.get("ro") if R is not None else None
+
+        def mod(b, h, q, kv):
+            qq = rop[b, q] if rop is not None else q
+            j = kv - P                                  # the branch token a key is (negative: a root key)
+            jj = j * (j >= 0)
+            tree = (j >= 0) & ((tm.anc[b, sp[b, qq], sp[b, jj]] & (jj <= qq)) | (jj == qq))
+            ok = (kv < tm.pr[b]) | tree
             if W:
-                kp = torch.where(kv < P, kv, pos[b, (kv - P).clamp(min=0, max=S - 1)])
-                ok = ok & (pos[b, qq] - kp < W)
+                ok = ok & (posp[b, qq] - torch.where(j >= 0, posp[b, jj], kv) < W)
             return ok
-        Lq = S if ro is None else ro.shape[1]
-        return self._dense_block(pos.shape[0], Lq, P + S, mod, pos.device)
+        return self._dense_block(sp.shape[0], S if R is None else R, P + S, mod, sp.device)
 
     # -- the forward --------------------------------------------------------------------------------------------------
-    def _masks(self, kernels, L, pos, prefix, mask, ro):
+    def _masks(self, kernels, L, pos, prefix, mask, ro, pads):
         """The attention masks of one forward per layer type, for every query and for the readout rows ro: boolean
-        masks for "math", block masks for "flex", ("fa3", window) for FlashAttention 3 over plain rows."""
+        masks for "math", block masks for "flex" (reading pads), ("fa3", window) for FlashAttention 3 over plain
+        rows."""
         from .lean import TreeMask
         dev, types = pos.device, set(self.types)
         math = [t for t in types if kernels[t] == "math"]
@@ -363,7 +381,7 @@ class Gemma4Graph:
             for t in flex:
                 m_all[t] = ("fa3", self._window(t)) if kernels[t] == "fa3" else self._plain_block(L, t, dev)
                 if ro is not None:
-                    m_ro[t] = self._rows_block(ro, L, t)
+                    m_ro[t] = self._rows_block(pads["ro"], ro.shape[1], L, t)
             return m_all, m_ro
         P = prefix[0][0].shape[2]
         if isinstance(mask, TreeMask):
@@ -377,18 +395,19 @@ class Gemma4Graph:
         if flex and not isinstance(mask, TreeMask):
             raise ValueError("the flex kernel takes the trie of pass 2 as a TreeMask")
         for t in flex:
-            m_all[t] = self._tree_block(mask, pos, P, t)
+            m_all[t] = self._tree_block(mask, pads, L, P, t)
             if ro is not None:
-                m_ro[t] = self._tree_block(mask, pos, P, t, ro)
+                m_ro[t] = self._tree_block(mask, pads, L, P, t, ro.shape[1])
         return m_all, m_ro
 
-    def _run(self, kernels, ids, pos, kv=None, prefix=None, mask=None, ro=None, between=None):
+    def _run(self, kernels, ids, pos, kv=None, prefix=None, mask=None, ro=None, between=None, pads=None):
         """kernels: per layer type; ids / pos [b, L]; kv: per own layer (K, V) buffers [b, kv heads, L, d] that receive
         this pass's keys and values (pass 1); prefix: per own layer (K, V) [b, kv heads, P, d] the rows continue (pass
         2) with mask (the trie: additive, or a TreeMask for flex); ro [b, R]: readout positions -> final hidden states
-        [b, R, D] (None: every position, [b, L, D]); between(i) is called before layer i (the long lane). The masks
-        of every query and of the readout rows are built here (_masks; the kernel follows the mask)."""
-        m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro)
+        [b, R, D] (None: every position, [b, L, D]); between(i) is called before layer i (the long lane); pads: the
+        padded index tensors of the flex masks (_pads). The masks of every query and of the readout rows are built
+        here (_masks; the kernel follows the mask)."""
+        m_all, m_ro = self._masks(kernels, ids.shape[1], pos, prefix, mask, ro, pads or {})
         h = self.lm.embed_tokens(ids)
         pli = self.lm.project_per_layer_inputs(h, self.lm.get_per_layer_inputs(ids, None)) if self.ple else None
         types = set(self.types)
@@ -442,7 +461,8 @@ class Gemma4Graph:
         L = ids.shape[1]
         pos = torch.arange(L, device=ids.device)[None].expand(ids.shape[0], L)
         compiled = compiled and between is None
-        return (self.run if compiled else self._run)(self.kernels, ids, pos, kv=kv, ro=ro, between=between)
+        return (self.run if compiled else self._run)(self.kernels, ids, pos, kv=kv, ro=ro, between=between,
+                                                     pads=self._pads(pos, None, ro))
 
     @torch.no_grad()
     def forward_suffix(self, ids, mask, pos, prefix, ro=None, compiled=True):
@@ -450,4 +470,5 @@ class Gemma4Graph:
         mask (additive [b, 1, S, P + S], 0 = visible; a TreeMask for flex) -> [b, R, D] at ro [b, R] (None: all)."""
         from .lean import TreeMask
         kernels = self._kernels(dense=not isinstance(mask, TreeMask))
-        return (self.run if compiled else self._run)(kernels, ids, pos, prefix=prefix, mask=mask, ro=ro)
+        return (self.run if compiled else self._run)(kernels, ids, pos, prefix=prefix, mask=mask, ro=ro,
+                                                     pads=self._pads(pos, mask, ro))
