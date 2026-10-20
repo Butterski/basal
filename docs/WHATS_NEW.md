@@ -14,6 +14,12 @@
   basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: three task requests (41, 24 and 10 prompts) 838 s -> 88 s, 9.6x,
   the same top answer on 75 of 75 readouts (max |Δp| 4e-6); single questions as fast as in `eager`. `--device cuda` is
   refused (that is `--mode fast`). Contributed by Milosz (@Butterski), [#26](https://github.com/rkinas/basal/pull/26).
+- **Compact rows on any sm80+ GPU** (`--batches compact`; `auto` unchanged): single prompts packed back to back without
+  padding ran only with FlashAttention 3 (Hopper); elsewhere they now run through torch's varlen attention (its
+  FlashAttention 2), with the template prefix. basal-2.0-mini on an RTX 4060 Ti 16 GB: single questions 66.8 -> 109.4
+  decisions/s (+64%), the same top answer on 58 of 58 answers; about 2.4 GB more GPU memory, and five questions over
+  ~1.5k tokens (unchanged path) 5.6% slower there with the card full. The start-up line names the compact kernel.
+  Contributed by Milosz (@Butterski).
 
 # What is new in basal 2.3
 
