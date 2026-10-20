@@ -1010,6 +1010,8 @@ class GraphBackend(EagerBackend):
                                           for (pk, pv), (k, v) in zip(kv, bufs)]
             if self.gemma is not None:  # sliding layers: the last window + 256 only
                 kv = [(k[:, :, -t:], v[:, :, -t:]) for (k, v), t in zip(kv, self.gemma.kv_lens(e))]
+        if self.dev.type == "cuda" and len(tokens) - m > self.CHUNK:  # the allocator's blocks of a long state back to
+            torch.cuda.empty_cache()  # the GPU (after one 32k-token ultra request the next ones ran out of memory)
         return [(k[0], v[0]) for k, v in kv], h
 
     def _usable(self, kv, m, n):
