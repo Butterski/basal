@@ -288,17 +288,18 @@ class Gemma4Forward:
                 out[:, j * r: (j + 1) * r, s0: s0 + m] = o.view(B, r, m, d)
         return out
 
-    def _attend(self, kind, a, q, k, v, mask, kval, qval, window):
+    def _attend(self, kind, a, q, k, v, mask, kval, qval, window, split=False):
         """Attention of one layer: q [B, H, Sq, d], k / v [B, kv heads, Lk, d] -> [B, H, Sq, d]. SDPA kernels take the
         boolean mask; varlen kernels the real queries (qval [B, Sq]) and keys (kval [B, Lk]) of each row packed back to
         back: a row's real keys are its earlier tokens' and its own, in position order, ending at its last real query,
-        so causal attention aligned at the row's end (with the window) is the mask's attention."""
+        so causal attention aligned at the row's end (with the window) is the mask's attention. split: an SDPA call in
+        _split's parts even within the budgets (a state over 16k tokens)."""
         if kind in SDPA_KERNELS:
             from torch.nn.attention import SDPBackend, sdpa_kernel
             name = SDPA_KERNELS[kind]
             B, H, Sq, d = q.shape
             G, Lk = k.shape[1], k.shape[2]
-            if B * Sq * Lk > self.ATTN_PAIRS or B * Lk * H * d * k.element_size() * 2 > self.KV_BYTES:
+            if split or B * Sq * Lk > self.ATTN_PAIRS or B * Lk * H * d * k.element_size() * 2 > self.KV_BYTES:
                 with sdpa_kernel([getattr(SDPBackend, name)]) if name else nullcontext():
                     return self._split(a, q, k, v, mask)
             gqa = name is None
@@ -334,12 +335,12 @@ class Gemma4Forward:
             h = h + layer.post_per_layer_input_norm(layer.per_layer_projection(g))
         return h * layer.layer_scalar
 
-    def _pass(self, h, pli, pos, valid, ctx=None, grp=None, read=None, blk=None):
+    def _pass(self, h, pli, pos, valid, ctx=None, grp=None, read=None, blk=None, split=False):
         """One forward over token rows [B, S]: embeddings h [B, S, D], per-layer inputs pli [B, S, L, P] or None,
         positions pos [B, S], valid [B, S] (right padding), blk vision block ids or None. ctx: (kv, kpos) of earlier
         tokens, kv {own layer: (K, V) [G, kv heads, Lc, d]}, kpos {layer type: positions [G, Lc]}; row b continues
         ctx row grp[b]. read [B]: the index of each row's readout token, or None for a prefix part (it stops after the
-        keys and values of the last layer that has its own).
+        keys and values of the last layer that has its own). split: the global layers' attention in _split's parts.
         -> ({own layer: (K, V) of this pass's tokens}, final hidden state at `read` [B, D] or None). A readout pass
         keeps no keys and values ({}): nothing reads them, and ultra's of a 16k-token batch were 14 GB."""
         B, S = valid.shape
@@ -385,7 +386,7 @@ class Gemma4Forward:
                 sliced = True
             q = self._q(a, x, rope[t])
             o = self._attend(kinds[t], a, q, k, v, masks.get(t), kval.get(t), qval,
-                             self.window if t == "sliding_attention" else None)
+                             self.window if t == "sliding_attention" else None, split and t != "sliding_attention")
             h = self._rest(layer, h, o, pli[:, :, i] if pli is not None else None)
         if read is None:
             return new, None
@@ -457,11 +458,14 @@ class Gemma4Forward:
         after each part, layer by layer (_trim's keys)."""
         if len(seqs) == 1 and len(seqs[0]) > self.CHUNK:
             seq, keep = seqs[0], self.window - 1
+            # a state over 16k tokens: every global-layer call in parts, from its first part on (its buffers leave
+            # no room for the scores of a part over 14k keys in one call: 3.5 GB on ultra at 76k)
+            split = len(seq) > self.ATTN_PAIRS // self.CHUNK
             kv, bufs = {}, {}
             at = torch.arange(len(seq), device=self.lm.embed_tokens.weight.device)[None]
             for s0, s1 in self._parts(seq, len(seq)):
                 h, pli, pos, valid, blk, _ = self._rows([seq[s0:s1]], [s0], media, seqs)
-                new, _ = self._pass(h, pli, pos, valid, ctx=(kv, kpos) if kv else None, blk=blk)
+                new, _ = self._pass(h, pli, pos, valid, ctx=(kv, kpos) if kv else None, blk=blk, split=split)
                 for i in list(new):
                     k, v = new.pop(i)
                     if self.types[i] == "sliding_attention":
@@ -500,7 +504,8 @@ class Gemma4Forward:
                 h, pli, pos, valid, blk, lens = self._rows([p[P:] for p, (_, _, _, P) in zip(prompts, cur)],
                                                            [P for *_, P in cur], media, prompts)
                 grp = torch.tensor([b for b, *_ in cur], device=pos.device)
-                _, hid = self._pass(h, pli, pos, valid, ctx=ctx, grp=grp, read=lens - 1, blk=blk)
+                _, hid = self._pass(h, pli, pos, valid, ctx=ctx, grp=grp, read=lens - 1, blk=blk,
+                                    split=Lc > self.ATTN_PAIRS // self.CHUNK)
                 for (_, g, j, _), x in zip(cur, hid):
                     out[g][j] = x
             cur = [r] if r is not None else []
