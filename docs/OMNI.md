@@ -11,9 +11,9 @@ uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags
 basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000    # or Remek/basal-omni-1.0-mini
 ```
 
-- **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), and, since v2.1.0, `vllm`
-  (text only; faster, with prefix caching and FlashAttention). The `-FP8` checkpoints (mini, max, ultra) run on
-  `--mode vllm` only.
+- **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), since v2.1.0 `vllm` (text only;
+  faster, with prefix caching and FlashAttention) and, since 2.3, `fast` / `fast-nocompile` (text only; the CUDA
+  graph engine, below). The `-FP8` checkpoints (mini, max, ultra) run on `--mode vllm` only.
   With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max and the `-FP8` checkpoints) uses
   it; the others use their `CALIBRATION.json`.
 - **Repeatable answers with vLLM:** vLLM's numbers depend on what the server computed before (prefix cache,
@@ -36,8 +36,36 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
   the prompt alone.
 - **Code logits:** option codes are read in fp32 from the output head's input, with Gemma's final logit softcap
   applied in fp32. The model body runs in bf16.
-- **Not yet for Gemma 4:** `fast` (shared prefix, CUDA graphs), the engine's own `fp8` and `nvfp4` modes and SGLang.
-  FP8 weights are served through vLLM (the `-FP8` checkpoints). The rest come with a later basal-omni release.
+- **`fast` and `fast-nocompile` (basal 2.3, text):** the CUDA graph engine runs Gemma 4 through its own layer code
+  (`basal/gemma4_graph.py`, transformers' modules and weights) under the engine's packing, graphs and caches:
+  - **SOAM over sliding-window layers.** The packed row of a request and its two passes work as for every basal model
+    ([SOAM.md](SOAM.md)); in the sliding-window layers (window 512 on E4B, 1,024 on 12B and 31B) a branch token sees a
+    key only within the window of its own position, as in its prompt alone, so the window is a condition on positions
+    inside the trie mask.
+  - **Keys and values per layer type** (head size 256 in sliding, 512 in global layers; 12B / 31B: one projection for
+    keys and values in global layers). E4B's last 18 of 42 layers reuse the keys and values of earlier layers.
+  - **Readout rows only.** Those KV-shared layers, and the attention and MLP of the last layer with its own keys and
+    values, run at the answer positions only (they produce nothing a later token reads): same answers, ~40% less
+    compute per decision on E4B.
+  - **Attention kernel** (`--gemma-attn`): `math` (default), the kernel of `--mode eager`, uncompiled; `flex`,
+    FlexAttention with block masks (the 512-wide heads on 32 x 32 tiles); `fa3`, FlashAttention 3 in the sliding
+    layers' plain rows and flex elsewhere (Hopper). flex and fa3 run compiled in `--mode fast`.
+  - Text only: `--media on` needs `--mode eager`. Each captured CUDA graph keeps its own cuBLAS workspace, so the
+    engine sets `CUBLAS_WORKSPACE_CONFIG=:4096:2` for Gemma 4 unless you set it (1.1-max ran out of GPU memory in
+    warm-up with the default; the smaller workspace did not change its forward time).
+
+  Measured 2026-10-20 on one H100 against `--mode eager` of the same engine (the gate of the FP8 ports, as above;
+  dev v2, 10,606 decisions, one order; automated share at 1% on the calibration test split, each engine with its own
+  calibration fit, paired bootstrap; `basal-loadtest` at 16 in flight: one question over a ~1.5k-token state, and
+  five questions over 3k-10k-token states):
+
+  | model | agreement (all / at margin >= 0.2) | accuracy | ECE | automated at 1% | decisions/s, one question | questions/s, five over a long state |
+  |---|---|---|---|---|---|---|
+  | mini, `fast` (math) | 0.9984 / 0.9997 | -0.02 pt | +0.000 | 41.83% (eager 41.99%) | 15.8 (eager 10.0) | 7.9 (eager 1.6) |
+  | 1.1-max, `fast` (math) | 0.9992 / 0.9997 | +0.01 pt | -0.000 | 47.04% (eager 47.10%) | 3.8 (eager 4.8) | 2.0 (eager 0.7) |
+
+  On 1.1-max the math kernel (fp32 scores, without tensor cores) dominates single questions.
+- **Not yet for Gemma 4:** the engine's `nvfp4` mode and SGLang.
 
 ## GGUF (llama.cpp, Ollama) and MLX (text)
 

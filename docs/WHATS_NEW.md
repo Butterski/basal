@@ -1,5 +1,11 @@
 # What is new in basal 2.3 (not released yet)
 
+- **basal-omni in the CUDA graph engine** (`--mode fast`, `fast-nocompile`). Gemma 4 runs through the engine's own
+  layer code: SOAM's packed row and two passes over its sliding-window and global layers (the window is a condition on
+  positions inside the trie mask), key / value buffers per layer type, E4B's KV-shared layers and the last own-key
+  layer at the answer rows only, the fp32 readout with the softcap; `--gemma-attn math | flex | fa3` picks the
+  attention kernel. Text only. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+
 - **Faster preparation of large requests.** The prompt language is detected from the state once per request in task
   expansion and once in question preparation, not once per question: an English state was re-scanned for Polish
   diacritics for every question (a 40k-character `compress` request with 326 questions: 509 ms, now 2 ms; 50 task
