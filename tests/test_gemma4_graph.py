@@ -188,6 +188,7 @@ def test_long_state_keeps_the_window_of_sliding_layers():
     from basal.engine import StateCache
     m = tiny("e4b", torch.float32)
     be = Stub(m)
+    be.gemma.MARGIN = 0  # (256 by default: longer than these states)
     assert [k.shape[2] for k, _ in be._kv_new(12)] == [5, 5, 12, 5]  # own layers: sliding, sliding, global, sliding
     be.state_cache = StateCache(1 << 30)
     state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
@@ -201,6 +202,18 @@ def test_long_state_keeps_the_window_of_sliding_layers():
         assert torch.allclose(torch.tensor(r), e, atol=1e-6)
     s = be.state_cache.stats()
     assert s["entries"] == 1 and s["hits"] == 1
+
+
+def test_one_forward_below_the_threshold_equals_separate():
+    """States and prompts beyond the largest graph but within one_forward run as one forward (2.3.0's path)."""
+    m = tiny("e4b", torch.float32)
+    be = Stub(m)
+    be.one_forward = 1 << 20
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]
+    toks = [state + [20, 21, 30 + o, 31 - o] for o in range(2)]
+    res = be.run_shared([(toks, [[7, 8], [7, 8]]), ([state + [40, 41]], [[7, 9]])])
+    for r, e in zip(res[0] + res[1], separate(m, toks, [[7, 8], [7, 8]]) + separate(m, [state + [40, 41]], [[7, 9]])):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-6)
 
 
 def test_long_lane_equals_separate():
@@ -251,3 +264,25 @@ def test_modelopt_fp8_gemma4_loads_tied_and_runs(tmp_path):
     with torch.no_grad():
         ref = q.model(input_ids=ids).last_hidden_state[0, -1]
     assert torch.allclose(Gemma4Graph(q).forward(ids, ro=torch.tensor([[12]]))[0, 0], ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("kind", ["e4b", "31b"])
+def test_chunked_long_states_and_incremental_states_equal_separate(kind):
+    """Long prompts and roots in chunks over the keys / values before them (CHUNK 5, sliding layers keeping their
+    window only), and incremental states: a growing state runs only its new tokens over the cached state, an edited
+    one only after the common prefix. Every readout equals a separate forward of its prompt."""
+    from basal.engine import StateCache
+    m = tiny(kind, torch.float32)
+    be = Stub(m)
+    be.CHUNK, be.gemma.MARGIN = 5, 0
+    be.state_cache = StateCache(1 << 30)
+    be.state_cache.BLOCK = 4
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16, 17, 18]
+    lids = [[7, 8], [7, 8]]
+    for st in (state, state + [19, 20, 21, 22, 23, 24, 25], state[:9] + [26, 27, 28, 29, 30]):
+        toks = [st + [20, 21, 30 + o, 31 - o] for o in range(2)]
+        res = be.run_shared([(toks, lids, len(st)), ([st + [40, 41]], [[7, 9]])])
+        for r, e in zip(res[0] + res[1], separate(m, toks, lids) + separate(m, [st + [40, 41]], [[7, 9]])):
+            assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+    s = be.state_cache.stats()
+    assert s["prefix_hits"] == 2 and s["entries"] == 2  # the grown state replaced the first

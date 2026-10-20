@@ -1,5 +1,17 @@
 # What is new in basal 2.3.1 (not released yet)
 
+- **Incremental states** (`--mode fast` with `--state-cache-gb N`): a request whose state begins with a cached state - a
+  growing agent trace or chat history, or an edited one up to the edit - computes only its new tokens over the cached
+  keys and values, and the grown state replaces the old entry. Same answers as computing the whole state (fp32: every
+  top answer, max |dp| 9e-6; bf16: 1.000 at margin >= 0.2; mini, 1.1-max, basal-2.0-4.5B, edited traces included).
+  One H100, an agent loop growing to ~10k tokens: step 12 in 0.19 s instead of 0.39 s on basal-2.0-4.5B and 0.27 s
+  instead of 0.79 s on basal-omni-1.1-max (16 traces at once: 1.2-1.3x).
+- **Long states in chunks:** a state too long for one forward (half the free GPU memory after start-up) is prefilled in
+  2,048-token chunks over the keys and values before them, so basal-omni-1.0-ultra answers 76k- and 82k-token states on
+  one 80 GB H100 (2.3.0: out of memory beyond ~32k; 82k with 5 questions: 46 s), also while short requests are being
+  served; a forward that runs out of memory anyway is redone in chunks, and the server frees the GPU memory of a
+  failed request (before, the next requests failed too).
+
 - **Less GPU memory for basal-2.0 in the graph engine:** 8 MB cuBLAS workspaces per captured CUDA graph for every model
   (2.3.0: basal-omni only; `CUBLAS_WORKSPACE_CONFIG` unless you set it): 0.6-0.9 GB less GPU memory, 100 s faster
   start-up on basal-2.0-4.5B (452 s instead of 554 s on an H100), the same speed; dev v2 top answers as two runs of
