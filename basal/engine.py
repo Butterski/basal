@@ -1558,6 +1558,8 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
         kw["quantization"] = "fp8"
     if kv != "auto":
         kw["kv_cache_dtype"] = kv
+        if text.get("attention_k_eq_v"):  # Gemma 4 12B / 31B (values = keys): vLLM 0.31's FlashAttention with an FP8
+            kw["attention_backend"] = "TRITON_ATTN"  # cache fails at start-up (H100: "Expected strides ... got 0")
     if invariant:
         # batch-invariant kernels without the prefix cache: with it, a request's numbers depend on the states earlier
         # requests left in the cache (the 31B FP8 port, 2,000 decisions at 32 in flight, two runs: 96.9% the same top

@@ -30,6 +30,12 @@ def test_presets():
         vllm_args(TEXT, "nvfp4")
 
 
+def test_fp8_kv_cache_with_shared_keys_and_values():
+    k_eq_v = {"text_config": {"attention_k_eq_v": True}}
+    assert vllm_args(k_eq_v, "fp8-kv")[0] == {"kv_cache_dtype": "fp8", "attention_backend": "TRITON_ATTN"}
+    assert vllm_args(k_eq_v)[0] == {}
+
+
 def test_fp8_checkpoint_keeps_its_own_weights():
     assert "quantization" not in vllm_args(FP8_PORT, "fp8")[0]
     assert vllm_args(FP8_PORT, "fp8-kv")[0] == {"kv_cache_dtype": "fp8", "language_model_only": True}
