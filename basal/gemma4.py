@@ -34,6 +34,11 @@ def text_model(model):
     return getattr(model.model, "language_model", model.model)
 
 
+def is_gemma4(model):
+    """A loaded Gemma 4 model (basal-omni): model types gemma4, gemma4_text, gemma4_unified, ..."""
+    return str(getattr(model.config, "model_type", "")).startswith("gemma4")
+
+
 class Gemma4Forward:
     # memory bounds as in EagerBackend: prefix parts of at most CHUNK tokens; at most MAX_BATCH_TOKENS padded tokens and
     # ATTN_PAIRS query-key pairs (rows x query tokens x keys: the attention scores of the math kernel) per forward,

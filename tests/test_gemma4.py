@@ -12,6 +12,7 @@ from transformers import (Gemma4AudioConfig, Gemma4Config, Gemma4ForCausalLM, Ge
 
 from basal import engine
 from basal.engine import EagerBackend
+from basal import gemma4
 from basal.gemma4 import Gemma4Forward
 
 ROPE = {"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1000000.0},
@@ -71,6 +72,15 @@ def test_forward_equals_transformers(name, answer_rows):
         for t, h in zip(grp, hs):
             r = last_hidden(m, t)
             assert (h - r).abs().max() <= 1e-4 * r.abs().max(), (name, t)
+
+
+def test_helpers_for_other_backends():
+    """text_model and is_gemma4 are imported by the CUDA graph engine's Gemma 4 path (keep their names)."""
+    m = tiny("e4b")
+    assert gemma4.text_model(m) is m.model and gemma4.is_gemma4(m)
+    mm = tiny_mm(False, 2, 8)
+    assert gemma4.text_model(mm) is mm.model.language_model and gemma4.is_gemma4(mm)
+    assert not gemma4.is_gemma4(type("M", (), {"config": type("C", (), {"model_type": "llama"})()})())
 
 
 def test_kv_sharing_layout():
