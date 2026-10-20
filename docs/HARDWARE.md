@@ -269,9 +269,11 @@ comparable with the CUDA tables; between two runs on this machine latencies diff
 HTTP: `basal-loadtest` against `basal-serve --mode mlx` (default prompts of the tool, 32 concurrent clients).
 
 - **Compute-bound.** About 90% of the forward time is in the linear layers, which MLX runs at 10–12 TFLOPS in bf16 on
-  the M4 Max; bf16, fp16 and fp32 differ little, larger batches do not raise throughput, and `mx.compile` gave no
-  speed-up (so the `mlx` backend pads only to the longest prompt of a batch instead of to fixed shape buckets). Other
-  M-series chips were not measured in that run (an M5 Max is below); being compute-bound, latency should scale roughly with GPU core count and clock.
+  the M4 Max; on the M4 Max bf16, fp16 and fp32 differ little, larger batches do not raise throughput, and
+  `mx.compile` gave no speed-up (so the `mlx` backend pads only to the longest prompt of a batch instead of to fixed
+  shape buckets). The M5 chips below differ: bf16 is 3.4–5.5× faster than fp32 there, and latency does not scale with
+  the GPU core count across generations (the 20-core M5 Pro is 2.0–2.5× faster in bf16 than the 40-core M4 Max). Within
+  one generation it does: the M5 Max is 1.35–1.63× faster than the M5 Pro with twice the cores.
 - **8-bit weights** (`mlx-q8`, MLX affine, group 64, decoder layers only) cut the resident weights of the 4.5B from
   8.9 to 4.8 GB (the checkpoint is loaded lazily, so the bf16 copy is never held); 0–10% slower.
 - **4-bit weights** were tried and dropped: agreement fell to 0.86 on the 1.5B without any speed gain.
@@ -279,12 +281,40 @@ HTTP: `basal-loadtest` against `basal-serve --mode mlx` (default prompts of the 
   was measured back to back, the comparison below after a cool-down before every engine.
 - **Early exit** (`fast-exit`) and the `fp8` / `nvfp4` modes are CUDA-only.
 
+### Apple M5 Pro (basal-1.0)
+
+Measured by Kamil ([@kamilrosa](https://github.com/kamilrosa), [#7](https://github.com/rkinas/basal/issues/7)) with
+`basal-bench` on the **44 bundled examples**, like the M4 Max table above. MacBook Pro, Apple M5 Pro (Mac17,9, 20-core
+GPU, 64 GB), macOS 26.5.2, Python 3.12.15, torch 2.14.1 (MPS), MLX 0.32.3, mlx-lm 0.32.0; basal at commit `3fa2eea`,
+the merge of #4 (the same `mlx` backend as the M4 Max table); on mains power, automatic power mode, modes measured
+back to back. Agreement with `eager-fp32` (PyTorch MPS, fp32) on the same machine; GB: peak memory (MLX: allocator
+peak, MPS: memory held by the Metal driver).
+
+| model | mode | 2 orders (ms) | 1 order (ms) | dec/s | agreement | accuracy | GB |
+|---|---|---|---|---|---|---|---|
+| basal-1.0-4.5B | `eager-fp32` | 589.2 | 309.3 | 1.5 | reference | 0.795 | 22.9 |
+| | `mps` (bf16) | 123.0 | 103.3 | 7.6 | 1.000 | 0.795 | 10.1 |
+| | `mlx` (bf16) | **106.9** | **93.3** | **8.9** | 1.000 | 0.795 | 10.1 |
+| | `mlx-q8` | 127.6 | 102.3 | 7.7 | 0.977 | 0.773 | 6.0 |
+| basal-1.0-1.5B | `eager-fp32` | 204.2 | 109.1 | 4.5 | reference | 0.727 | 10.1 |
+| | `mps` (bf16) | 49.1 | 39.3 | 21.4 | 0.977 | 0.750 | 4.1 |
+| | `mlx` (bf16) | **37.6** | **33.8** | **26.3** | 0.977 | 0.750 | 4.0 |
+| | `mlx-q8` | 44.2 | 37.6 | 22.5 | 1.000 | 0.727 | 2.6 |
+
+Two more runs of `--modes mps mlx` for the 4.5B: `mlx` 108.8 / 109.4 ms, `mps` 122.7 / 124.4 ms (2 orders; spread
+below 2%).
+
+- **Half the GPU cores of the M4 Max, 2.0–2.5× faster in bf16** (2 orders: `mlx` 4.5B 106.9 vs 265.9 ms, 1.5B 37.6
+  vs 87.3 ms; `mps` and `mlx-q8` alike). `eager-fp32` is slightly slower than on the M4 Max (0.86–0.92×), so bf16 is
+  4.2–5.5× faster than fp32 here. A likely cause is the matrix hardware of the M5's GPU cores, which speeds up bf16
+  but not fp32 (not verified).
+- `mlx-q8` changes one decision of 44 on the 4.5B (agreement 0.977; 1.000 on the M4 Max).
+
 ### Apple M5 Max (basal-1.0 and basal-2.0)
 
-Measured by Greg Brzezinka with `basal-bench` on the **44 bundled examples**, like the M4 Max table above and the
-Apple M5 Pro numbers in [#7](https://github.com/rkinas/basal/issues/7). Apple M5 Max (Mac17,6, 40-core GPU, 128 GB),
-macOS 27.0.1, Python 3.12.2, torch 2.14.1 (MPS), MLX 0.32.4, mlx-lm 0.32.2; on mains power, automatic power mode,
-modes measured back to back. Agreement with `eager-fp32` (PyTorch MPS, fp32) on the same machine; GB: peak memory
+Measured by Greg Brzezinka with `basal-bench` on the **44 bundled examples**, like the M4 Max and M5 Pro tables above.
+Apple M5 Max (Mac17,6, 40-core GPU, 128 GB), macOS 27.0.1, Python 3.12.2, torch 2.14.1 (MPS), MLX 0.32.4, mlx-lm
+0.32.2; on mains power, automatic power mode, modes measured back to back. Agreement with `eager-fp32` (PyTorch MPS, fp32) on the same machine; GB: peak memory
 (MLX: allocator peak, MPS: memory held by the Metal driver).
 
 **basal-1.0**, at commit `3fa2eea`, the merge of #4: the same `mlx` backend as the M4 Max table above, and the commit of

@@ -46,6 +46,10 @@
   family (`--min-family`); with fewer in every family it passed without a test. It still passes, but now prints
   "0 families tested" for each such type on stderr and in the report. Reported by @agentGreg,
   [#19](https://github.com/rkinas/basal/issues/19).
+- **Apple M5 Pro in HARDWARE.md.** `basal-bench` tables for basal-1.0-4.5B and -1.5B on an M5 Pro (20-core GPU): bf16
+  is 2.0-2.5x faster than on the 40-core M4 Max and 4.2-5.5x faster than fp32, so two sentences written for the M4
+  Max (latency scaling with the core count, fp32 close to bf16) now say that they do not hold for the M5 chips.
+  Measured by Kamil (@kamilrosa), [#7](https://github.com/rkinas/basal/issues/7).
 
 # What is new in basal 2.3
 
