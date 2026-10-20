@@ -33,7 +33,7 @@ basal-2.0 (4.5B); replace the repository name for mini or max.
 <!-- engines -->
 | engine | `basal-serve` mode | hardware | what it is for | quick start |
 |---|---|---|---|---|
-| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon (`mps`); CPU (`eager`) | the primary server: packed requests (SOAM), compact batching, `--deterministic` | `basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off` |
+| **basal engine** (PyTorch) | `fast` (also `fast-nocompile`); `mps`; `eager --device mps\|cpu` | NVIDIA GPUs (sm80+); Apple Silicon (`mps`); CPU (`mps --device cpu`, `eager`) | the primary server: packed requests (SOAM), compact batching, `--deterministic` | `basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off` |
 | **basal engine, FP8** | `fp8` | NVIDIA sm89+ (Hopper, Blackwell) | the `-FP8` checkpoints in the same engine (bf16 weights are quantised on load) | `basal-serve --model Remek/basal-2.0-4.5B-FP8 --mode fp8 --template-prefix off` |
 | **vLLM** | `vllm` | NVIDIA GPUs | an alternative CUDA server for bf16 weights (the `-FP8` checkpoints are checked in `--mode fp8` only) | `basal-serve --model Remek/basal-2.0-4.5B --mode vllm` (extra `basal[vllm]`) |
 | **SGLang** | `sglang` | NVIDIA GPUs | an alternative CUDA server (measured with basal-1.5) | `basal-serve --model Remek/basal-2.0-4.5B --mode sglang` (own environment) |
@@ -247,6 +247,10 @@ basal-serve --model Remek/basal-2.0-4.5B --port 8000   # --mode tpu is the defau
 ### CPU
 
 `basal-serve --model Remek/basal-2.0-mini --mode eager --device cpu` runs everywhere, for tests and low volumes.
+Requests with several questions or option orders over one state (tasks, `--orders 2`) run faster with
+`--mode mps --device cpu`: the packed engine computes the state once, where `eager` computes it once per prompt
+(basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: 838 s -> 88 s on three task requests, 75 of 75 top answers the
+same; single questions take as long as in `eager`).
 
 ### Images and audio: basal-omni (experimental)
 

@@ -23,6 +23,20 @@
   (2.3.0: basal-omni only; `CUBLAS_WORKSPACE_CONFIG` unless you set it): 0.6-0.9 GB less GPU memory, 100 s faster
   start-up on basal-2.0-4.5B (452 s instead of 554 s on an H100), the same speed; dev v2 top answers as two runs of
   2.3.0 differ.
+- **Faster sentence splitting for `compress`.** With `unit: "sentence"`, the word before each sentence end was searched
+  from the start of the text (and retried at every position of a long token), O(n²) per document; it is now read
+  backwards from the sentence end (a 98k-character document: 13 s on the event loop before the 600-unit refusal, now
+  4 ms). Same units as before. Contributed by Milosz (@Butterski), [#16](https://github.com/rkinas/basal/pull/16).
+- **`--mode gguf` uses every physical core.** llama.cpp in process ran its own default of 4 threads; it now takes
+  PyTorch's thread count (the physical cores within the process's CPU affinity, or `OMP_NUM_THREADS` /
+  `torch.set_num_threads`). basal-2.0-mini Q8_0 on a 6-core CPU: 1.34× faster on 16 recorded requests, probabilities
+  bit-identical (each logit is still one dot product in one thread). Builds with every layer on Metal or CUDA are not
+  affected. Contributed by Milosz (@Butterski), [#20](https://github.com/rkinas/basal/pull/20).
+- **`--mode mps` on the CPU** (`--device cpu`, the default without Apple Silicon): the packed engine (SOAM) computes a
+  request's state once for all its questions and option orders, where `--mode eager` computes it once per prompt.
+  basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: three task requests (41, 24 and 10 prompts) 838 s -> 88 s, 9.6x,
+  the same top answer on 75 of 75 readouts (max |Δp| 4e-6); single questions as fast as in `eager`. `--device cuda` is
+  refused (that is `--mode fast`). Contributed by Milosz (@Butterski), [#26](https://github.com/rkinas/basal/pull/26).
 
 # What is new in basal 2.3
 
