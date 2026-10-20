@@ -991,7 +991,7 @@ class GraphBackend(EagerBackend):
         full = [t >= L for t in keep]
         bufs, cur = [], []  # per layer: (K, V) [1, kv heads, room, d]; tokens held (positions s - cur .. s - 1)
         for (H, D), t, f, pre in zip(self.kv_shapes, keep, full, prefix or [None] * len(keep)):
-            room = L if f else t + self.CHUNK
+            room = L if f else min(L, t + self.CHUNK)
             kb = torch.empty((1, H, room, D), dtype=dt, device=self.dev)
             vb = torch.empty((1, H, room, D), dtype=dt, device=self.dev)
             c = 0
