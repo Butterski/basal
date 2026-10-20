@@ -674,11 +674,15 @@ class GraphBackend(EagerBackend):
         return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1], self.TREE_ROWS[-1] * self.LENS[-1])
 
     def _kv_new(self, L):
-        """Fresh per-layer (K, V) buffers [1, kv heads, L, head size] (a root longer than the largest graph)."""
+        """Fresh per-layer (K, V) buffers [1, kv heads, L, head size] (a root longer than the largest graph). Gemma 4:
+        a sliding layer's last `window` tokens only (kv_lens: pass 2 reads no further back), so a long state takes a
+        fifth of the memory on 31B (0.9 MB per token: its 10k-token states ran out of memory on an 80 GB H100 next to
+        59 GB of weights, 20 Oct); the state cache keeps the same."""
         dt = self._dtype
-        return [(torch.empty((1, H, L, D), dtype=dt, device=self.dev), torch.empty((1, H, L, D), dtype=dt,
+        lens = self.gemma.kv_lens(L) if self.gemma is not None else [L] * len(self.kv_shapes)
+        return [(torch.empty((1, H, n, D), dtype=dt, device=self.dev), torch.empty((1, H, n, D), dtype=dt,
                                                                                   device=self.dev))
-                for H, D in self.kv_shapes]
+                for (H, D), n in zip(self.kv_shapes, lens)]
 
     @torch.no_grad()
     def _template_prefixes(self, model_dir):
@@ -1175,15 +1179,19 @@ class GraphBackend(EagerBackend):
             for r, e in enumerate(hits):
                 same.setdefault(id(e), (e, P[r], []))[2].append(r)
             for e, p, rs in same.values():
+                # a cached entry may hold the root's last tokens only (Gemma 4's sliding layers, _kv_new): they end
+                # where the root ends (a buffer of the graph) or the buffer does (a fresh one as long as the entry)
                 if len(rs) == 1:
                     for (kb, vb), (ke, ve) in zip(kv, e):
-                        kb[rs[0], :, :p].copy_(ke, non_blocking=True)
-                        vb[rs[0], :, :p].copy_(ve, non_blocking=True)
+                        z = min(p, kb.shape[2])
+                        kb[rs[0], :, z - ke.shape[1]: z].copy_(ke, non_blocking=True)
+                        vb[rs[0], :, z - ke.shape[1]: z].copy_(ve, non_blocking=True)
                     continue
                 ix = self._to_dev(torch.tensor(rs))
                 for (kb, vb), (ke, ve) in zip(kv, e):
-                    kb[:, :, :p].index_copy_(0, ix, ke[None].expand(len(rs), *ke.shape))
-                    vb[:, :, :p].index_copy_(0, ix, ve[None].expand(len(rs), *ve.shape))
+                    z = min(p, kb.shape[2])
+                    kb[:, :, z - ke.shape[1]: z].index_copy_(0, ix, ke[None].expand(len(rs), *ke.shape))
+                    vb[:, :, z - ke.shape[1]: z].index_copy_(0, ix, ve[None].expand(len(rs), *ve.shape))
         elif max(P) > self.PLAIN_LENS[-1]:
             # a root longer than the largest graph runs uncompiled, like a long single prompt: the compiled forward
             # recompiles for these fresh key / value buffers (44-109 s on the first long request on an H100), the

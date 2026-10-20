@@ -351,6 +351,11 @@ class Gemma4Graph:
     def _window(self, t):
         return self.window if t == "sliding_attention" else None
 
+    def kv_lens(self, L):
+        """Root tokens per own layer that pass 2 can read, for a root of L tokens: a sliding layer's last `window`
+        only, as pass 2's rows come after the root (positions from L on) and see window - 1 tokens back at most."""
+        return [min(L, self.window) if t == "sliding_attention" else L for t in self.types[: self.n_kv]]
+
     def _plain_masks(self, L, qpos, dev):
         """Boolean masks [b, 1, Lq, L] per layer type of plain causal rows (keys at positions 0..L-1) for queries at
         qpos [b, Lq] (all positions, or the readout rows)."""
@@ -362,15 +367,20 @@ class Gemma4Graph:
             out[t] = (causal & (k > qpos[:, :, None] - W) if W else causal)[:, None]
         return out
 
-    def _suffix_masks(self, mask, pos, P):
-        """Pass 2: the trie mask (additive, 0 = visible) [b, 1, S, P + S] -> boolean masks per layer type; sliding
-        layers also need the key within the window of the query's position (root keys at 0..P-1, branch keys at pos)."""
-        allow = mask >= 0
-        kpos = torch.cat([torch.arange(P, device=pos.device)[None].expand(pos.shape[0], P), pos], 1)
+    def _suffix_masks(self, mask, pos, lens):
+        """Pass 2: the trie mask (additive, 0 = visible) [b, 1, S, P + S] -> boolean masks per layer type over its
+        keys: the root's last lens[t] (all P, or a sliding layer's window of a long root: kv_lens) and the branches;
+        sliding layers also need the key within the window of the query's position (root keys at P - lens[t]..P - 1,
+        branch keys at pos)."""
+        P = mask.shape[-1] - pos.shape[1]
         out = {}
         for t in set(self.types):
-            W = self._window(t)
-            out[t] = allow & (kpos[:, None, :] > pos[:, :, None] - W)[:, None] if W else allow
+            o, W = P - lens[t], self._window(t)
+            allow = mask[..., o:] >= 0
+            if W:
+                kpos = torch.cat([torch.arange(o, P, device=pos.device)[None].expand(pos.shape[0], P - o), pos], 1)
+                allow = allow & (kpos[:, None, :] > pos[:, :, None] - W)[:, None]
+            out[t] = allow
         return out
 
     def _plain_block(self, L, t, dev):
@@ -431,10 +441,11 @@ class Gemma4Graph:
             return (p >= kv) & (p - kv < W) if W else p >= kv
         return self._dense_block(rop.shape[0], R, L, mod, rop.device)
 
-    def _tree_block(self, tm, pads, S, P, t, R=None):
+    def _tree_block(self, tm, pads, S, P, t, R=None, off=0):
         """Block mask of pass 2 (the TreeMask of basal/lean.py: root tokens per row, block of every branch token,
-        ancestors per block; lean.tree_mask_mod's mask) with the window on positions in sliding layers; R: the
-        readout rows only (pads["ro"])."""
+        ancestors per block; lean.tree_mask_mod's mask) with the window on positions in sliding layers; P keys before
+        the rows, the root's from position off on (a sliding layer's window of a long root: kv_lens); R: the readout
+        rows only (pads["ro"])."""
         W = self._window(t)
         sp, posp, rop = pads["s"], pads["pos"], pads.get("ro") if R is not None else None
 
@@ -443,9 +454,10 @@ class Gemma4Graph:
             j = kv - P                                  # the branch token a key is (negative: a root key)
             jj = j * (j >= 0)
             tree = (j >= 0) & ((tm.anc[b, sp[b, qq], sp[b, jj]] & (jj <= qq)) | (jj == qq))
-            ok = (kv < tm.pr[b]) | tree
+            rk = kv + off if off else kv                # a root key's position
+            ok = (rk < tm.pr[b]) | tree
             if W:
-                ok = ok & (posp[b, qq] - torch.where(j >= 0, posp[b, jj], kv) < W)
+                ok = ok & (posp[b, qq] - torch.where(j >= 0, posp[b, jj], rk) < W)
             return ok
         return self._dense_block(sp.shape[0], S if R is None else R, P + S, mod, sp.device)
 
@@ -505,28 +517,30 @@ class Gemma4Graph:
                 if ro is not None:
                     m_ro[t] = self._rows_block(pads["ro"], ro.shape[1], L, t)
             return m_all, m_ro
-        P = prefix[0][0].shape[2]
+        lens = {self.types[i]: prefix[i][0].shape[2] for i in range(self.n_kv)}  # root keys per layer type
+        P = max(lens.values())                     # the root (its global layers keep every key)
         if isinstance(mask, TreeMask):
             if math:
                 raise ValueError("the trie as a TreeMask needs the flex kernel in every layer type")
         elif math:
-            m_all = self._suffix_masks(mask, pos, P)
+            m_all = self._suffix_masks(mask, pos, lens)
             if ro is not None:
                 b, R = ro.shape
                 m_ro = {t: m.gather(2, ro[:, None, :, None].expand(b, 1, R, m.shape[-1])) for t, m in m_all.items()}
         if flex and not isinstance(mask, TreeMask):
             raise ValueError("the flex kernel takes the trie of pass 2 as a TreeMask")
         for t in flex:
-            m_all[t] = self._tree_block(mask, pads, L, P, t)
+            m_all[t] = self._tree_block(mask, pads, L, lens[t], t, off=P - lens[t])
             if ro is not None:
-                m_ro[t] = self._tree_block(mask, pads, L, P, t, ro.shape[1])
+                m_ro[t] = self._tree_block(mask, pads, L, lens[t], t, ro.shape[1], P - lens[t])
         return m_all, m_ro
 
     def _run(self, kernels, ids, pos, kv=None, prefix=None, mask=None, ro=None, between=None, pads=None,
              compiled=False, cu=None):
         """kernels: per layer type; ids / pos [b, L]; kv: per own layer (K, V) buffers [b, kv heads, L, d] that receive
-        this pass's keys and values (pass 1); prefix: per own layer (K, V) [b, kv heads, P, d] the rows continue (pass
-        2) with mask (the trie: additive, or a TreeMask for flex); ro [b, R]: readout positions -> final hidden states
+        this pass's keys and values (pass 1; a shorter buffer receives the last ones: kv_lens); prefix: per own layer
+        (K, V) [b, kv heads, P, d] (sliding layers: the last kv_lens of the root may be all there is) the rows continue
+        (pass 2) with mask (the trie: additive, or a TreeMask for flex); ro [b, R]: readout positions -> final hidden states
         [b, R, D] (None: every position, [b, L, D]); between(i) is called before layer i (the long lane); pads: the
         padded index tensors of the flex masks (_pads); compiled: the compiled layer functions. The masks of every
         query and of the readout rows are built here (_masks; the kernel follows the mask). A layer is two functions
@@ -546,8 +560,13 @@ class Gemma4Graph:
                 between(i)
             t = self.types[i]
             buf = kv[i] if kv is not None and self.own[i] else (None, None)
+            tail = buf[0] is not None and buf[0].shape[2] < ids.shape[1]  # a sliding layer's window (kv_lens)
             pre_kv = prefix[i] if prefix is not None and self.own[i] else (None, None)
-            q, k, v = pre(h, P, C, *cs[t], *buf, *pre_kv)
+            q, k, v = pre(h, P, C, *cs[t], *((None, None) if tail else buf), *pre_kv)
+            if tail:
+                n = buf[0].shape[2]
+                buf[0].copy_(k[:, :, -n:])
+                buf[1].copy_(v[:, :, -n:])
             if self.own[i]:
                 if i in self.store:
                     kept[t] = (k, v)
@@ -596,8 +615,9 @@ class Gemma4Graph:
 
     @torch.no_grad()
     def forward_suffix(self, ids, mask, pos, prefix, ro=None, compiled=True):
-        """Pass 2: rows [b, S] at positions pos over per own layer prefix (K, V) [b, kv heads, P, d], with the trie
-        mask (additive [b, 1, S, P + S], 0 = visible; a TreeMask for flex) -> [b, R, D] at ro [b, R] (None: all)."""
+        """Pass 2: rows [b, S] at positions pos over per own layer prefix (K, V) [b, kv heads, P, d] (or a sliding
+        layer's last kv_lens(P) of them), with the trie mask (additive [b, 1, S, P + S], 0 = visible; a TreeMask for
+        flex) -> [b, R, D] at ro [b, R] (None: all)."""
         from .lean import TreeMask
         kernels = self._kernels(dense=not isinstance(mask, TreeMask))
         return self._run(kernels, ids, pos, prefix=prefix, mask=mask, ro=ro, pads=self._pads(pos, mask, ro),
