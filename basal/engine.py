@@ -1546,9 +1546,10 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
     A checkpoint quantised already (ModelOpt FP8 / NVFP4: quantization_config) keeps its own weights. fast_prefill:
     models whose last layers reuse earlier layers' keys and values (Gemma 4 E2B / E4B: num_kv_shared_layers) run those
     layers at the answer position only during prefill (vLLM's kv_sharing_fast_prefill, YOCO); the generated token, the
-    only one basal reads, is the same, prompt log-probabilities would not be. media (--media on): the encoders of the
-    media the model takes, at most media.MAX_ITEMS items per prompt, no video; without, a model with image / audio
-    encoders is loaded without them (more memory for the KV cache)."""
+    only one basal reads, is the same, prompt log-probabilities would not be. media (--media on): at most
+    media.MAX_ITEMS items per prompt of the media the model takes, no video. A text-only server still loads the
+    encoders: without them (language_model_only) vLLM 0.31 picks another attention backend for Gemma 4 on an H100
+    (FlashAttention instead of Triton + FlashAttention) and keeps fewer KV tokens (mini: 911k instead of 978k)."""
     if preset not in VLLM_PRESETS:
         raise ValueError(f"unknown --vllm-preset {preset!r} (one of: {', '.join(VLLM_PRESETS)})")
     fp8, kv, invariant = VLLM_PRESETS[preset]
@@ -1572,8 +1573,6 @@ def vllm_args(cfg, preset="default", media=False, fast_prefill=False):
     if media:
         from .media import MAX_ITEMS, kinds_of
         kw["limit_mm_per_prompt"] = {k: MAX_ITEMS if k in kinds_of(cfg) else 0 for k in ("image", "audio", "video")}
-    elif cfg.get("vision_config") or cfg.get("audio_config"):
-        kw["language_model_only"] = True
     return kw, env
 
 

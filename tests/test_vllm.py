@@ -38,18 +38,16 @@ def test_fp8_kv_cache_with_shared_keys_and_values():
 
 def test_fp8_checkpoint_keeps_its_own_weights():
     assert "quantization" not in vllm_args(FP8_PORT, "fp8")[0]
-    assert vllm_args(FP8_PORT, "fp8-kv")[0] == {"kv_cache_dtype": "fp8", "language_model_only": True}
+    assert vllm_args(FP8_PORT, "fp8-kv")[0] == {"kv_cache_dtype": "fp8"}
     nested = {"text_config": {"quantization_config": {"quant_method": "fp8"}}}
     assert vllm_args(nested, "fp8") == ({}, {})
 
 
 def test_text_only_and_kv_shared_layers():
-    assert vllm_args(BF16)[0] == {"language_model_only": True}             # no image / audio encoders without media
-    assert "language_model_only" not in vllm_args(BF16, media=True)[0]
-    assert vllm_args(E4B)[0] == {"language_model_only": True}                       # --vllm-fast-prefill off
-    assert vllm_args(E4B, fast_prefill=True)[0] == {"kv_sharing_fast_prefill": True, "language_model_only": True}
-    assert vllm_args(E4B, "fp8-kv", fast_prefill=True)[0] == {"kv_cache_dtype": "fp8", "kv_sharing_fast_prefill": True,
-                                                              "language_model_only": True}
+    assert vllm_args(BF16)[0] == {}                                         # the encoders load (attention backend)
+    assert vllm_args(E4B)[0] == {}                                                  # --vllm-fast-prefill off
+    assert vllm_args(E4B, fast_prefill=True)[0] == {"kv_sharing_fast_prefill": True}
+    assert vllm_args(E4B, "fp8-kv", fast_prefill=True)[0] == {"kv_cache_dtype": "fp8", "kv_sharing_fast_prefill": True}
 
 
 @pytest.fixture
@@ -70,7 +68,7 @@ def test_backend_passes_the_preset_to_vllm(tmp_path, fake_vllm):
     (tmp_path / "config.json").write_text(json.dumps(E4B))
     be = VLLMBackend(tmp_path, max_len=16384, preset="fp8-kv", fast_prefill=True)
     assert be.preset == "fp8-kv" and "quantization" not in fake_vllm and fake_vllm["kv_cache_dtype"] == "fp8"
-    assert fake_vllm["kv_sharing_fast_prefill"] and fake_vllm["language_model_only"]
+    assert fake_vllm["kv_sharing_fast_prefill"] and "language_model_only" not in fake_vllm
     assert fake_vllm["enable_prefix_caching"] and fake_vllm["max_model_len"] == 16384 and fake_vllm["env"] is None
     fake_vllm.clear()
     VLLMBackend(tmp_path, preset="deterministic")
@@ -148,7 +146,7 @@ def test_media_needs_an_encoder(tmp_path, fake_vllm):
     (tmp_path / "config.json").write_text(json.dumps(E4B))
     (tmp_path / "processor_config.json").write_text(json.dumps({"audio_seq_length": 750, "audio_ms_per_token": 40}))
     be = VLLMBackend(tmp_path, media=True)
-    assert be.media_kinds == ("image", "audio") and be.max_audio_s == 30 and "language_model_only" not in fake_vllm
+    assert be.media_kinds == ("image", "audio") and be.max_audio_s == 30 and fake_vllm["limit_mm_per_prompt"]
 
 
 class Out:
