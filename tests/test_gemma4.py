@@ -110,6 +110,31 @@ def test_varlen_kernels_pack_rows(name, answer_rows, monkeypatch):
                 assert (h - r).abs().max() <= 1e-4 * r.abs().max(), (name, attn, t)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the memory-efficient kernel runs on CUDA")
+@pytest.mark.parametrize("hd", [256, 512])
+@pytest.mark.parametrize("kv_heads", [1, 8])
+def test_efficient_kernel_equals_math_on_one_mod_32(hd, kv_heads):
+    """pytorch/pytorch#191937 (torch <= 2.13): the memory-efficient kernel returns wrong attention for expanded
+    (zero-stride) keys / values at query lengths = 1 mod 32 with head size 256 / 512, as transformers passed max's one
+    global KV head. The forward's dispatch copies them per head; every row equals the math kernel there."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    g = Gemma4Forward.__new__(Gemma4Forward)
+    a = type("Attn", (), {"scaling": 1.0})()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    for L in (33, 289, 1857):
+        q = torch.nn.functional.normalize(torch.randn(1, 16, L, hd, device="cuda", generator=gen), dim=-1) * 8
+        k = torch.nn.functional.normalize(torch.randn(1, kv_heads, L, hd, device="cuda", generator=gen), dim=-1) * 8
+        v = torch.randn(1, kv_heads, L, hd, device="cuda", generator=gen)
+        i = torch.arange(L, device="cuda")
+        mask = (i[None, :] <= i[:, None])[None, None]
+        for dtype in (torch.float32, torch.bfloat16):
+            args = [x.to(dtype) for x in (q, k, v)]
+            with sdpa_kernel([SDPBackend.MATH]):  # "sdpa" is the math kernel only where EagerBackend made it so
+                ref = g._attend("sdpa", a, *args, mask, None, None, None)
+            got = g._attend("efficient", a, *args, mask, None, None, None)
+            assert (got.float() - ref.float()).abs().max() < (1e-4 if dtype == torch.float32 else 0.1), (hd, L, dtype)
+
+
 def test_flash_kernels_only_where_they_apply():
     g = Gemma4Forward(tiny("31b"), attn={"sliding_attention": "fa3", "full_attention": "efficient"})
     assert g._kernel("sliding_attention", torch.bfloat16, None) == "fa3"

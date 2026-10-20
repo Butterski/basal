@@ -27,9 +27,10 @@ sliding-window layers (head size 256) FlashAttention 3 is within bf16 rounding o
 the memory-efficient kernel at 4.4x; in the global layers (512) only the math and memory-efficient kernels run on
 Hopper (FA3 / FA4 take at most 256, cuDNN has no kernel, FlexAttention runs out of shared memory), the
 memory-efficient one 3x faster. The 7 Oct wrong attention was the memory-efficient kernel on keys and values with a
-zero-stride head dimension: transformers repeats max's one global KV head to 16 query heads as an expanded view, and
-the kernel then returned errors of 10-28 on outputs of 14-22 in every global layer (fp32 and bf16; the sliding layers,
-8 KV heads, were right). Here the keys and values are copied per head before that kernel.
+zero-stride head dimension (pytorch/pytorch#191937, torch <= 2.13: query lengths = 1 mod 32 at head size 256 / 512):
+transformers repeats max's one global KV head to 16 query heads as an expanded view, and on the 1,857-token prompt the
+kernel returned errors of 10-28 on outputs of 14-22 in every global layer (fp32 and bf16). Here the keys and values are
+copied per head before that kernel.
 """
 import os
 import sys
@@ -260,7 +261,8 @@ class Gemma4Forward:
             name = SDPA_KERNELS[kind]
             gqa = name is None
             if not gqa:  # the memory-efficient and cuDNN kernels take no enable_gqa: keys and values per query head,
-                # copied (an expanded, zero-stride view gives the memory-efficient kernel wrong keys: the 7 Oct case)
+                # copied (an expanded, zero-stride view gives the memory-efficient kernel wrong attention at query
+                # lengths = 1 mod 32: pytorch/pytorch#191937, the 7 Oct case)
                 k, v = (x.repeat_interleave(q.shape[1] // k.shape[1], 1) for x in (k, v))
             with sdpa_kernel([getattr(SDPBackend, name)]) if name else nullcontext():
                 return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=a.scaling, enable_gqa=gqa)
