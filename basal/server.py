@@ -658,7 +658,8 @@ class Server:
                                         prefix=getattr(a, "prefix_cache", "off") == "on",
                                         batches=getattr(a, "batches", "default"),
                                         readout_layer=getattr(a, "readout_layer", "off"),
-                                        template=getattr(a, "template_prefix", "off"))
+                                        template=getattr(a, "template_prefix", "off"),
+                                        gemma_attn=getattr(a, "gemma_attn", "auto"))
         self.tok = self.backend.tok
         self.states_cached = bool(getattr(a, "state_cache_gb", 0))  # --state-cache-gb: requests are cut at their state
         model = getattr(self.backend, "model", None)  # evidence head: needs the in-process HF model
@@ -1267,6 +1268,11 @@ def add_engine_args(ap):
     ap.add_argument("--attn", choices=list(ATTN), default="auto",
                     help="attention kernel of the CUDA graph engine: auto (FlashAttention 3 on Hopper when installed, "
                          "else 2; FP8 checkpoints and --mode fp8: 2), fa2 (torch SDPA), fa3, fa4 (flash-attn-4), cudnn")
+    ap.add_argument("--gemma-attn", dest="gemma_attn", choices=["auto", "math", "flex", "fa3"], default="auto",
+                    help="CUDA graph engine, Gemma 4 (basal-omni): the attention kernel of its layers: math (torch "
+                         "SDPA's math kernel, as --mode eager), flex (FlexAttention with block masks: sliding window, "
+                         "trie; --mode fast only), fa3 (FlashAttention 3 in the sliding-window layers' plain rows, "
+                         "flex elsewhere; Hopper). auto: math")
     ap.add_argument("--merge", choices=["auto", "on", "off"], default="auto",
                     help="CUDA graph engine: one q/k/v and one gate/up GEMM per layer (bf16: the same products; FP8 "
                          "checkpoints: the merged weights re-quantised per tensor). auto: on for bf16 weights, off for "
