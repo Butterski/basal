@@ -7,7 +7,8 @@
 A prompt is a string or a list of token ids (the server tokenizes once and passes ids).
 
 Backends:
-  EagerBackend      plain PyTorch forward (reference, any GPU, Apple MPS or CPU)
+  EagerBackend      plain PyTorch forward (reference, any GPU, Apple MPS or CPU); Gemma 4 (basal-omni) through
+                    basal/gemma4.py: the shared prefix of a group once, the last layers at the answer rows only
   GraphBackend      static shapes + CUDA graphs, optional torch.compile, shared prefix for the two option orders,
                     token-budget batching, optional torchao FP8 / NVFP4 quantisation
   ExitGraphBackend  GraphBackend split into graph segments at trained early-exit layers; exit policy per request
@@ -60,6 +61,22 @@ def default_device():
     return "cpu"
 
 
+def eager_sdpa_kernels(device):
+    """The SDPA kernels the eager backend's transformers forward may use: None (every enabled one), or, on CUDA with
+    torch older than 2.14.1, the enabled ones without the memory-efficient kernel. That kernel returns wrong attention
+    for keys / values expanded from one KV head (zero stride, transformers' repeat_kv with a mask) at query lengths
+    = 1 mod 32 (head size 256 / 512) or 1 mod 64 (128): pytorch/pytorch#191937, fixed in 2.14.1; basal-omni max was off
+    by 6.2 in code log-prob on a 1,857-token prompt (2026-10-07)."""
+    from torch.torch_version import TorchVersion
+    if torch.device(device).type != "cuda" or TorchVersion(torch.__version__) >= "2.14.1":
+        return None
+    from torch.nn.attention import SDPBackend
+    on = ((SDPBackend.FLASH_ATTENTION, torch.backends.cuda.flash_sdp_enabled()),
+          (SDPBackend.CUDNN_ATTENTION, torch.backends.cuda.cudnn_sdp_enabled()),
+          (SDPBackend.MATH, torch.backends.cuda.math_sdp_enabled()))
+    return [k for k, enabled in on if enabled]
+
+
 def _memo_media(proc):
     """The processor prepares a request's images / audio once for all its prompts (questions and option orders): at
     1,120 soft tokens the image preprocessing took ~2.8 s a call against 0.65 s for the forward (measured
@@ -85,8 +102,10 @@ class EagerBackend:
     # processor's media memo); class defaults, so a backend built without __init__ (tests) has them too
     lock = threading.Lock()
     media_lock = threading.Lock()
+    g4 = None  # basal/gemma4.py: the own Gemma 4 forward (shared prefixes, answer rows), None = the transformers forward
+    sdpa_kernels = None  # eager_sdpa_kernels: the SDPA kernels of the transformers forward (None: every enabled one)
 
-    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False):
+    def __init__(self, model_dir, dtype="bfloat16", device=None, media=False, forward=None):
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.padding_side = "left"
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
@@ -108,13 +127,24 @@ class EagerBackend:
             _memo_media(self.proc)
         self.lock, self.media_lock = threading.Lock(), threading.Lock()
         self.model = cls.from_pretrained(model_dir, dtype=getattr(torch, dtype)).to(dev).eval()
-        if str(getattr(self.model.config, "model_type", "")).startswith("gemma4"):
+        from .gemma4 import is_gemma4
+        if is_gemma4(self.model):
             # Gemma 4 (basal-omni): SDPA's memory-efficient kernel returned wrong attention on real activations in some
             # shapes (omni kernel check 2026-10-07); the math kernel equals eager attention there
             torch.backends.cuda.enable_flash_sdp(False)
             torch.backends.cuda.enable_mem_efficient_sdp(False)
             torch.backends.cuda.enable_cudnn_sdp(False)
+            # basal 2.3: the engine's own Gemma 4 forward (basal/gemma4.py) unless --eager-forward hf (or
+            # BASAL_EAGER_FORWARD=hf), the transformers forward of 2.2.0
+            import os
+            forward = forward or os.environ.get("BASAL_EAGER_FORWARD") or "basal"
+            if forward not in EAGER_FORWARDS:
+                raise ValueError(f"eager forward {forward!r} (one of {', '.join(EAGER_FORWARDS)})")
+            if forward == "basal":
+                from .gemma4 import Gemma4Forward
+                self.g4 = Gemma4Forward(self.model)
         self.dev = dev
+        self.sdpa_kernels = eager_sdpa_kernels(dev)
         self.prefill = PREFILL
         # option-code logits in fp32, as in GraphBackend._rows: the output head's input (the normalised last hidden
         # state) is taken from a hook and multiplied by the fp32 code rows; the model's final logit softcap (Gemma)
@@ -127,6 +157,14 @@ class EagerBackend:
 
     def _grab(self, module, inputs, output):
         self._head_in = inputs[0]
+
+    def _forward(self, **kw):
+        """The transformers forward on the SDPA kernels of sdpa_kernels."""
+        if self.sdpa_kernels is None:
+            return self.model(**kw)
+        from torch.nn.attention import sdpa_kernel
+        with sdpa_kernel(self.sdpa_kernels):
+            return self.model(**kw)
 
     def encode(self, prompts):
         """Strings -> token id lists (one batched tokenizer call); id lists pass through."""
@@ -145,6 +183,8 @@ class EagerBackend:
     MAX_BATCH_TOKENS = 16384
 
     def run(self, prompts, ids_list):
+        if self.g4 is not None:
+            return [r[0] for r in self.run_shared([([p], [x]) for p, x in zip(prompts, ids_list)])]
         with self.lock:
             return self._run(prompts, ids_list)
 
@@ -171,12 +211,18 @@ class EagerBackend:
                     raise ValueError(f"the prompt with its media is {ids.shape[0]} tokens, more than the {max_tokens} "
                                      "tokens of the context; send fewer or shorter media, or detail \"default\"")
                 encs.append((enc, int(ids.shape[0]), n_media))
+            if self.g4 is not None:  # the towers once, the prompts' shared prefix (template, media, state) once
+                with self.lock:
+                    feats = self.g4.media_features(encs[0][0])
+                    hid = self.g4.hidden([[e["input_ids"][0].tolist() for e, _, _ in encs]], media=feats)[0]
+                    ps = self._codes(torch.stack(hid).float(), ids_list)
+                return [(p, n, n_media) for p, (_, n, n_media) in zip(ps, encs)]
             out = []
             for (enc, n, n_media), lid in zip(encs, ids_list):
                 x = {k: (v.to(self.dev, self.model.dtype) if v.is_floating_point() else v.to(self.dev))
                      for k, v in enc.items() if isinstance(v, torch.Tensor)}
                 with self.lock:
-                    self.model(**x, logits_to_keep=1)
+                    self._forward(**x, logits_to_keep=1)
                     p = self._codes(self._head_in[:, -1, :].float(), [lid])[0]
                 out.append((p, n, n_media))
             return out
@@ -212,8 +258,8 @@ class EagerBackend:
         for s0 in range(0, ids.shape[1], self.CHUNK):
             part = ids[:, s0:s0 + self.CHUNK]
             pos = torch.arange(s0, s0 + part.shape[1], device=self.dev)[None]
-            cache = self.model(input_ids=part, position_ids=pos, past_key_values=cache, use_cache=True,
-                               logits_to_keep=1).past_key_values
+            cache = self._forward(input_ids=part, position_ids=pos, past_key_values=cache, use_cache=True,
+                                  logits_to_keep=1).past_key_values
         return self._codes(self._head_in[:, -1, :].float(), [lid])[0]
 
     def _batch(self, enc, ids_list):
@@ -224,7 +270,7 @@ class EagerBackend:
         # positions that skip the left pads, so a padded prompt reads as it does alone: on Gemma 4 (basal-omni) the
         # default arange moved a 44-option distribution by 0.12 with 1,458 pads (RoPE is relative only up to rounding)
         pos = (att.cumsum(-1) - 1).clamp_min(0)
-        self.model(input_ids=ids, attention_mask=att, position_ids=pos, logits_to_keep=1)
+        self._forward(input_ids=ids, attention_mask=att, position_ids=pos, logits_to_keep=1)
         return self._codes(self._head_in[:, -1, :].float(), ids_list)
 
     def _codes(self, h, ids_list):
@@ -240,13 +286,19 @@ class EagerBackend:
         return out
 
     def run_shared(self, groups, policy=None):
-        flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])
+        if self.g4 is not None:  # Gemma 4: the shared prefix of each group once (SOAM)
+            with self.lock, torch.no_grad():
+                hid = self.g4.hidden([self.encode(g[0]) for g in groups])
+                flat = self._codes(torch.stack([h for g in hid for h in g]).float(), [x for g in groups for x in g[1]])
+        else:
+            flat = self.run([p for g in groups for p in g[0]], [x for g in groups for x in g[1]])
         out, j = [], 0
         for g in groups:
             out.append(flat[j: j + len(g[0])]); j += len(g[0])
         return out
 
 
+EAGER_FORWARDS = ("basal", "hf")
 ATTN = ("auto", "fa2", "fa3", "fa4", "cudnn")
 _ATTN = {"impl": "fa2", "direct": None}  # the attention of causal forwards without a mask (process-wide)
 

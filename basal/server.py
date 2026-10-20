@@ -39,8 +39,8 @@ from pathlib import Path
 
 import torch
 
-from .engine import (ATTN, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend, MLXBackend,
-                     MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, attention_available, resolve,
+from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend,
+                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLMBackend, attention_available, resolve,
                      set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
@@ -640,7 +640,8 @@ class Server:
         if getattr(a, "media", "off") == "on" and kind != "eager":
             raise SystemExit("--media on needs --mode eager (the media path of basal-omni runs in the eager backend)")
         if kind == "eager":
-            self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on")
+            self.backend = EagerBackend(md, a.dtype, device=a.device, media=getattr(a, "media", "off") == "on",
+                                        forward=getattr(a, "eager_forward", None))
         elif kind == "exit":
             self.backend = ExitGraphBackend(md, a.dtype, quant, compile=comp, heads_dir=a.exit_heads,
                                             default_policy=a.early_exit, attn=attn, merge=merge_arg(a.merge))
@@ -1249,6 +1250,10 @@ def add_engine_args(ap):
     ap.add_argument("--media", choices=["off", "on"], default="off",
                     help="on: requests may carry images / audio (\"media\", basal/media.py); --mode eager and a model "
                          "with an image / audio encoder (basal-omni, Gemma 4)")
+    ap.add_argument("--eager-forward", dest="eager_forward", choices=list(EAGER_FORWARDS), default=None,
+                    help="--mode eager with a Gemma 4 model (basal-omni): basal = the engine's own forward (the shared "
+                         "prefix of a request once, the last layers at the answer rows only; default), hf = the "
+                         "transformers forward of basal 2.2.0 (default: BASAL_EAGER_FORWARD, else basal)")
     ap.add_argument("--device", default=None, choices=["cuda", "mps", "cpu"],
                     help="device for --mode eager (default: BASAL_DEVICE, else cuda, else Apple Silicon mps, else cpu)")
     ap.add_argument("--orders", type=orders_arg, default=None,
