@@ -97,6 +97,10 @@ benchmarking a GPU.
   documents. The `fast` mode is not affected.
 - `--log-decisions file.jsonl` appends one line per request with the served probabilities (a propensity log, for later
   use of production feedback).
+- **Status codes and load (2.3.1)**: an invalid request answers HTTP 422, the GPU out of memory 503 (retry later or
+  elsewhere) and any other server error 500, all with `{"error": "..."}`. `GET /health` returns the requests in flight
+  as `running` and `queued` (waiting for the engine); both 0 means idle, for a process manager that stops or restarts
+  the server. Definitions: [API.md](API.md).
 
 ## Inference on a JSONL file
 

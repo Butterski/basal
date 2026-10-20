@@ -18,7 +18,7 @@ import json
 import math
 import re
 
-from .prompt import lang_of
+from .prompt import lang_of, reads_request
 
 TASKS = ("classify", "verify", "compress", "extract")
 SEP = "::"  # expanded question names: <task question>::<part>
@@ -298,6 +298,7 @@ def parse_number(text, integer=False):
 
 # --- expansion ------------------------------------------------------------------------------------------------------
 
+@reads_request
 def expand(body, max_options=255):
     """A request with task questions -> (the request with only decision questions, plans to assemble the answers)."""
     state = body.get("state")

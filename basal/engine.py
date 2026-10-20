@@ -34,7 +34,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .prompt import PREFILL
+from .prompt import PREFILL, RequestError
 
 
 METADATA_FILES = ["*.json", "*.jinja", "*.model", "*.txt", "*.md", "Modelfile*"]  # tokenizer, template, calibration
@@ -186,7 +186,7 @@ class EagerBackend:
     # memory bounds of the eager forward (the attention scores are B x heads x L x L on the math kernel): prompts longer
     # than CHUNK run alone, prefilled CHUNK tokens at a time through the KV cache; shorter ones are batched by length up
     # to MAX_BATCH_TOKENS padded tokens (basal-omni 2026-10-08: concurrent long contracts made the server run out of
-    # GPU memory and answer HTTP 422)
+    # GPU memory and fail its requests)
     CHUNK = 2048
     MAX_BATCH_TOKENS = 16384
 
@@ -216,8 +216,9 @@ class EagerBackend:
                 n_media = int(sum((ids == t).sum() for t in (getattr(self.proc, "image_token_id", None),
                                                              getattr(self.proc, "audio_token_id", None)) if t is not None))
                 if max_tokens and ids.shape[0] > max_tokens:
-                    raise ValueError(f"the prompt with its media is {ids.shape[0]} tokens, more than the {max_tokens} "
-                                     "tokens of the context; send fewer or shorter media, or detail \"default\"")
+                    raise RequestError(f"the prompt with its media is {ids.shape[0]} tokens, more than the "
+                                       f"{max_tokens} tokens of the context; send fewer or shorter media, or detail "
+                                       "\"default\"")
                 encs.append((enc, int(ids.shape[0]), n_media))
             if self.g4 is not None:  # the towers once, the prompts' shared prefix (template, media, state) once
                 with self.lock:
@@ -2113,8 +2114,8 @@ class VLLMBackend:
             n = re.search(r"\(length (\d+)\) is longer than", str(e))
             if not n:
                 raise
-            raise ValueError(f"the prompt with its media is {n.group(1)} tokens, more than the {max_tokens or '?'} "
-                             "tokens of the context; send fewer or shorter media, or detail \"default\"") from None
+            raise RequestError(f"the prompt with its media is {n.group(1)} tokens, more than the {max_tokens or '?'} "
+                               "tokens of the context; send fewer or shorter media, or detail \"default\"") from None
         media_ids = {t for t in (getattr(self.tok, "image_token_id", None), getattr(self.tok, "audio_token_id", None))
                      if t is not None}
         return [(p, len(o.prompt_token_ids), sum(t in media_ids for t in o.prompt_token_ids)) for p, o in outs]
@@ -2450,7 +2451,7 @@ class GGUFBackend(GraphBackend):
         for k in sorted(range(len(units)), key=lambda k: len(units[k][0][0])):
             t, r = len(units[k][0][0]), len(units[k][1])
             if t > self.N_CTX:
-                raise ValueError(f"prompt too long for the GGUF backend: {t} tokens (max {self.N_CTX})")
+                raise RequestError(f"prompt too long for the GGUF backend: {t} tokens (max {self.N_CTX})")
             if cur and (n_tok + t > self.N_CTX or n_seq + r > self.N_SEQ):
                 out.append(cur); cur, n_tok, n_seq = [], 0, 0
             cur.append(k); n_tok += t; n_seq += r

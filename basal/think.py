@@ -35,7 +35,7 @@ import torch
 from . import server
 from .engine import resolve
 from .facts import inject as inject_facts
-from .prompt import PREFILL, render
+from .prompt import PREFILL, RequestError, render
 from .server import Server, act_answer, certified, check_calibration, temper, temperature, to_items
 from .tools import answer as tool_answer
 
@@ -206,7 +206,7 @@ class ThinkServer(Server):
     async def decide(self, body):
         mode = body.get("think", self.think)
         if mode not in ("off", "auto", "force"):
-            raise ValueError('think must be "off", "auto" or "force"')
+            raise RequestError('think must be "off", "auto" or "force"')
         out = await super().decide(body)
         if self.think == "off":
             return out
