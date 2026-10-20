@@ -474,8 +474,9 @@ the Llama-architecture models basal-1.5 and basal-2.0 only, and was measured wit
 cannot run are refused at start-up with a message naming what does not fit: the mini models (hidden size 1,536, 6 query
 heads per kv head) and basal-omni (Gemma 4) are not supported; the 11B max models pass the checks but have not been
 measured. ROCm only, bf16, tile configs tuned on the Radeon 8060S. **Every number in this section was measured by
-@kardysm** on the machine below; we have not reproduced them. The benchmark scripts and raw results are in the author's
-fork, [kardysm/basal#3](https://github.com/kardysm/basal/pull/3).
+@kardysm** on the machine below, except the last bullet (a second machine, measured by @piotrkowski); we have not
+reproduced them. The benchmark scripts and raw results are in the author's fork,
+[kardysm/basal#3](https://github.com/kardysm/basal/pull/3).
 
 One Ryzen AI Max+ PRO 395 (Radeon 8060S, gfx1151, 128 GB unified memory; Fedora 44, PyTorch 2.12 + ROCm 7.2),
 basal-1.5 (4.5B). On this iGPU a decision is compute-bound prefill (~9.2 GFLOP per token), and the stock kernels reach
@@ -501,6 +502,9 @@ Request matrix over HTTP, p50 (details, profile and method: [benchmarks/STRIX_HA
   136 → 144 ms for one question over a ≈100-token state, 1.27 s → **714 ms** at ≈2,000 tokens, 4.16 → **2.41 s** at
   ≈6,000 tokens (5.25 → **2.90 s** with 20 questions), 11.5 → **19.0/s** with 32 clients. Both agree with fp32 on 142 of
   144 decisions; the other two are one question that fp32 puts at 0.502 / 0.498.
+- **A second machine** ([@piotrkowski](https://github.com/piotrkowski)): basal-2.0 (4.5B) on a ROG Flow Z13 tablet
+  (same GPU, 32 GB, ~50 W) gives the same answers and a close speed-up (1.05–1.70×), 1.4–1.7× slower in both engines
+  ([details](benchmarks/STRIX_HALO.md#a-second-machine-basal-20-on-a-rog-flow-z13)).
 
 ## Google TPU (experimental, community-maintained)
 
