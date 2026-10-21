@@ -533,13 +533,14 @@ def _merge_attention(o1, l1, o2, l2):
     return (torch.where(w1 > 0, o1.float() * w1, 0.0) + torch.where(w2 > 0, o2.float() * w2, 0.0)).to(o1.dtype)
 
 
-def _block_plan(seg, parents, pad=16, waste=1.5):
+def _block_plan(seg, parents, waste=1.5):
     """The branch pass per trie block, without a trie mask: block b's queries see the tokens of its ancestor blocks
     below the root and its own earlier tokens, i.e. keys = (ancestors' tokens, b's tokens) with a causal mask aligned at
     the end. seg: block of every token below the root (0..; each block contiguous, flattened depth first), parents: the
     parent block of every block (-1 = the root); a slice of whole top-level subtrees works as well. -> [(queries
     [n, m], keys [n, k], mask bool [n, 1, m, k])]: token indices (len(seg) = padding) of blocks of similar shape
-    batched, padded to multiples of `pad`, at most `waste` x the real query-key pairs per batch."""
+    batched, padded to the batch's longest, at most `waste` x the real query-key pairs per batch (one block alone may
+    exceed it)."""
     N = len(seg)
     span = {}
     for i, s in enumerate(seg):
@@ -560,8 +561,8 @@ def _block_plan(seg, parents, pad=16, waste=1.5):
             if not cur or len(nxt) * m * k <= waste * sum(len(q) * (len(q) + len(an)) for q, an in nxt):
                 cur = nxt
                 continue
-        m = -(-max(len(q) for q, _ in cur) // pad) * pad
-        k = -(-max(len(q) + len(an) for q, an in cur) // pad) * pad
+        m = max(len(q) for q, _ in cur)
+        k = max(len(q) + len(an) for q, an in cur)
         qi = torch.full((len(cur), m), N, dtype=torch.long)
         ki = torch.full((len(cur), k), N, dtype=torch.long)
         mask = torch.zeros((len(cur), 1, m, k), dtype=torch.bool)
@@ -574,6 +575,15 @@ def _block_plan(seg, parents, pad=16, waste=1.5):
         plan.append((qi, ki, mask))
         cur = [it] if it is not None else []
     return plan
+
+
+def cascade_ok(cfg):
+    """The CPU branch pass of _cascade covers attention-only models without a sliding window (the Llama-based basal
+    models): every key a branch token sees is in the root or in its block's ancestors. Models with sliding-window or
+    linear-attention layers keep the dense pass over the transformers cache."""
+    cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
+    return set(getattr(cfg, "layer_types", None) or ["full_attention"]) == {"full_attention"} \
+        and not getattr(cfg, "sliding_window", None)
 
 
 def _branch_attention(q, k, v, scale, plan):
@@ -1775,7 +1785,7 @@ class GraphBackend(EagerBackend):
             if i < P:  # a prompt that ends inside the root (a duplicate of the shared prefix)
                 h[m] = out.last_hidden_state[0, i]
         rest = [m for m, i in enumerate(last) if i >= P]
-        if rest and self.dev.type == "cpu":
+        if rest and self.dev.type == "cpu" and cascade_ok(self.model.config):
             h2 = self._cascade(t[P:], pp[P:], [s - 1 for s in sg[P:]], [-1 if q <= 0 else q - 1 for q in par[1:]],
                                out.past_key_values)
         elif rest:
@@ -2178,11 +2188,19 @@ class MPSBackend(GraphBackend):
         self._wrows = {}
 
     def _oversize(self, pack, n):
-        """On the CPU the branch pass runs in parts over one root (_cascade): a unit is split only when its prompts
-        have no common root."""
-        if self.dev.type == "cpu":
-            return pack[4].count(-1) > 1
-        return GraphBackend._oversize(self, pack, n)
+        """On the CPU (cascade_ok models) the branch pass runs in parts of whole top-level subtrees over one root
+        (_cascade): a unit is split only when its prompts have no common root or one top-level subtree (a question with
+        its option orders, ...) holds more than BRANCH_TOKENS tokens; splitting then moves its shared block into the
+        root of the smaller units."""
+        if self.dev.type != "cpu" or not cascade_ok(self.model.config):
+            return GraphBackend._oversize(self, pack, n)
+        top, size = [], {}  # the top-level subtree of every block (block 0 = the root); its tokens
+        for b, p in enumerate(pack[4]):
+            top.append(b if p <= 0 else top[p])
+        for s in pack[2]:
+            if s > 0:
+                size[top[s]] = size.get(top[s], 0) + 1
+        return pack[4].count(-1) > 1 or max(size.values(), default=0) > self.BRANCH_TOKENS
 
     @torch.no_grad()
     def run(self, prompts, ids_list):

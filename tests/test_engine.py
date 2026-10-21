@@ -2,7 +2,7 @@
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from basal.engine import GraphBackend, MPSBackend
+from basal.engine import GraphBackend, MPSBackend, _block_plan, cascade_ok
 
 
 class Stub(GraphBackend):
@@ -142,6 +142,44 @@ def test_mps_cpu_branch_pass_cascade_root_once():
     assert len(out) == len(toks)
     for r, e, ids in zip(out, separate(m, toks, lids), lids):
         assert len(r) == len(ids) and torch.allclose(torch.tensor(r), e, atol=1e-5)
+
+
+def test_mps_cpu_cascade_large_question_split_and_padding_bound():
+    """A question whose own block (with its option orders) holds more than BRANCH_TOKENS tokens is split from the
+    others, so its shared block becomes a root and nothing is quadratic in a long branch; and _block_plan's batches,
+    padded to their longest block, stay within `waste` x the real query-key pairs (many one-token blocks next to one
+    long one)."""
+    torch.manual_seed(0)
+    m = LlamaForCausalLM(LlamaConfig(vocab_size=60, hidden_size=48, intermediate_size=64, num_hidden_layers=2,
+                                     num_attention_heads=12, num_key_value_heads=2, head_dim=8,
+                                     max_position_embeddings=256)).eval()
+    m.config._attn_implementation = "sdpa"
+    be = MPSStub(m)
+    be.LENS, be.BRANCH_TOKENS = [16], 24
+    state = [1, 5, 9, 11, 3, 4, 6, 12]
+    long_q = list(range(30, 58))  # 28 tokens: more than BRANCH_TOKENS in one block
+    toks = [state + long_q + [20 + o, 21 - o] for o in range(2)] + [state + [40 + q, 41] for q in range(3)]
+    lids = [[7, 8]] * len(toks)
+    units = be._units([(toks, lids)])
+    assert len(units) > 1 and all(pk[4].count(-1) == 1 for pk, *_ in units)
+    for r, e in zip(be.run_shared([(toks, lids)])[0], separate(m, toks, lids)):
+        assert torch.allclose(torch.tensor(r), e, atol=1e-5)
+    seg = [0] * 20 + list(range(1, 41))  # one 20-token block, then 40 one-token blocks under it
+    parents = [-1] + [0] * 40
+    plan = _block_plan(seg, parents)
+    real = 20 * 20 + 40 * 21  # query-key pairs: the long block causally, each short block over 20 ancestors + itself
+    padded = sum(qi.shape[0] * qi.shape[1] * ki.shape[1] for qi, ki, _ in plan)
+    assert sorted(i for qi, _, _ in plan for i in qi.flatten().tolist() if i < len(seg)) == list(range(len(seg)))
+    assert padded <= 1.5 * real
+
+
+def test_cascade_only_for_attention_only_models():
+    """Sliding-window and linear-attention layers need more than the root's keys / values and the block's ancestors:
+    those models keep the dense branch pass over the transformers cache."""
+    from transformers import Gemma4TextConfig, MistralConfig, Qwen3_5TextConfig
+    assert cascade_ok(LlamaConfig()) and cascade_ok(MistralConfig(sliding_window=None))
+    assert not cascade_ok(MistralConfig()) and not cascade_ok(Gemma4TextConfig())
+    assert not cascade_ok(Qwen3_5TextConfig())  # Gated DeltaNet (linear attention) and attention layers
 
 
 def test_row_only_readout_equals_full_softmax():
