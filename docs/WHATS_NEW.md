@@ -18,6 +18,12 @@
   one 80 GB H100 (2.3.0: out of memory beyond ~32k; 82k with 5 questions: 46 s), also while short requests are being
   served; a forward that runs out of memory anyway is redone in chunks, and the server frees the GPU memory of a
   failed request (before, the next requests failed too).
+- **Long states and busy servers in `--mode eager`:** basal-omni-1.0-ultra answers 32k- to 82k-token states in eager
+  mode too, on one 80 GB H100 (2.3.0: out of memory from 32k on; 82k with 5 questions: 99 s, also while 16 short
+  requests at a time are being served). Above 16k tokens the attention runs in smaller pieces; up to 16k nothing
+  changes (dev v2: the same probabilities, bit for bit, on mini, 1.1-max and ultra). Ultra in eager also serves 16
+  requests at a time now: 2.04 decisions per second without errors, where 2.3.0 failed 452 of 480 requests. It ran out
+  of memory holding keys and values nothing read, and a failed request kept its GPU memory until a garbage collection.
 
 - **Less GPU memory for basal-2.0 in the graph engine:** 8 MB cuBLAS workspaces per captured CUDA graph for every model
   (2.3.0: basal-omni only; `CUBLAS_WORKSPACE_CONFIG` unless you set it): 0.6-0.9 GB less GPU memory, 100 s faster

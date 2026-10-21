@@ -27,6 +27,7 @@ import json
 import os
 import re
 import threading
+import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1338,7 +1339,8 @@ class GraphBackend(EagerBackend):
                     return self._forward(self._to_dev(torch.tensor([t])), ro=self._to_dev(torch.tensor([[last[0]]])))[
                         0, [0] * len(last)]
                 return self._forward(self._to_dev(torch.tensor([t])))[0, last]
-            except torch.OutOfMemoryError:  # beyond what the estimate allowed for: in chunks after all
+            except torch.OutOfMemoryError as e:  # beyond what the estimate allowed for: in chunks after all
+                traceback.clear_frames(e.__traceback__)  # (the failed forward's tensors, held by the error until then)
                 torch.cuda.empty_cache()
                 self.one_forward = min(self.one_forward, n - 1)
                 return self._plain_hidden(packs, idx)
@@ -1475,8 +1477,9 @@ class GraphBackend(EagerBackend):
                     kv = self._kv_new(L)
                     ro = self._to_dev(torch.tensor([[L - 1]])) if self.gemma is not None else None
                     h1 = self._forward(self._to_dev(torch.tensor([packs[idx[0]][0][:L]])), kv, ro)
-                except torch.OutOfMemoryError:  # beyond what the estimate allowed for: in chunks after all
+                except torch.OutOfMemoryError as e:  # beyond what the estimate allowed for: in chunks after all
                     kv = None
+                    traceback.clear_frames(e.__traceback__)  # (the failed forward's tensors, held by the error)
                     torch.cuda.empty_cache()
                     self.one_forward = min(self.one_forward, L - 1)
                     return self._tree_hidden(packs, idx, keys, hits)
