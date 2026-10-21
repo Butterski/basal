@@ -825,6 +825,7 @@ class GraphBackend(EagerBackend):
         self._kv = [tuple(torch.zeros(n * H * D, dtype=dt, device=self.dev) for _ in "kv") for H, D in self.kv_shapes] \
             if self.shared else None
 
+    PASS2_POOL = 1 << 30  # Gemma 4: the most the pass-2 graphs over roots longer than LENS may add to the GPU memory
     KV_SHARE = 0.15  # Gemma 4: the most of the free GPU memory (after the weights) its key / value buffers may take
 
     def _fit_grid(self):
@@ -917,7 +918,7 @@ class GraphBackend(EagerBackend):
 
     def warm(self):
         """Capture every plain graph of the grid, and with `shared` the pass-2 graphs for roots up to the largest of
-        LENS."""
+        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx)."""
         if self.compact:  # plain graphs only for pass 1 of branched units (at most TREE_ROWS[-1] roots)
             for T in self.COMPACT_LENS:
                 self._graph_c(T)
@@ -936,6 +937,8 @@ class GraphBackend(EagerBackend):
                         for b in self.PREFIX_ROWS:
                             if b * S <= self.TOKEN_BUDGET:
                                 self._graph_sfx(b, S, L)
+            if self.gemma is not None:
+                self._warm_long_sfx()
         # beyond the largest graph the forwards run uncompiled; their first use sets up kernels and memory for long
         # shapes (3 s of the first long request on an H100), so a long prompt and a long branched unit run here once
         n = self.PLAIN_LENS[-1] + 64
@@ -945,6 +948,37 @@ class GraphBackend(EagerBackend):
             root = [self.tok.pad_token_id] * n
             self.run_shared([([root + [5]], [[10, 11]])] + ([([root + [5, 6], root + [6, 5]], [[10, 11], [10, 11]])]
                                                              if self.shared else []))
+            if self.gemma is not None and self.flex and self.shared:
+                self._warm_pass2(n)
+
+    def _warm_long_sfx(self):
+        """Gemma 4: pass-2 graphs over the roots of the plain graphs longer than LENS (states of 3k-8k tokens: the
+        questions of a multi-question request over them ran kernel by kernel, mini's GPU idle 11-13% of the time under
+        load, nsys 20 Oct), rows x root within TOKEN_BUDGET, while the graph pool grows by at most PASS2_POOL."""
+        r0 = torch.cuda.memory_reserved(self.dev) if self.dev.type == "cuda" else 0
+        for L in (x for x in self.PLAIN_LENS if x > self.LENS[-1]):
+            for b in (x for x in self.TREE_ROWS if x * L <= self.TOKEN_BUDGET):
+                for S in self.SUFFIX_LENS:
+                    if self.dev.type == "cuda" and torch.cuda.memory_reserved(self.dev) - r0 > self.PASS2_POOL:
+                        return
+                    self._graph_sfx(b, S, L)
+
+    def _warm_pass2(self, n):
+        """Gemma 4: pass 2 without a graph calls one compiled flex_attention, which compiles anew for each shape class
+        it has not seen (one row or several, fresh key / value buffers or the graphs', readout rows or all, a second
+        size of a dimension makes it dynamic): 1.8-2.4 s each, under the launch lock, the first time a class came up
+        under load (nsys, 20 Oct: 4-5 such stalls in the first multi-question run on mini and 1.1-max). The classes
+        run here once: branched units of five 64-token branches over a root beyond the largest graph (fresh buffers)
+        and over a root of the plain graphs (their buffers), one and two units per forward."""
+        pad = self.tok.pad_token_id
+
+        def unit(L):  # five branches of 64 tokens below an L-token root
+            return ([[pad] * L + [5 + k] + [7] * 63 for k in range(5)], [[10, 11]] * 5)
+        L = self.LENS[-1] + 64  # a root of the plain graphs (none on ultra, whose grid ends at LENS: _fit_grid)
+        if L <= self.PLAIN_LENS[-1] and 2 * self._bucket(L, self.PLAIN_LENS) <= self.TOKEN_BUDGET:
+            self.run_shared([unit(L)])
+            self.run_shared([unit(L), unit(L)])
+        self.run_shared([unit(n)])
 
     # -- helpers -------------------------------------------------------------------------------------------------
     def _bucket(self, n, xs):
@@ -1543,7 +1577,8 @@ class GraphBackend(EagerBackend):
                                          tokens=packs[idx[r]][0][: P[r]])
         S = next((x for x in sfx if n2 <= x), None)
         graph = None
-        if S and L <= self.LENS[-1] and b <= rows[-1]:  # a pass-2 graph, rows padded (stale buffer rows are masked)
+        # a pass-2 graph, rows padded (stale buffer rows are masked); Gemma 4: over the longer plain graphs' roots too
+        if S and (L <= self.LENS[-1] or self.gemma is not None) and b <= rows[-1]:
             Bc = self._bucket(b, rows)
             graph = self.graphs.get(("x", Bc, S, L))
         if graph is not None:

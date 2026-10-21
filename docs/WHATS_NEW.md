@@ -25,6 +25,15 @@
   requests at a time now: 2.04 decisions per second without errors, where 2.3.0 failed 452 of 480 requests. It ran out
   of memory holding keys and values nothing read, and a failed request kept its GPU memory until a garbage collection.
 
+- **Questions over long states: no first-use stalls, and faster** (`--mode fast`, basal-omni). The second pass (the
+  questions over a state) compiled its attention for a new shape class the first time one came up under load, 1.8-2.4
+  s with every request in flight waiting (4-5 times in a first run of five questions over 3k-10k-token states); the
+  classes are now compiled at start-up. Questions over 3.5k-8k-token states run as captured CUDA graphs instead of
+  kernel by kernel (at most 1 GB more GPU memory; 70 MB on mini). One H100, five questions over 3k-10k tokens: mini
+  21.9 -> 33.7 questions per second at 16 in flight in a first run, +5-6% at 1 and 32; 1.1-max 10.3 -> 11.8, +3-4%;
+  ultra, single questions and basal-2.0 as before (within run-to-run noise); dev v2 as two runs of 2.3.0 differ
+  (0.9994-1.0000 of top answers at margin >= 0.2). The server also keeps its start-up objects out of full garbage
+  collections (up to 1.4 s each by the end of start-up; one stalled a request for 2.9 s on basal-2.0-4.5B).
 - **Less GPU memory for basal-2.0 in the graph engine:** 8 MB cuBLAS workspaces per captured CUDA graph for every model
   (2.3.0: basal-omni only; `CUBLAS_WORKSPACE_CONFIG` unless you set it): 0.6-0.9 GB less GPU memory, 100 s faster
   start-up on basal-2.0-4.5B (452 s instead of 554 s on an H100), the same speed; dev v2 top answers as two runs of
