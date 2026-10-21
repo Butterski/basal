@@ -41,7 +41,8 @@ DATE_TXT = re.compile(r"\b(\d{1,2}) (" + "|".join(MONTHS) + r") (\d{4})(?: r\.)?
 DATE_NUM = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")
 DATE_ISO = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 DURATION = re.compile(r"\b(\d{1,3}) (dni|dnia|dzień|tygodni|tygodnie|tydzień|miesięcy|miesiące|miesiąc|lat|lata|rok)\b")
-DUR_WORD = re.compile(r"(?<!\d{4}[ \u00a0])\b(tydzień|tygodnia|miesiąc|miesiąca|rok|roku)\b")  # not "2025 roku"
+DUR_WORD = re.compile(r"\b(tydzień|tygodnia|miesiąc|miesiąca|rok|roku)\b")
+YEAR_BEFORE = re.compile(r"\d{4}(?:-\d{2}-\d{2})?\s+$")  # "2025 roku", "2025-03-03 roku": part of a date
 AGO = re.compile(r"\b(\d{1,3}) (dni|dzień) temu\b")
 TODAY = re.compile(r"\b(?:[Dd]ziś|[Dd]zisiaj)(?: jest| mamy|:)? ")
 AMOUNT = re.compile(r"(?<![\d,])\b(\d{1,3}(?:[  ]\d{3})+(?:,\d{2})?|\d+(?:,\d{2})?) zł\b")
@@ -138,6 +139,8 @@ def _durations(text):
         if (n, unit) not in out and not text[m.end():m.end() + 5].startswith(" temu"):
             out.append((n, unit))
     for m in DUR_WORD.finditer(text):  # "w terminie tygodnia", "miesiąca", "roku" = 1 unit
+        if YEAR_BEFORE.search(text[max(0, m.start() - 20):m.start()]):
+            continue
         unit = {"ty": "w", "mi": "m", "ro": "y"}[m.group(1)[:2]]
         if (1, unit) not in out:
             out.append((1, unit))

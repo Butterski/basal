@@ -433,6 +433,9 @@ def test_year_of_a_date_is_not_a_duration():                     # regression: "
     ls = facts("Gwarancja obowiązuje w terminie roku od 3 marca 2025 roku.")                  # a real "roku": kept
     assert "3 marca 2025 r. + 1 rok (kalendarzowo) = 3 marca 2026 r. (wtorek)" in ls
     assert any(" + 1 miesiąc " in x for x in facts("Wpłynęło 3 marca 2025 roku; odpowiedź w terminie miesiąca."))
+    for text in ("Doręczono 3 marca 2025  roku, termin 7 dni.", "Doręczono 3 marca 2025\nroku, termin 7 dni.",
+                 "Doręczono 3 marca 2025\troku, termin 7 dni.", "Doręczono 2025-03-03 roku, termin 7 dni."):
+        assert not any(" rok (kalendarzowo)" in x for x in facts(text)), text
 
 
 # VAT rate needs VAT context
