@@ -29,7 +29,7 @@ Money arithmetic, appended after the facts above, at most MAX_TOTAL lines in all
 import re
 from bisect import bisect_left
 from datetime import date, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 
 MONTHS = ["stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca", "lipca", "sierpnia", "września",
           "października", "listopada", "grudnia"]
@@ -162,7 +162,9 @@ UNIT_PL = {"d": ("dzień", "dni"), "w": ("tydzień", "tygodnie"), "m": ("miesią
 
 
 def _pl_amount(x):
-    q = x.quantize(Decimal("0.01"), ROUND_HALF_UP)
+    with localcontext() as c:  # long amounts (> 26 digits) would exceed the default precision of quantize
+        c.prec = 60
+        q = x.quantize(Decimal("0.01"), ROUND_HALF_UP)
     s = f"{q:,.2f}".replace(",", " ").replace(".", ",")
     return f"{s} zł"
 
@@ -172,7 +174,9 @@ def _dec(raw):
 
 
 def _q(x):
-    return x.quantize(Decimal("0.01"), ROUND_HALF_UP)
+    with localcontext() as c:
+        c.prec = 60
+        return x.quantize(Decimal("0.01"), ROUND_HALF_UP)
 
 
 def _pl_num(x):

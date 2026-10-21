@@ -441,6 +441,12 @@ COURT_FEE = ("Pozew o zapłatę 19 726,00 zł. Opłata: ponad 15 000 do 20 000 z
              "przedmiotu sporu, nie więcej niż 200 000 zł.")
 
 
+
+def test_very_long_amounts_do_not_crash_facts():                   # 27+ digits exceeded Decimal's default precision
+    for text in ("Faktura na 123.456.789.012.345.678.901.234.567,00 zł, VAT 23%.",
+                 "Faktura na 123 456 789 012 345 678 901 234 567 890,00 zł, VAT 23%."):
+        assert facts(text)
+
 def test_percentage_is_a_vat_rate_only_with_vat_in_its_sentence():   # regression: "5% wartości sporu" got ×1,05 lines
     assert facts(COURT_FEE) == []
     assert facts("Faktura na 4 877,00 zł. Odsetki wynoszą 13,5% w skali roku. Stopa referencyjna NBP: 5%.") == []
