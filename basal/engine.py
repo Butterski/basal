@@ -1815,7 +1815,10 @@ class GraphBackend(EagerBackend):
     # -- public calls --------------------------------------------------------------------------------------------
     streams = True  # run_shared(..., done=callback) reports every group as soon as its forwards are read out
     inflight = 2    # calls the server may run at once: one call's host work overlaps the other's forwards
-    _launch = threading.Lock()  # a forward's input copies, replay and readout are enqueued by one call at a time
+    # a forward's input copies, replay and readout are enqueued by one call at a time, all on the device's default
+    # stream (every thread's current stream; nothing here sets another), so the graphs' static inputs, the key / value
+    # buffer and the shared graph outputs (_shared_out) are reused only after the previous call's reads, in launch order
+    _launch = threading.Lock()
 
     @torch.no_grad()
     def run(self, prompts, ids_list):
