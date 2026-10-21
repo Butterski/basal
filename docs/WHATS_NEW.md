@@ -91,7 +91,9 @@
   ~1.5k tokens (unchanged path) 5.6% slower there with the card full. On an H100 with the kernel forced
   (`--attn fa2`): single questions +16% (basal-2.0-mini and 4.5B), five questions unchanged, 5.8-7.2 GB more GPU
   memory, the same top answer on every dev v2 decision with margin >= 0.2 ([SERVING.md](SERVING.md)); `auto` gave
-  bit-identical dev v2 answers there. Not yet measured on Blackwell. The start-up line names the compact kernel.
+  bit-identical dev v2 answers there. On a Blackwell RTX PRO 6000 (sm_120, no FlashAttention 3, so `auto` runs no
+  compact rows): single questions +18% (mini) and +13% (4.5B), five questions unchanged, the same top answer on 7,632
+  of 7,632 and 9,047 of 9,049 dev v2 decisions with margin >= 0.2. The start-up line names the compact kernel.
   Contributed by Milosz (@Butterski), [#29](https://github.com/rkinas/basal/pull/29).
 
 # What is new in basal 2.3
