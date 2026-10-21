@@ -436,6 +436,19 @@ def test_amounts_with_dot_thousands_separator():                 # regression: "
     assert facts("Faktura na 1 000,00 zł netto, VAT 23%.")[0].startswith("1 000,00 zł × 1,23")
 
 
+def test_year_of_a_date_is_not_a_duration():                     # regression: "2025 roku" added "+ 1 rok"
+    ls = facts("Doręczono 3 marca 2025 roku, termin 7 dni.")
+    assert "3 marca 2025 r. + 7 dni (kalendarzowo) = 10 marca 2025 r. (poniedziałek)" in ls
+    assert not any(" rok (kalendarzowo)" in x for x in ls), ls
+    assert not any(" rok (kalendarzowo)" in x for x in facts("Umowę zawarto 5 maja 2026 r. W 2025 roku nie było zmian."))
+    ls = facts("Gwarancja obowiązuje w terminie roku od 3 marca 2025 roku.")                  # a real "roku": kept
+    assert "3 marca 2025 r. + 1 rok (kalendarzowo) = 3 marca 2026 r. (wtorek)" in ls
+    assert any(" + 1 miesiąc " in x for x in facts("Wpłynęło 3 marca 2025 roku; odpowiedź w terminie miesiąca."))
+    for text in ("Doręczono 3 marca 2025  roku, termin 7 dni.", "Doręczono 3 marca 2025\nroku, termin 7 dni.",
+                 "Doręczono 3 marca 2025\troku, termin 7 dni.", "Doręczono 2025-03-03 roku, termin 7 dni."):
+        assert not any(" rok (kalendarzowo)" in x for x in facts(text)), text
+
+
 # VAT rate needs VAT context
 COURT_FEE = ("Pozew o zapłatę 19 726,00 zł. Opłata: ponad 15 000 do 20 000 zł — 1000 zł; ponad 20 000 zł — 5% wartości "
              "przedmiotu sporu, nie więcej niż 200 000 zł.")
