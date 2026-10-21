@@ -408,14 +408,39 @@ def _direct_attention(impl):
     return None
 
 
-def _varlen_attention(q, k, v, cu, scale, layer=0):
+def torch_varlen_available(dtype):
+    """None if torch's varlen attention (torch.nn.attention.varlen.varlen_attn: torch's built-in FlashAttention 2 on
+    packed sequences, with GQA) can run compact rows here, else why not."""
+    if not torch.cuda.is_available():
+        return "needs CUDA"
+    if torch.cuda.get_device_capability()[0] < 8:
+        return "needs an sm80+ GPU"
+    if dtype not in (torch.bfloat16, torch.float16):
+        return "needs bf16 / fp16 activations"
+    try:
+        from torch.nn.attention.varlen import varlen_attn
+    except ImportError:
+        return "needs torch with torch.nn.attention.varlen"
+    import inspect
+    if "enable_gqa" not in inspect.signature(varlen_attn).parameters:
+        return "this torch's varlen_attn has no enable_gqa"
+    return None
+
+
+def compact_refused(why):
+    return ("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper; Gemma 4: --gemma-attn fa3) or "
+            f"torch's varlen attention ({why})")
+
+
+def _varlen_attention(q, k, v, cu, scale, layer=0, impl="fa3"):
     """Causal attention of compact rows: [1, heads, T, d] in (prompts packed back to back, cu = their cumulative token
-    counts, int32, empty prompts at the end), [1, T, heads, d] out. FlashAttention 3's varlen kernel (a torch custom
-    op, so the compiled forward has no graph break): the same rows as the padded forward on an H100.
+    counts, int32, empty prompts at the end), [1, T, heads, d] out. impl (the backend's compact_kernel): "fa3" =
+    FlashAttention 3's varlen kernel, "torch varlen" = torch's varlen_attn (torch's FlashAttention 2, any sm80+ GPU);
+    both are torch custom ops, so the compiled forward has no graph break. FA3: the same rows as the padded forward on
+    an H100.
     With a template prefix cu = (cu_q, cu_k, gather, prefix): every prompt's keys / values are its template prefix's
     (prefix[layer] = (K, V) [prefix tokens, kv heads, d], computed at start-up) followed by its own; gather picks them
     from prefix + own tokens, and the queries (own tokens) attend bottom-right causally."""
-    import flash_attn_interface as fa3
     T = q.shape[2]
     k, v = k[0].transpose(0, 1), v[0].transpose(0, 1)
     if isinstance(cu, tuple):
@@ -425,21 +450,27 @@ def _varlen_attention(q, k, v, cu, scale, layer=0):
         v = torch.cat([pv, v]).index_select(0, gather)
     else:
         cu_k = cu
+    if impl == "torch varlen":
+        from torch.nn.attention.varlen import varlen_attn
+        return varlen_attn(q[0].transpose(0, 1), k, v, cu, cu_k, T, k.shape[0], scale=scale, window_size=(-1, 0),
+                           enable_gqa=True)[None]
+    import flash_attn_interface as fa3
     o = fa3.flash_attn_varlen_func(q[0].transpose(0, 1), k, v, cu, cu_k, T, k.shape[0], softmax_scale=scale,
                                    causal=True)
     return (o[0] if isinstance(o, (tuple, list)) else o)[None]
 
 
 def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None,
-                    basal_kv=None, basal_prefix=None, basal_cu=None, **kwargs):
+                    basal_kv=None, basal_prefix=None, basal_cu=None, basal_varlen="fa3", **kwargs):
     """torch SDPA with additions for the two-pass forward of branched units and for compact rows (the kwargs pass
     through the transformers model forward): basal_kv[layer] = (K, V) buffers that receive this layer's keys and
     values (the root pass), basal_prefix[layer] = (K, V) of a computed prefix that the queries also attend to (the
-    branch pass), basal_cu = cumulative token counts of prompts packed into one row (each attends to itself only).
+    branch pass), basal_cu = cumulative token counts of prompts packed into one row (each attends to itself only),
+    basal_varlen = the kernel of those rows (_varlen_attention's impl).
     A causal forward without a mask uses the kernel chosen by set_attention (--attn)."""
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
     if basal_cu is not None:
-        return _varlen_attention(query, key, value, basal_cu, scaling, module.layer_idx), None
+        return _varlen_attention(query, key, value, basal_cu, scaling, module.layer_idx, basal_varlen), None
     if basal_kv is not None:
         k, v = basal_kv[module.layer_idx]
         k.copy_(key); v.copy_(value)
@@ -623,6 +654,7 @@ class GraphBackend(EagerBackend):
                     + list(range(2048, 4096, 128)) + list(range(4096, 8192, 256)) + list(range(8192, 12289, 512)))
     COMPACT_SEQS = 32
     compact = False
+    compact_kernel = None  # with compact rows: "fa3" or "torch varlen" (_varlen_attention's impl, the start-up line)
     readout_layer = False  # --readout-layer on (with compact rows): the last layer's o_proj / MLP at the readouts only
     template = ()          # --template-prefix on (with compact rows): template prefixes computed at start-up
     prefix = False
@@ -646,6 +678,11 @@ class GraphBackend(EagerBackend):
         self.fp8_checkpoint = modelopt_fp8(model_dir)  # the -FP8 repositories: FP8 weights with static scales
         # likewise: the kernel of the causal forwards (--attn; auto keeps FlashAttention 2 for FP8 GEMMs)
         self.attn = set_attention(attn, fp8=self.fp8_checkpoint or quant == "fp8")
+        if batches == "compact" and self.attn != "fa3":  # refused before the weights are loaded
+            why = ("Gemma 4 needs --gemma-attn fa3" if gemma4_graph.is_gemma4_dir(model_dir)
+                   else torch_varlen_available(getattr(torch, dtype)))
+            if why:
+                raise ValueError(compact_refused(why))
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
         if self.fp8_checkpoint:
@@ -665,14 +702,17 @@ class GraphBackend(EagerBackend):
         self._wrows = {}
         if batches == "fine":
             self.BATCHES = self.FINE_BATCHES
-        # compact rows need FlashAttention 3's varlen kernel (Hopper); auto: compact where it runs. Gemma 4: with its
-        # fa3 kernels (FA3 varlen in the sliding layers, a flex block mask per prompt in the 512-wide global ones)
-        self.compact = batches in ("compact", "auto") and self.attn == "fa3" and self.dev.type == "cuda" \
-            and (self.gemma is None or self.gemma.kernels.get("sliding_attention") == "fa3"
-                 and self.gemma.kernels.get("full_attention") != "math")
+        # compact rows need a varlen kernel: FlashAttention 3's (Hopper; auto: compact where it runs; Gemma 4 with its
+        # fa3 kernels: FA3 varlen in the sliding layers, a flex block mask per prompt in the 512-wide global ones), or,
+        # with --batches compact on other GPUs, torch's varlen_attn (its FlashAttention 2, sm80+; Llama models)
+        fa3 = self.attn == "fa3" and (self.gemma is None or self.gemma.kernels.get("sliding_attention") == "fa3"
+                                      and self.gemma.kernels.get("full_attention") != "math")
+        why = torch_varlen_available(getattr(torch, dtype)) if self.gemma is None else "Gemma 4 needs --gemma-attn fa3"
+        torch_varlen = not fa3 and batches == "compact" and why is None
+        self.compact = batches in ("compact", "auto") and (fa3 or torch_varlen) and self.dev.type == "cuda"
+        self.compact_kernel = ("torch varlen" if torch_varlen else "fa3") if self.compact else None  # per backend
         if batches == "compact" and not self.compact:
-            raise ValueError("--batches compact needs FlashAttention 3 (--attn fa3 / auto on Hopper; Gemma 4: "
-                             "--gemma-attn fa3)")
+            raise ValueError(compact_refused(why))
         if self.compact and self.gemma is not None:  # its forward reads out at one row per prompt
             self.fwd_c, self.readout_layer = self.gemma.forward_compact, True
         elif self.compact:
@@ -955,14 +995,15 @@ class GraphBackend(EagerBackend):
         if cu_k is not None:
             cu = (cu, cu_k, gather, self.template_kv)
         if ro is None:
-            return m(input_ids=ids, position_ids=pos, use_cache=False, basal_cu=cu).last_hidden_state
+            return m(input_ids=ids, position_ids=pos, use_cache=False, basal_cu=cu,
+                     basal_varlen=self.compact_kernel).last_hidden_state
         from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
         h = m.embed_tokens(ids)
         pe = m.rotary_emb(h, position_ids=pos)
         layers = m.layers[: m.config.num_hidden_layers]
         for layer in layers[:-1]:
             h = layer(h, attention_mask=None, position_embeddings=pe, position_ids=pos, past_key_values=None,
-                      use_cache=False, basal_cu=cu)
+                      use_cache=False, basal_cu=cu, basal_varlen=self.compact_kernel)
         last, a = layers[-1], layers[-1].self_attn
         x = last.input_layernorm(h)
         if hasattr(a, "qkv_proj"):
@@ -971,7 +1012,8 @@ class GraphBackend(EagerBackend):
             q, k, v = a.q_proj(x), a.k_proj(x), a.v_proj(x)
         shape = (*x.shape[:-1], -1, a.head_dim)
         q, k = apply_rotary_pos_emb(q.view(shape).transpose(1, 2), k.view(shape).transpose(1, 2), *pe)
-        o = _varlen_attention(q, k, v.view(shape).transpose(1, 2), cu, a.scaling, a.layer_idx)[0, ro]  # [R, heads, d]
+        o = _varlen_attention(q, k, v.view(shape).transpose(1, 2), cu, a.scaling, a.layer_idx,
+                              self.compact_kernel)[0, ro]  # [R, heads, d]
         h = h[0, ro] + a.o_proj(o.reshape(o.shape[0], -1))
         h = h + last.mlp(last.post_attention_layernorm(h))
         return m.norm(h)

@@ -1446,9 +1446,10 @@ def add_engine_args(ap):
                          "to the state) once and run short requests over its cached keys and values")
     ap.add_argument("--batches", choices=["auto", "compact", "default", "fine"], default="auto",
                     help="CUDA graph engine: compact = single prompts packed back to back into one row (FlashAttention "
-                         "3 varlen, Hopper), no padding to graph lengths and row counts; default = rows padded to graph "
-                         "lengths; fine = more row counts (less padding of short batches, longer start-up); auto = "
-                         "compact where FlashAttention 3 runs, else default")
+                         "3 varlen on Hopper; elsewhere, sm80+, torch's varlen attention, Llama models), no padding to "
+                         "graph lengths and row counts; default = rows padded to graph lengths; fine = more row "
+                         "counts (less padding of short batches, longer start-up); auto = compact where FlashAttention "
+                         "3 runs, else default")
     ap.add_argument("--readout-layer", dest="readout_layer", choices=["auto", "on", "off"], default="off",
                     help="CUDA graph engine with compact rows, Llama models: the last decoder layer computes keys, values "
                          "and attention for every token and its o_proj and MLP at the readout positions only (auto: on; off by "
@@ -1586,8 +1587,10 @@ def main():
         from .think import ThinkServer
         srv = ThinkServer(a)
     attn = getattr(srv.backend, "attn", None)
-    print(f"basal: model {a.model} mode {a.mode}{f' attention {attn}' if attn else ''} ready in {time.time() - t0:.0f}s "
-          f"on port {a.port}", flush=True)
+    rows = getattr(srv.backend, "compact_kernel", None)  # compact rows: their kernel, and the template prefix with them
+    info = (f" attention {attn}" if attn else "") + (f" compact rows {rows}" if rows else "") \
+        + (" template prefix" if rows and getattr(srv.backend, "template", None) else "")
+    print(f"basal: model {a.model} mode {a.mode}{info} ready in {time.time() - t0:.0f}s on port {a.port}", flush=True)
 
     mcp = None
     if a.mcp == "on":
