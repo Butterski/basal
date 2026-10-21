@@ -117,7 +117,7 @@ def test_flex_with_lean_on_refused_before_loading(monkeypatch, tmp_path, entry):
     for module in (server_module, calibrate_module, think_module):
         monkeypatch.setattr(module, "resolve", lambda *_, **__: pytest.fail("must reject before loading a model"))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # e.g. an RTX 4060 Ti: CUDA, no FlashAttention 3
-    monkeypatch.setattr(server_module, "attention_available", lambda impl: None if impl == "fa2" else "no")
+    monkeypatch.setattr(server_module, "gemma_fast_kernels", lambda: None)  # and not sm_120: Gemma 4 has no fast
     args = ["--lean", "on", "--tree", "flex"]
     with pytest.raises(SystemExit, match="--tree flex runs with --lean pass2"):
         if entry == "serve":
