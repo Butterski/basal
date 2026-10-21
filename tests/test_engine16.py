@@ -10,11 +10,13 @@ from tests.test_engine import separate, tiny
 
 
 class Replay:
-    """Stand-in for a captured CUDA graph: replay() recomputes the output from the static inputs, in place."""
+    """Stand-in for a captured CUDA graph: replay() recomputes the output from the static inputs, in place. Its output
+    is the tensor the function returned at capture, as on the GPU: for Llama graphs a view of the buffer every graph
+    of its family writes (_shared_out)."""
 
     def __init__(self, fn, static):
         self.fn, self.static = fn, static
-        self.out = fn(*static).clone()
+        self.out = fn(*static)
 
     def replay(self):
         self.out.copy_(self.fn(*self.static))
@@ -159,6 +161,44 @@ def test_pass2_graphs():
     gs.append(([s + list(range(3, 30)), s + list(range(30, 3, -1))], [[7, 8], [7, 8]]))  # 27-token branches: no graph
     check(be, gs)
     assert used and all(k[2] in (8, 16) for k in used)
+
+
+def test_shared_graph_outputs_keep_every_readout():
+    """Llama graphs share one output buffer per family (plain / pass 2) and one pass-2 mask buffer: a unit read out
+    both inside its root (pass 1's buffer) and below it (a pass-2 graph's), in one call with plain prompts and other
+    units, still reads its own forward's values, and the captured graphs keep no output of their own."""
+    class Warm(Stub):
+        SUFFIX_LENS = [8, 16]
+    rnd = random.Random(6)
+    be = Warm(tiny())
+    be.warm()
+    used = []
+    for key, g in be.graphs.items():
+        if key[0] == "x":
+            g[0].replay = (lambda r, k: lambda: (used.append(k), Replay.replay(r)))(g[0], key)
+    s = [1] + [rnd.randrange(3, 50) for _ in range(12)]
+    q = prompt(rnd, s, 8)  # rows of 10 tokens below the root: a pass-2 graph of 16 that covers the root's 13
+    check(be, [([s, q + [10, 11], q + [11, 10]], [[7, 8], [10, 11], [10, 11]]),  # readouts in the root and below
+               ([prompt(rnd, s, 5)], [[7, 8, 9]])])
+    assert used == [("x", 1, 16, 16)] and ("tree", 1, 13) in be.replays
+    check(be, groups(rnd))
+    for fam in "px":
+        assert len({g[-1].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == fam}) == 1
+    assert len({g[2].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == "x"}) == 1
+
+
+def test_pass2_graphs_are_the_reachable_shapes():
+    """Pass-2 graphs (rows, root length) exist exactly for the batches pass 1 can form (_chunks; state-cached roots
+    are chunked the same way), and the key / value buffer holds the largest of those, not TREE_ROWS[-1] x LENS[-1]."""
+    be = GraphBackend.__new__(GraphBackend)  # the default grid
+    reach = set()
+    for L in be.LENS:
+        for n in range(1, be.TREE_ROWS[-1] + 1):
+            for idx in be._chunks([L] * n, be.PLAIN_LENS, [8] * n, be.TREE_ROWS[-1]):
+                reach.add((be._bucket(len(idx), be.TREE_ROWS), L))
+    assert {(b, L) for b in be.TREE_ROWS for L in be.LENS if be._pass2_ok(b, L)} == reach
+    assert be._kv_tokens() == max(be.TOKEN_BUDGET, be.PLAIN_LENS[-1], max(b * L for b, L in reach))
+    assert be._kv_tokens() < be.TREE_ROWS[-1] * be.LENS[-1]
 
 
 def test_layered_forward_is_the_forward():
