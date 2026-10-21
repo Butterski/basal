@@ -71,7 +71,8 @@ benchmarking a GPU.
     padding to bucket lengths or row counts. On other sm80+ GPUs `--batches compact` runs them through torch's varlen
     attention (Llama models; `auto` keeps them off there). basal-2.0-mini on an RTX 4060 Ti 16 GB, against
     `--batches default`: single questions 66.8 -> 109.4 decisions/s (template prefix on), the same top answer on 58
-    of 58 answers; the compact graphs take about 2.4 GB more GPU memory (13.4 -> 15.8 GB), and with the card full
+    of 58 answers; the compact graphs took 2.4 GB more GPU memory there (13.4 -> 15.8 GB, the card full; with room
+    they take about 6 GB for mini and 7 GB for the 4.5B, see below), and with the card full
     five questions over ~1.5k tokens (a path compact rows do not change) ran 5.6% slower. The same kernel on an H100,
     forced with `--attn fa2 --batches compact` (an H100 runs FlashAttention 3 otherwise; 16 clients, 2.3.1 check):
     single questions +16% for basal-2.0-mini (79.0 -> 91.7 decisions/s) and basal-2.0-4.5B (27.9 -> 32.3), five
@@ -80,7 +81,10 @@ benchmarking a GPU.
     9,064 changed). On a Blackwell RTX PRO 6000 (Server Edition, sm_120, torch 2.13, where `auto` runs no compact
     rows): single questions +18% for mini (49.0 -> 57.9) and +13% for 4.5B (17.0 -> 19.1), five questions unchanged,
     GPU memory +5.8 / +7.2 GB, start-up +31 / +112 s; dev v2 at margin >= 0.2: 7,632 / 7,632 (mini) and 9,047 /
-    9,049 (4.5B, template prefix off) kept their top answer.
+    9,049 (4.5B, template prefix off) kept their top answer. On an RTX 3090 (Ampere, sm_86; @krzysztofkaminski, #33):
+    +68% on short prompts and +20% / +18% (mini / 4.5B) on ~1.6k-token states, GPU memory +5.9 GB for mini, the
+    same top answer on 58 of 58; the 4.5B with compact rows runs out of memory at start-up on 24 GB (it starts with
+    `GraphBackend.TREE_ROWS = [1, 2, 4]`).
   - `--template-prefix on`: the chat template, system prompt and user header of every prompt language are computed
     once at start-up; compact rows run only their own tokens over them (off for basal-2.0 4.5B, see the quick start).
   - `--scheduler on`: requests longer than `--long-tokens` (2,048) wait in a backlog and join engine calls in

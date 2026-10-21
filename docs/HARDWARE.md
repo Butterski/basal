@@ -46,6 +46,7 @@ measurements):
 | Desktop with unified memory (DGX Spark GB10) | `fp8` | memory-bandwidth-bound; FP8 halves latency |
 | Batched high-throughput serving with vLLM | `vllm` + the `-FP8` checkpoint on Hopper / Ada, the `-NVFP4` checkpoint on Blackwell (RTX 50xx, RTX PRO 6000, B200, DGX Spark); see [QUANTIZATION](QUANTIZATION.md#basal-15-the-modelopt-checkpoints) | basal-1.0 NVFP4: 3.2× throughput on the DGX Spark, but −3 accuracy points; the basal-1.5 checkpoints' agreement and speed: FP8 agrees with the bf16 model on 0.979–0.989 of decisions; NVFP4 on 0.979 for max and 0.937 for basal-1.5 (−2.8 points); no NVFP4 for mini |
 | A100 and other GPUs without FP8 (not measured) | `fast` | the bf16 path runs on any sm80+ GPU |
+| RTX 3090 (Ampere, sm_86; measured by @krzysztofkaminski, [#33](https://github.com/rkinas/basal/issues/33)) | `fast` (bf16); `--batches compact` for basal-2.0-mini | basal-2.0-mini 13.4 ms per decision (one option order), 161.6 decisions/s with compact rows at 32 clients; basal-2.0 (4.5B) `fast` fits 24 GB from v2.3.1 (peak 23.1 GB); no `fp8` (torchao needs sm 8.9 or newer) |
 | Apple Silicon (M-series) | MLX port: `-MLX-8bit` (decisions as with bf16); `-MLX-fp4` for 8 GB Macs (about 1.4 accuracy points less on basal-1.5, 2.0 on max, 3.6 on mini: for mini prefer `-MLX-8bit` or GGUF); without MLX: `gguf` (a `-GGUF` file in process) or `mps` (PyTorch, evidence spans) | see [Apple Silicon](#apple-silicon) |
 
 With basal-1.0 models (which ship exit heads), add `--mode fast-exit` to let requests choose `"early_exit": "0.99"`

@@ -79,7 +79,8 @@ basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --por
   fast-nocompile` starts in seconds. On Hopper, FlashAttention 3 is used when its wheel is installed
   (`uv pip install flash_attn_3 --extra-index-url https://download.pytorch.org/whl/cu128`); compact batching and
   the template cache use it. On other GPUs, `--batches compact` runs them through torch's varlen attention (about
-  2.4 GB more GPU memory for mini; [SERVING.md](SERVING.md#serving-modes)).
+  6 GB more GPU memory for mini and 7 GB for the 4.5B where the card has room, 2.4 GB on a full 16 GB card;
+  [SERVING.md](SERVING.md#serving-modes)).
 - Other models: `--model Remek/basal-2.0-max` or `--model Remek/basal-2.0-mini`.
 - From a clone instead: `git clone https://github.com/rkinas/basal && cd basal && uv pip install -e ".[fp8]"`
   (after the torch line above).
