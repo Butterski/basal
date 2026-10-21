@@ -24,6 +24,11 @@
   changes (dev v2: the same probabilities, bit for bit, on mini, 1.1-max and ultra). Ultra in eager also serves 16
   requests at a time now: 2.04 decisions per second without errors, where 2.3.0 failed 452 of 480 requests. It ran out
   of memory holding keys and values nothing read, and a failed request kept its GPU memory until a garbage collection.
+- **Faster `--mode eager` for basal-2.0 and other non-Gemma models on CUDA:** no cuDNN attention in eager, as in the
+  fast engine. It built a new plan for every new prompt length (0.5 s a request on an H100). basal-2.0-4.5B: one
+  request at a time 52 ms instead of 591 ms (median), 16 at a time 7.35 instead of 4.95 decisions per second; dev v2
+  as served: the same top answer on 0.9998 of decisions at margin >= 0.2, accuracy 70.24 -> 70.29%. basal-omni
+  (Gemma 4) ran without it already.
 
 - **Questions over long states: no first-use stalls, and faster** (`--mode fast`, basal-omni). The second pass (the
   questions over a state) compiled its attention for a new shape class the first time one came up under load, 1.8-2.4
