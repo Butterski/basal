@@ -68,7 +68,11 @@ benchmarking a GPU.
 - **Engine v2.0.0 items** (bf16 weights in `--mode fast` on Hopper with FlashAttention 3; each item has a flag,
   `auto` = on):
   - `--batches compact`: single prompts packed back to back into one row (FA3 varlen), graphs per token count, no
-    padding to bucket lengths or row counts.
+    padding to bucket lengths or row counts. On other sm80+ GPUs `--batches compact` runs them through torch's varlen
+    attention (Llama models; `auto` keeps them off there). basal-2.0-mini on an RTX 4060 Ti 16 GB, against
+    `--batches default`: single questions 66.8 -> 109.4 decisions/s (template prefix on), the same top answer on 58
+    of 58 answers; the compact graphs take about 2.4 GB more GPU memory (13.4 -> 15.8 GB), and with the card full
+    five questions over ~1.5k tokens (a path compact rows do not change) ran 5.6% slower.
   - `--template-prefix on`: the chat template, system prompt and user header of every prompt language are computed
     once at start-up; compact rows run only their own tokens over them (off for basal-2.0 4.5B, see the quick start).
   - `--scheduler on`: requests longer than `--long-tokens` (2,048) wait in a backlog and join engine calls in
