@@ -8,7 +8,7 @@
   basal-2.0-mini 12.7 -> 10.0 GB (compact rows 18.7 -> 17.6 GB), basal-2.0-4.5B 24.1 -> 20.5 GB of the card's 24.6;
   every probability bit-identical (420 readouts per model and batching mode), the same decisions per second (128.7 /
   128.4 single questions, 53.4 / 54.5 questions per second five at a time over 1.5k-token states) and start-up time.
-  Contributed by Milosz (@Butterski).
+  Contributed by Milosz (@Butterski), [#35](https://github.com/rkinas/basal/pull/35).
 
 # What is new in basal 2.3.1
 
