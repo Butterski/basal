@@ -425,10 +425,27 @@ def test_vat_line_skips_exchange_rates():                         # regression: 
     assert facts("Cena 4,31 zł netto, VAT 23%.")[0].startswith("4,31 zł × 1,23")    # a price, not a rate: kept
 
 
+def test_amounts_with_dot_thousands_separator():                 # regression: "10.000,00 zł" was read as "0,00 zł"
+    assert facts("Faktura na 10.000,00 zł, VAT 23%.") == [
+        "10 000,00 zł × 1,23 = 12 300,00 zł; 10 000,00 zł ÷ 1,23 = 8 130,08 zł"]
+    assert facts("Próg 1.500 zł, zamówienie 1 200 zł.") == ["1 500,00 zł > 1 200,00 zł"]   # was "500,00 zł < 1 200,00 zł"
+    assert facts("Kwota 1.234.567,89 PLN brutto, VAT 23%.") == ["1 234 567,89 zł brutto ÷ 1,23 = 1 003 713,73 zł netto"]
+    for s in ("Termin 01.05.2026, opłata 1.5 zł, VAT 23%.", "Wersja 2.25 zł, VAT 23%."):   # a date, a decimal: no amount
+        assert not any(" zł × " in x or " zł ÷ " in x for x in facts(s)), s
+    assert facts("Opłata 1500 zł, VAT 8%.")[0].startswith("1 500,00 zł × 1,08")          # unchanged forms
+    assert facts("Faktura na 1 000,00 zł netto, VAT 23%.")[0].startswith("1 000,00 zł × 1,23")
+
+
 # VAT rate needs VAT context
 COURT_FEE = ("Pozew o zapłatę 19 726,00 zł. Opłata: ponad 15 000 do 20 000 zł — 1000 zł; ponad 20 000 zł — 5% wartości "
              "przedmiotu sporu, nie więcej niż 200 000 zł.")
 
+
+
+def test_very_long_amounts_do_not_crash_facts():                   # 27+ digits exceeded Decimal's default precision
+    for text in ("Faktura na 123.456.789.012.345.678.901.234.567,00 zł, VAT 23%.",
+                 "Faktura na 123 456 789 012 345 678 901 234 567 890,00 zł, VAT 23%."):
+        assert facts(text)
 
 def test_percentage_is_a_vat_rate_only_with_vat_in_its_sentence():   # regression: "5% wartości sporu" got ×1,05 lines
     assert facts(COURT_FEE) == []

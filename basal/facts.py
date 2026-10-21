@@ -29,7 +29,7 @@ Money arithmetic, appended after the facts above, at most MAX_TOTAL lines in all
 import re
 from bisect import bisect_left
 from datetime import date, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 
 MONTHS = ["stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca", "lipca", "sierpnia", "września",
           "października", "listopada", "grudnia"]
@@ -44,14 +44,15 @@ DURATION = re.compile(r"\b(\d{1,3}) (dni|dnia|dzień|tygodni|tygodnie|tydzień|m
 DUR_WORD = re.compile(r"\b(tydzień|tygodnia|miesiąc|miesiąca|rok|roku)\b")
 AGO = re.compile(r"\b(\d{1,3}) (dni|dzień) temu\b")
 TODAY = re.compile(r"\b(?:[Dd]ziś|[Dd]zisiaj)(?: jest| mamy|:)? ")
-AMOUNT = re.compile(r"(?<![\d,])\b(\d{1,3}(?:[  ]\d{3})+(?:,\d{2})?|\d+(?:,\d{2})?) zł\b")
+AMOUNT = re.compile(r"(?<![\d,.])\b(\d{1,3}(?:[  ]\d{3})+(?:,\d{2})?|\d{1,3}(?:\.\d{3})+(?:,\d{2})?|\d+(?:,\d{2})?) zł\b")
 VAT = re.compile(r"(?<![\d,.])\b(23|8|5) ?%")
 VAT_CTX = re.compile(r"\bVAT\b|\bpodat\w* od towarów")
 
 # money arithmetic
 MAX_TOTAL, MAX_COMPARE, MAX_PLAIN, MAX_EURO = 12, 6, 3, 3
 AMT = r"\d{1,3}(?:[ \u00a0]\d{3})*(?:,\d{2})?"
-STATED = re.compile(r"(?<![\d,])\b(\d{1,3}(?:[ \u00a0]\d{3})+(?:,\d{2})?|\d+(?:,\d{2})?)[ \u00a0]?(?:zł|PLN)\b")
+STATED = re.compile(r"(?<![\d,.])\b(\d{1,3}(?:[ \u00a0]\d{3})+(?:,\d{2})?|\d{1,3}(?:\.\d{3})+(?:,\d{2})?|\d+(?:,\d{2})?)"
+                    r"[ \u00a0]?(?:zł|PLN)\b")
 EURO_AMT = r"(?<![\d,])\b(\d{1,3}(?:[ \u00a0]\d{3})*(?:,\d{1,2})?)[ \u00a0]?(?:euro\b|EUR\b|€)"
 EURO = re.compile(EURO_AMT)
 RATE = r"(\d{1,2},\d{2,4})[ \u00a0]?(?:zł|PLN)\b"
@@ -161,17 +162,21 @@ UNIT_PL = {"d": ("dzień", "dni"), "w": ("tydzień", "tygodnie"), "m": ("miesią
 
 
 def _pl_amount(x):
-    q = x.quantize(Decimal("0.01"), ROUND_HALF_UP)
+    with localcontext() as c:  # long amounts (> 26 digits) would exceed the default precision of quantize
+        c.prec = 60
+        q = x.quantize(Decimal("0.01"), ROUND_HALF_UP)
     s = f"{q:,.2f}".replace(",", " ").replace(".", ",")
     return f"{s} zł"
 
 
 def _dec(raw):
-    return Decimal(raw.replace(" ", "").replace("\u00a0", "").replace(",", "."))
+    return Decimal(raw.replace(" ", "").replace("\u00a0", "").replace(".", "").replace(",", "."))
 
 
 def _q(x):
-    return x.quantize(Decimal("0.01"), ROUND_HALF_UP)
+    with localcontext() as c:
+        c.prec = 60
+        return x.quantize(Decimal("0.01"), ROUND_HALF_UP)
 
 
 def _pl_num(x):
@@ -421,7 +426,7 @@ def facts(text):
     covered = set()
     rate_at = {p for p, _ in _rates(text)[0]}  # an exchange rate is not an amount to put VAT on
     for raw in [m.group(1) for m in AMOUNT.finditer(text) if m.start() not in rate_at][:MAX_AMOUNTS]:
-        x = Decimal(raw.replace(" ", "").replace(" ", "").replace(",", "."))
+        x = _dec(raw)
         for r in rates:
             k = 1 + Decimal(r) / 100
             kk = str(k).replace(".", ",")
