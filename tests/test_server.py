@@ -425,6 +425,16 @@ def test_vat_line_skips_exchange_rates():                         # regression: 
     assert facts("Cena 4,31 zł netto, VAT 23%.")[0].startswith("4,31 zł × 1,23")    # a price, not a rate: kept
 
 
+def test_year_of_a_date_is_not_a_duration():                     # regression: "2025 roku" added "+ 1 rok"
+    ls = facts("Doręczono 3 marca 2025 roku, termin 7 dni.")
+    assert "3 marca 2025 r. + 7 dni (kalendarzowo) = 10 marca 2025 r. (poniedziałek)" in ls
+    assert not any(" rok (kalendarzowo)" in x for x in ls), ls
+    assert not any(" rok (kalendarzowo)" in x for x in facts("Umowę zawarto 5 maja 2026 r. W 2025 roku nie było zmian."))
+    ls = facts("Gwarancja obowiązuje w terminie roku od 3 marca 2025 roku.")                  # a real "roku": kept
+    assert "3 marca 2025 r. + 1 rok (kalendarzowo) = 3 marca 2026 r. (wtorek)" in ls
+    assert any(" + 1 miesiąc " in x for x in facts("Wpłynęło 3 marca 2025 roku; odpowiedź w terminie miesiąca."))
+
+
 # VAT rate needs VAT context
 COURT_FEE = ("Pozew o zapłatę 19 726,00 zł. Opłata: ponad 15 000 do 20 000 zł — 1000 zł; ponad 20 000 zł — 5% wartości "
              "przedmiotu sporu, nie więcej niż 200 000 zł.")
