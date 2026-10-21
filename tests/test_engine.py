@@ -120,6 +120,30 @@ def test_mps_backend_on_cpu_equals_separate():
                 assert len(r) == len(ids) and torch.allclose(torch.tensor(r), e, atol=1e-5), lens
 
 
+def test_mps_cpu_branch_pass_cascade_root_once():
+    """On the CPU the long path's branch pass attends to the root and to each block's ancestors separately, merged by
+    log-sum-exp (_cascade): a request with more tokens below its root than BRANCH_TOKENS stays one unit (the root runs
+    once), its branch pass runs in parts of whole questions, and every readout equals its prompt run alone: 6 query
+    heads per key / value head, questions in two option orders (nested blocks), a duplicate prompt and a prompt that
+    ends at the root."""
+    torch.manual_seed(0)
+    m = LlamaForCausalLM(LlamaConfig(vocab_size=50, hidden_size=48, intermediate_size=64, num_hidden_layers=2,
+                                     num_attention_heads=12, num_key_value_heads=2, head_dim=8,
+                                     max_position_embeddings=256)).eval()
+    m.config._attn_implementation = "sdpa"
+    be = MPSStub(m)
+    be.LENS, be.BRANCH_TOKENS = [16], 24  # every unit through the long path; parts of at most 24 tokens below the root
+    state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 2, 7]
+    toks = [state + [20 + q, 21, 22 + q, 30 + o, 31 - o] for q in range(4) for o in range(2)]  # 4 x 7 tokens below
+    toks += [list(toks[0]), list(state)]  # a duplicate, and a prompt that ends at the root (read out in pass 1)
+    lids = [[7, 8, 9] if k % 3 else [7, 8] for k in range(len(toks))]
+    assert len(be._units([(toks, lids)])) == 1  # 28 tokens below the root > BRANCH_TOKENS: not split
+    out = be.run_shared([(toks, lids)])[0]
+    assert len(out) == len(toks)
+    for r, e, ids in zip(out, separate(m, toks, lids), lids):
+        assert len(r) == len(ids) and torch.allclose(torch.tensor(r), e, atol=1e-5)
+
+
 def test_row_only_readout_equals_full_softmax():
     m = tiny()
     be = Stub(m)
