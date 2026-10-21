@@ -1,5 +1,48 @@
-# What is new in basal 2.3.1 (not released yet)
+# What is new in basal 2.3.1
 
+- **basal-omni's fast mode on Blackwell workstation GPUs** (sm_120, such as the RTX PRO 6000): `--gemma-attn auto` is
+  FlexAttention there, with tiles for their 99 KB of shared memory per block, and basal-omni without `--mode` runs
+  `fast` on them as on Hopper. Gate on an RTX PRO 6000: every path of the fp32 identity check 1.000 (mini, 1.0-max),
+  dev v2 port gates pass, automated share at 1% with the shipped calibration within 0.07 points of eager's (mini
+  -0.07, 1.0-max -0.05), 2.2-4.1x eager on single questions and 14-22x with five over a long state. vLLM stays faster
+  for single 1.0-max questions there (8.9 against 5.0 decisions per second).
+
+- **Incremental states** (`--mode fast` with `--state-cache-gb N`): a request whose state begins with a cached state - a
+  growing agent trace or chat history, or an edited one up to the edit - computes only its new tokens over the cached
+  keys and values, and the grown state replaces the old entry. Same answers as computing the whole state (fp32: every
+  top answer, max |dp| 9e-6; bf16: 1.000 at margin >= 0.2; mini, 1.1-max, basal-2.0-4.5B, edited traces included).
+  One H100, an agent loop growing to ~10k tokens: step 12 in 0.19 s instead of 0.39 s on basal-2.0-4.5B and 0.27 s
+  instead of 0.79 s on basal-omni-1.1-max (16 traces at once: 1.2-1.3x).
+- **Long states in chunks:** a state too long for one forward (half the free GPU memory after start-up) is prefilled in
+  2,048-token chunks over the keys and values before them, so basal-omni-1.0-ultra answers 76k- and 82k-token states on
+  one 80 GB H100 (2.3.0: out of memory beyond ~32k; 82k with 5 questions: 46 s), also while short requests are being
+  served; a forward that runs out of memory anyway is redone in chunks, and the server frees the GPU memory of a
+  failed request (before, the next requests failed too).
+- **Long states and busy servers in `--mode eager`:** basal-omni-1.0-ultra answers 32k- to 82k-token states in eager
+  mode too, on one 80 GB H100 (2.3.0: out of memory from 32k on; 82k with 5 questions: 99 s, also while 16 short
+  requests at a time are being served). Above 16k tokens the attention runs in smaller pieces; up to 16k nothing
+  changes (dev v2: the same probabilities, bit for bit, on mini, 1.1-max and ultra). Ultra in eager also serves 16
+  requests at a time now: 2.04 decisions per second without errors, where 2.3.0 failed 452 of 480 requests. It ran out
+  of memory holding keys and values nothing read, and a failed request kept its GPU memory until a garbage collection.
+- **Faster `--mode eager` for basal-2.0 and other non-Gemma models on CUDA:** no cuDNN attention in eager, as in the
+  fast engine. It built a new plan for every new prompt length (0.5 s a request on an H100). basal-2.0-4.5B: one
+  request at a time 52 ms instead of 591 ms (median), 16 at a time 7.35 instead of 4.95 decisions per second; dev v2
+  as served: the same top answer on 0.9998 of decisions at margin >= 0.2, accuracy 70.24 -> 70.29%. basal-omni
+  (Gemma 4) ran without it already.
+
+- **Questions over long states: no first-use stalls, and faster** (`--mode fast`, basal-omni). The second pass (the
+  questions over a state) compiled its attention for a new shape class the first time one came up under load, 1.8-2.4
+  s with every request in flight waiting (4-5 times in a first run of five questions over 3k-10k-token states); the
+  classes are now compiled at start-up. Questions over 3.5k-8k-token states run as captured CUDA graphs instead of
+  kernel by kernel (at most 1 GB more GPU memory; 70 MB on mini). One H100, five questions over 3k-10k tokens: mini
+  21.9 -> 33.7 questions per second at 16 in flight in a first run, +5-6% at 1 and 32; 1.1-max 10.3 -> 11.8, +3-4%;
+  ultra, single questions and basal-2.0 as before (within run-to-run noise); dev v2 as two runs of 2.3.0 differ
+  (0.9994-1.0000 of top answers at margin >= 0.2). The server also keeps its start-up objects out of full garbage
+  collections (up to 1.4 s each by the end of start-up; one stalled a request for 2.9 s on basal-2.0-4.5B).
+- **Less GPU memory for basal-2.0 in the graph engine:** 8 MB cuBLAS workspaces per captured CUDA graph for every model
+  (2.3.0: basal-omni only; `CUBLAS_WORKSPACE_CONFIG` unless you set it): 0.6-0.9 GB less GPU memory, 100 s faster
+  start-up on basal-2.0-4.5B (452 s instead of 554 s on an H100), the same speed; dev v2 top answers as two runs of
+  2.3.0 differ.
 - **Faster sentence splitting for `compress`.** With `unit: "sentence"`, the word before each sentence end was searched
   from the start of the text (and retried at every position of a long token), O(n²) per document; it is now read
   backwards from the sentence end (a 98k-character document: 13 s on the event loop before the 600-unit refusal, now
@@ -14,6 +57,49 @@
   basal-2.0-mini, `--dtype float32`, a 6-core Zen 2: three task requests (41, 24 and 10 prompts) 838 s -> 88 s, 9.6x,
   the same top answer on 75 of 75 readouts (max |Δp| 4e-6); single questions as fast as in `eager`. `--device cuda` is
   refused (that is `--mode fast`). Contributed by Milosz (@Butterski), [#26](https://github.com/rkinas/basal/pull/26).
+- **Status codes and load for process managers.** basal-serve answered every failed request with HTTP 422; now 422
+  means an invalid request, 503 that the GPU ran out of memory (retry later or elsewhere) and 500 any other server
+  error, with the same `{"error": ...}` body. `GET /health` also returns the requests in flight as `running` and
+  `queued` (waiting for the engine), so a manager can tell when the server is idle ([API.md](API.md)). Suggested by
+  @edurdias, [#22](https://github.com/rkinas/basal/issues/22).
+- **`basal-calibrate --strict` says when it tested nothing.** The family check needs 30 CERT decisions of a type in a
+  family (`--min-family`); with fewer in every family it passed without a test. It still passes, but now prints
+  "0 families tested" for each such type on stderr and in the report. Reported by @agentGreg,
+  [#19](https://github.com/rkinas/basal/issues/19).
+- **`basal-calibrate` says up front when a file is too small for a target.** Before any model readout, it checks
+  every question type and task against each `--targets` value. When the FIT decisions could not certify the target
+  even if all of them were accepted and correct (1% needs 299 without an error, 5% needs 59), it prints a warning with
+  the count, the gap and how many more items to label, and repeats it at the end of the run. A threshold certified on
+  FIT whose CERT decisions are too few to confirm it (CERT upper bound above the target) is now flagged in the report
+  and on stderr; the threshold is kept. Feedback from BRAUN SI / NovaraX.
+- **Apple M5 Pro in HARDWARE.md.** `basal-bench` tables for basal-1.0-4.5B and -1.5B on an M5 Pro (20-core GPU): bf16
+  is 2.0-2.5x faster than on the 40-core M4 Max and 4.2-5.5x faster than fp32, so two sentences written for the M4
+  Max (latency scaling with the core count, fp32 close to bf16) now say that they do not hold for the M5 chips.
+  Measured by Kamil (@kamilrosa), [#7](https://github.com/rkinas/basal/issues/7).
+- **`--mlx-packed`: two option orders in one forward on Apple Silicon** (opt-in, `--mode mlx`, basal-1.x and
+  basal-2.0). Since 1.5.0 the MLX backend computed the prefix shared by a question's option orders in one forward and
+  the option blocks in a second, and every forward reads all the weights. With `--mlx-packed` a group of at most 512
+  tokens is one packed row with explicit positions and a block mask, and the rows of several requests share a forward
+  (at most 2,048 tokens each). Two orders: basal-1.0-4.5B 118 -> 68 ms on an M5 Max, basal-1.0-1.5B 158 -> 130-136 ms
+  on an M4 Pro; the same decisions as the default path at margin >= 0.2. It stays opt-in because the automated share
+  at 5% of basal-2.0-4.5B-MLX-8bit's shipped calibration moved by -0.20 pt [-0.60, +0.20] (QUANTIZATION.md).
+  Root cause in [#27](https://github.com/rkinas/basal/issues/27), contributed by Grzegorz Brzezinka (@agentGreg),
+  [#28](https://github.com/rkinas/basal/pull/28).
+- **`--lean on --tree flex` is refused before the model is resolved** also on CUDA GPUs without FlashAttention 3,
+  where choosing the default mode resolved the model first (offline: a download error instead of the refusal;
+  `tests/test_lean.py` failed on those GPUs). Contributed by Milosz (@Butterski),
+  [#30](https://github.com/rkinas/basal/pull/30).
+- **Compact rows on any sm80+ GPU** (`--batches compact`; `auto` unchanged): single prompts packed back to back without
+  padding ran only with FlashAttention 3 (Hopper); elsewhere they now run through torch's varlen attention (its
+  FlashAttention 2), with the template prefix. basal-2.0-mini on an RTX 4060 Ti 16 GB: single questions 66.8 -> 109.4
+  decisions/s (+64%), the same top answer on 58 of 58 answers; about 2.4 GB more GPU memory, and five questions over
+  ~1.5k tokens (unchanged path) 5.6% slower there with the card full. On an H100 with the kernel forced
+  (`--attn fa2`): single questions +16% (basal-2.0-mini and 4.5B), five questions unchanged, 5.8-7.2 GB more GPU
+  memory, the same top answer on every dev v2 decision with margin >= 0.2 ([SERVING.md](SERVING.md)); `auto` gave
+  bit-identical dev v2 answers there. On a Blackwell RTX PRO 6000 (sm_120, no FlashAttention 3, so `auto` runs no
+  compact rows): single questions +18% (mini) and +13% (4.5B), five questions unchanged, the same top answer on 7,632
+  of 7,632 and 9,047 of 9,049 dev v2 decisions with margin >= 0.2. The start-up line names the compact kernel.
+  Contributed by Milosz (@Butterski), [#29](https://github.com/rkinas/basal/pull/29).
 
 # What is new in basal 2.3
 

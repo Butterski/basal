@@ -71,16 +71,17 @@ def test_default_mode_prefers_cuda_over_mlx(monkeypatch):
 
 
 def test_default_mode_gemma4_fast_only_where_its_gate_passed(monkeypatch, tmp_path):
-    """basal-omni (Gemma 4) without --mode: fast on Hopper with FlashAttention 3 (the configuration its gate passed),
-    eager on other GPUs; every other model fast on any CUDA GPU."""
+    """basal-omni (Gemma 4) without --mode: fast where its fast configuration passed its gate (Hopper with FlashAttention
+    3, Blackwell workstation GPUs with flex), eager on other GPUs; every other model fast on any CUDA GPU."""
     omni, llama = tmp_path / "omni", tmp_path / "llama"
     for d, t in ((omni, "gemma4"), (llama, "llama")):
         d.mkdir()
         (d / "config.json").write_text(f'{{"model_type": "{t}"}}')
     monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(server_module, "attention_available", lambda impl: None)
-    assert default_mode(str(omni)) == "fast"
-    monkeypatch.setattr(server_module, "attention_available", lambda impl: "FlashAttention 3 runs on Hopper only")
+    for kernels in ("fa3", "flex"):
+        monkeypatch.setattr(server_module, "gemma_fast_kernels", lambda: kernels)
+        assert default_mode(str(omni)) == "fast"
+    monkeypatch.setattr(server_module, "gemma_fast_kernels", lambda: None)
     assert default_mode(str(omni)) == "eager"
     assert default_mode(str(llama)) == default_mode() == "fast"
 
@@ -93,6 +94,18 @@ def test_fast_mode_loads_the_eager_fitted_calibration(tmp_path):
     for name in ("CALIBRATION.json", "CALIBRATION.fast.json"):
         (tmp_path / name).write_text("{}")
     assert calibration_file(tmp_path, "graph") == tmp_path / "CALIBRATION.json"
+
+
+@pytest.mark.parametrize("fa3, major, want", [(None, 9, "fa3"), ("no flash_attn_3", 9, None), ("Hopper only", 12, "flex"),
+                                              ("Hopper only", 10, None), ("Hopper only", 8, None)])
+def test_gemma_fast_kernels_by_gpu_class(monkeypatch, fa3, major, want):
+    """basal-omni's fast kernels: fa3 where FlashAttention 3 runs, flex on sm_120 (RTX PRO 6000 class, gated 20 Oct),
+    none elsewhere (B200's sm_100 and Ampere have no gate yet)."""
+    import basal.engine as engine_module
+    monkeypatch.setattr(engine_module, "attention_available", lambda impl: fa3)
+    monkeypatch.setattr(engine_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(engine_module.torch.cuda, "get_device_capability", lambda *a: (major, 0))
+    assert engine_module.gemma_fast_kernels() == want
 
 
 def test_default_mode_requires_both_mlx_packages_on_mps(monkeypatch):
@@ -464,3 +477,29 @@ def test_viz_packing_and_served_comparison():
     out = compare_served(res, served)
     assert abs(out["questions"][0]["served_max_diff"] - 0.05) < 1e-9
     assert abs(out["questions"][1]["served_max_diff"] - 0.025) < 1e-9 and out["served"] is served["answers"]
+
+
+def test_out_of_memory_frees_the_failed_forward():
+    """An out-of-memory error's frames are cleared before the requests get it: the failed forward's tensors are freed at
+    once, not at a later garbage collection (until then the next requests ran out of memory too; ultra eager, 20 Oct)."""
+    import weakref
+
+    import torch
+    from basal.server import _fail
+    held = []
+
+    def forward():
+        t = torch.zeros(4)
+        held.append(weakref.ref(t))
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    async def main():
+        fut = asyncio.get_running_loop().create_future()
+        try:
+            forward()
+        except Exception as e:  # noqa: BLE001
+            _fail([fut], e)
+        assert held[0]() is None
+        with pytest.raises(torch.OutOfMemoryError):
+            await fut
+    asyncio.run(main())

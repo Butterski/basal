@@ -35,8 +35,9 @@ import torch
 from . import server
 from .engine import resolve
 from .facts import inject as inject_facts
-from .prompt import PREFILL, render
-from .server import Server, act_answer, certified, check_calibration, temper, temperature, to_items
+from .prompt import PREFILL, RequestError, render
+from .server import (Server, act_answer, certified, check_calibration, refuse_lean_flex, temper, temperature,
+                     to_items)
 from .tools import answer as tool_answer
 
 TYPES = ("choice", "noul", "score", "act", "tool")  # single-readout types
@@ -163,6 +164,7 @@ class ThinkServer(Server):
         if a.think == "off":
             super().__init__(a)
             return
+        refuse_lean_flex(a.lean, a.tree)  # before the model is resolved and the sidecar started
         md = resolve(a.model, a.revision)
         weights = a.think_model or (md / "think" if (md / "think" / "config.json").exists() else md)
         adapter = a.think_adapter or (md / "think" / "adapter" if (md / "think" / "adapter").exists() else None)
@@ -206,7 +208,7 @@ class ThinkServer(Server):
     async def decide(self, body):
         mode = body.get("think", self.think)
         if mode not in ("off", "auto", "force"):
-            raise ValueError('think must be "off", "auto" or "force"')
+            raise RequestError('think must be "off", "auto" or "force"')
         out = await super().decide(body)
         if self.think == "off":
             return out

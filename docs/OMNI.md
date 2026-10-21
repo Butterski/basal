@@ -7,16 +7,17 @@ question. They are trained on text; with `--media on` the server also takes imag
 ## Serve
 
 ```bash
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.1.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000    # or Remek/basal-omni-1.0-mini
 ```
 
 - **Modes:** `eager`, the PyTorch forward in bf16 on CUDA (text, images and audio), since v2.1.0 `vllm` (faster, with
   prefix caching and FlashAttention; since 2.3 also images and audio for mini, [below](#vllm---mode-vllm)) and, since
-  2.3, `fast` / `fast-nocompile` (text only; the CUDA
-  graph engine, below). Without `--mode`, basal-omni runs `fast` on Hopper GPUs with the `flash_attn_3` package (the
-  configuration its gate passed) and `eager` on other GPUs until they pass theirs (2.2.0 had no working default for
-  basal-omni on CUDA: `fast` stopped while loading the model). The `-FP8` checkpoints (mini, max, ultra) run on `--mode vllm`;
+  2.3, `fast` / `fast-nocompile` (text only; the CUDA graph engine, below). Without `--mode`, basal-omni runs `fast`
+  where its fast configuration passed its gate: Hopper GPUs with the `flash_attn_3` package and (2.3.1) Blackwell
+  workstation GPUs (sm_120, such as the RTX PRO 6000); `eager` on other GPUs until they pass theirs (2.2.0 had no
+  working default for basal-omni on CUDA: `fast` stopped while loading the model). The `-FP8` checkpoints (mini, max,
+  ultra) run on `--mode vllm`;
   basal-omni-1.0-mini-FP8 also on `--mode fast` (its port gate below).
   With `--mode vllm` a model that ships `CALIBRATION.vllm.json` (basal-omni-1.1-max and the `-FP8` checkpoints) uses
   it; the others use their `CALIBRATION.json`.
@@ -98,8 +99,11 @@ basal-serve --model Remek/basal-omni-1.0-max --mode eager --media on --port 8000
     FlexAttention in the 512-wide global layers (32 x 32 tiles: the default tiles need more shared memory than an
     H100 has) and wherever the trie needs a mask; compiled, with merged q / k / v and gate / up (`--merge auto`) and
     compact rows (`--batches auto`: prompts back to back in one row, no padding). `math`: the kernel of `--mode
-    eager`, uncompiled. Also `flex` (FlexAttention everywhere) and `fa3+math`. On Blackwell, `auto` is `math` until
-    FlexAttention there has its own identity gate.
+    eager`, uncompiled. Also `flex` (FlexAttention everywhere) and `fa3+math`. On Blackwell workstation GPUs
+    (sm_120) `auto` is `flex`, compiled, with merged projections and smaller tiles for their 99 KB of shared memory
+    per block (no compact rows: those need FlashAttention 3). On an RTX PRO 6000 vLLM is faster for single
+    basal-omni-1.0-max questions (8.9 against 5.0 decisions per second), `fast` for five questions over a long state
+    (5.3 against 4.9 per second). Elsewhere `auto` is `math`.
   - Text only: `--media on` needs `--mode eager`; the image and audio towers are not loaded. Each captured CUDA graph
     keeps its own cuBLAS workspace, so the engine sets `CUBLAS_WORKSPACE_CONFIG=:4096:2` for Gemma 4 unless you set it
     (1.1-max ran out of GPU memory in warm-up with the default; the smaller workspace did not change its forward

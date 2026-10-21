@@ -364,10 +364,13 @@ class Gemma4Graph:
     def _window(self, t):
         return self.window if t == "sliding_attention" else None
 
+    MARGIN = 256  # sliding layers of a long state keep window + MARGIN tokens: a state that continues it a few tokens
+    # before its end (a tokenizer merge where new text joins the old) still has a window of keys (incremental states)
+
     def kv_lens(self, L):
-        """Root tokens per own layer that pass 2 can read, for a root of L tokens: a sliding layer's last `window`
-        only, as pass 2's rows come after the root (positions from L on) and see window - 1 tokens back at most."""
-        return [min(L, self.window) if t == "sliding_attention" else L for t in self.types[: self.n_kv]]
+        """Root tokens per own layer that pass 2 (or a continuation of the state) can read, for a root of L tokens: a
+        sliding layer's last window + MARGIN only, as later rows see window - 1 tokens back at most."""
+        return [min(L, self.window + self.MARGIN) if t == "sliding_attention" else L for t in self.types[: self.n_kv]]
 
     def _plain_masks(self, L, qpos, dev):
         """Boolean masks [b, 1, Lq, L] per layer type of plain causal rows (keys at positions 0..L-1) for queries at
@@ -627,11 +630,11 @@ class Gemma4Graph:
         return out[0]
 
     @torch.no_grad()
-    def forward_suffix(self, ids, mask, pos, prefix, ro=None, compiled=True):
+    def forward_suffix(self, ids, mask, pos, prefix, ro=None, compiled=True, kv=None):
         """Pass 2: rows [b, S] at positions pos over per own layer prefix (K, V) [b, kv heads, P, d] (or a sliding
         layer's last kv_lens(P) of them), with the trie mask (additive [b, 1, S, P + S], 0 = visible; a TreeMask for
         flex) -> [b, R, D] at ro [b, R] (None: all)."""
         from .lean import TreeMask
         kernels = self._kernels(dense=not isinstance(mask, TreeMask))
-        return self._run(kernels, ids, pos, prefix=prefix, mask=mask, ro=ro, pads=self._pads(pos, mask, ro),
+        return self._run(kernels, ids, pos, kv=kv, prefix=prefix, mask=mask, ro=ro, pads=self._pads(pos, mask, ro),
                          compiled=compiled and self.compiled)

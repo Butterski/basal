@@ -8,7 +8,10 @@ model (the same modules and weights) in its own loop, for three things the trans
   tokens only, so its readout equals the forward of its whole prompt (up to float rounding). Prefixes of several groups
   are batched together, a long one runs alone in CHUNK-token parts; a single prompt longer than CHUNK runs its parts
   the same way (the transformers path's chunked prefill). Sliding-window layers keep the last window - 1 keys of a
-  prefix only (the most a later token can see), global layers all of them.
+  prefix only (the most a later token can see), global layers all of them. A state over 16k tokens (ATTN_PAIRS //
+  CHUNK) writes its global layers' keys and values into buffers of the whole state, and their attention runs in calls
+  of at most SCORES scores, each KV head's query heads as one block of queries (_split); up to 16k tokens every call
+  is as before.
 - **Answer rows only (G1):** the layers from the last one with its own keys and values onwards matter only at the
   readout positions: Gemma 4 E2B / E4B reuse the keys and values of earlier layers in their last layers (E4B: 18 of
   42), so those layers produce nothing a later token reads. Such layers, and the attention and MLP of the last layer
@@ -145,6 +148,9 @@ class Gemma4Forward:
     # rows of a suffix forward: each row repeats the prefix keys, so 31B (32 heads x 512 in its global layers, 64 KB a
     # row and key) with five questions over a 10k-token state would hold 3.2 GB per layer; at most KV_BYTES
     KV_BYTES = 2 << 30
+    # an attention call past those budgets (a state over 16k tokens) runs as calls of at most SCORES scores (query heads
+    # x queries x keys; fp32 in the math kernel: 256 MB), as the graph engine's math kernel (Gemma4Graph.SCORES)
+    SCORES = 2 ** 26
 
     def __init__(self, model, answer_rows=True, attn=None):
         self.model = model
@@ -237,11 +243,11 @@ class Gemma4Forward:
         if block is not None and self.unified_blocks:
             m = m | block  # unified: the whole image, past the window too
         m = m & (valid[:, None, :] | (d == 0))
-        if kc is not None:
-            dc = qpos[:, :, None] - kc[:, None, :]
-            mc = (kc[:, None, :] >= 0) & (dc >= 0)
+        if kc is not None:  # (comparisons, not distances: over an 82k-token state those were 1.3 GB of int64)
+            kq = kc[:, None, :]
+            mc = (kq >= 0) & (kq <= qpos[:, :, None])
             if sliding:
-                mc = mc & (dc < self.window)
+                mc = mc & (qpos[:, :, None] - kq < self.window)
             m = torch.cat([mc, m], -1)
         return m[:, None]
 
@@ -265,14 +271,40 @@ class Gemma4Forward:
             return "sdpa"
         return k
 
-    def _attend(self, kind, a, q, k, v, mask, kval, qval, window):
+    def _split(self, a, q, k, v, mask):
+        """An SDPA call past the budgets of a forward over a 16k-token context (ATTN_PAIRS query-key pairs, KV_BYTES of
+        keys and values repeated per query head; only states over 16k tokens reach them) as calls of SCORES scores:
+        per KV head, its query heads folded into one block of queries over its keys and values (nothing repeated per
+        query head), in parts of queries. Without it the 2,048 queries of a part of ultra over a 76k-token state were
+        one math-kernel call of 32 heads x 2,048 x 76k scores (fp32: 20 GB) over keys and values repeated 8x."""
+        B, H, Sq, d = q.shape
+        G, Lk = k.shape[1], k.shape[2]
+        r = H // G
+        n = max(1, self.SCORES // (B * r * Lk))  # queries per call
+        out = q.new_empty(B, H, Sq, d)
+        for j in range(G):
+            for s0 in range(0, Sq, n):
+                qs = q[:, j * r: (j + 1) * r, s0: s0 + n]
+                m = qs.shape[2]
+                o = F.scaled_dot_product_attention(qs.reshape(B, 1, r * m, d), k[:, j: j + 1], v[:, j: j + 1],
+                                                   attn_mask=mask[:, :, s0: s0 + m].repeat(1, 1, r, 1), scale=a.scaling)
+                out[:, j * r: (j + 1) * r, s0: s0 + m] = o.view(B, r, m, d)
+        return out
+
+    def _attend(self, kind, a, q, k, v, mask, kval, qval, window, split=False):
         """Attention of one layer: q [B, H, Sq, d], k / v [B, kv heads, Lk, d] -> [B, H, Sq, d]. SDPA kernels take the
         boolean mask; varlen kernels the real queries (qval [B, Sq]) and keys (kval [B, Lk]) of each row packed back to
         back: a row's real keys are its earlier tokens' and its own, in position order, ending at its last real query,
-        so causal attention aligned at the row's end (with the window) is the mask's attention."""
+        so causal attention aligned at the row's end (with the window) is the mask's attention. split: an SDPA call in
+        _split's parts even within the budgets (a state over 16k tokens)."""
         if kind in SDPA_KERNELS:
             from torch.nn.attention import SDPBackend, sdpa_kernel
             name = SDPA_KERNELS[kind]
+            B, H, Sq, d = q.shape
+            G, Lk = k.shape[1], k.shape[2]
+            if split or B * Sq * Lk > self.ATTN_PAIRS or B * Lk * H * d * k.element_size() * 2 > self.KV_BYTES:
+                with sdpa_kernel([getattr(SDPBackend, name)]) if name else nullcontext():
+                    return self._split(a, q, k, v, mask)
             gqa = name is None
             if not gqa:  # the memory-efficient and cuDNN kernels take no enable_gqa: keys and values per query head,
                 # copied (an expanded, zero-stride view gives the memory-efficient kernel wrong attention at query
@@ -306,13 +338,14 @@ class Gemma4Forward:
             h = h + layer.post_per_layer_input_norm(layer.per_layer_projection(g))
         return h * layer.layer_scalar
 
-    def _pass(self, h, pli, pos, valid, ctx=None, grp=None, read=None, blk=None):
+    def _pass(self, h, pli, pos, valid, ctx=None, grp=None, read=None, blk=None, split=False):
         """One forward over token rows [B, S]: embeddings h [B, S, D], per-layer inputs pli [B, S, L, P] or None,
         positions pos [B, S], valid [B, S] (right padding), blk vision block ids or None. ctx: (kv, kpos) of earlier
         tokens, kv {own layer: (K, V) [G, kv heads, Lc, d]}, kpos {layer type: positions [G, Lc]}; row b continues
         ctx row grp[b]. read [B]: the index of each row's readout token, or None for a prefix part (it stops after the
-        keys and values of the last layer that has its own).
-        -> ({own layer: (K, V) of this pass's tokens}, final hidden state at `read` [B, D] or None)."""
+        keys and values of the last layer that has its own). split: the global layers' attention in _split's parts.
+        -> ({own layer: (K, V) of this pass's tokens}, final hidden state at `read` [B, D] or None). A readout pass
+        keeps no keys and values ({}): nothing reads them, and ultra's of a 16k-token batch were 14 GB."""
         B, S = valid.shape
         kv, kpos = ctx if ctx is not None else ({}, {})
         if ctx is not None and grp is None:
@@ -334,7 +367,8 @@ class Gemma4Forward:
             x = layer.input_layernorm(h)
             if self.own[i]:  # every own layer comes before the cut: its keys and values at every position
                 k, v = self._kv(a, x, rope[t])
-                new[i] = (k, v)
+                if read is None:
+                    new[i] = (k, v)
                 if i in kv:
                     K, V = kv[i]
                     K = K.expand(B, -1, -1, -1) if K.shape[0] == 1 else K.index_select(0, grp)
@@ -355,7 +389,7 @@ class Gemma4Forward:
                 sliced = True
             q = self._q(a, x, rope[t])
             o = self._attend(kinds[t], a, q, k, v, masks.get(t), kval.get(t), qval,
-                             self.window if t == "sliding_attention" else None)
+                             self.window if t == "sliding_attention" else None, split and t != "sliding_attention")
             h = self._rest(layer, h, o, pli[:, :, i] if pli is not None else None)
         if read is None:
             return new, None
@@ -422,19 +456,33 @@ class Gemma4Forward:
 
     def _prefix(self, seqs, media=None):
         """Keys and values of prefixes: short ones in one forward, a long one (alone) in parts through the keys of the
-        parts before it."""
+        parts before it: global layers write theirs into buffers of the whole prefix (no copy of the earlier ones per
+        part; an 82k-token state of ultra holds 6.7 GB of them), sliding-window layers keep their last window - 1
+        after each part, layer by layer (_trim's keys)."""
         if len(seqs) == 1 and len(seqs[0]) > self.CHUNK:
-            ctx = None
-            for s0, s1 in self._parts(seqs[0], len(seqs[0])):
-                h, pli, pos, valid, blk, _ = self._rows([seqs[0][s0:s1]], [s0], media, seqs)
-                new, _ = self._pass(h, pli, pos, valid, ctx=ctx, blk=blk)
-                if ctx is None:
-                    ctx = (new, {t: pos for t in set(self.types)})
-                else:
-                    ctx = ({i: (torch.cat([ctx[0][i][0], k], 2), torch.cat([ctx[0][i][1], v], 2))
-                            for i, (k, v) in new.items()}, {t: torch.cat([p, pos], 1) for t, p in ctx[1].items()})
-                ctx = self._trim(*ctx)
-            return ctx
+            seq, keep = seqs[0], self.window - 1
+            # a state over 16k tokens: every global-layer call in parts, from its first part on (its buffers leave
+            # no room for the scores of a part over 14k keys in one call: 3.5 GB on ultra at 76k)
+            split = len(seq) > self.ATTN_PAIRS // self.CHUNK
+            kv, bufs = {}, {}
+            at = torch.arange(len(seq), device=self.lm.embed_tokens.weight.device)[None]
+            for s0, s1 in self._parts(seq, len(seq)):
+                h, pli, pos, valid, blk, _ = self._rows([seq[s0:s1]], [s0], media, seqs)
+                new, _ = self._pass(h, pli, pos, valid, ctx=(kv, kpos) if kv else None, blk=blk, split=split)
+                for i in list(new):
+                    k, v = new.pop(i)
+                    if self.types[i] == "sliding_attention":
+                        if i in kv:
+                            k, v = torch.cat([kv[i][0], k], 2), torch.cat([kv[i][1], v], 2)
+                        kv[i] = (k[:, :, -keep:].clone(), v[:, :, -keep:].clone())
+                    else:
+                        if i not in bufs:
+                            bufs[i] = tuple(x.new_empty(*x.shape[:2], len(seq), x.shape[3]) for x in (k, v))
+                        bufs[i][0][:, :, s0:s1], bufs[i][1][:, :, s0:s1] = k, v
+                        kv[i] = (bufs[i][0][:, :, :s1], bufs[i][1][:, :, :s1])
+                kpos = {t: at[:, max(0, s1 - keep): s1] if t == "sliding_attention" else at[:, :s1]
+                        for t in set(self.types)}
+            return kv, kpos
         h, pli, pos, valid, blk, _ = self._rows(seqs, [0] * len(seqs), media, seqs)
         new, _ = self._pass(h, pli, pos, valid, blk=blk)
         return self._trim(new, {t: torch.where(valid, pos, -1) for t in set(self.types)})
@@ -459,7 +507,8 @@ class Gemma4Forward:
                 h, pli, pos, valid, blk, lens = self._rows([p[P:] for p, (_, _, _, P) in zip(prompts, cur)],
                                                            [P for *_, P in cur], media, prompts)
                 grp = torch.tensor([b for b, *_ in cur], device=pos.device)
-                _, hid = self._pass(h, pli, pos, valid, ctx=ctx, grp=grp, read=lens - 1, blk=blk)
+                _, hid = self._pass(h, pli, pos, valid, ctx=ctx, grp=grp, read=lens - 1, blk=blk,
+                                    split=Lc > self.ATTN_PAIRS // self.CHUNK)
                 for (_, g, j, _), x in zip(cur, hid):
                     out[g][j] = x
             cur = [r] if r is not None else []
@@ -518,6 +567,9 @@ class Gemma4Forward:
                 self._shared([jb], groups, out, media)
             elif jb is not None:
                 cur = [jb]
+        if jobs and jobs[-1][2] > self.ATTN_PAIRS // self.CHUNK and self.lm.embed_tokens.weight.is_cuda:
+            torch.cuda.empty_cache()  # a state over 16k tokens: its parts' cached blocks back to the GPU (as the fast
+            # engine's long roots: after one large request the next ones ran out of memory sooner, ultra, 20 Oct)
         return out
 
     @torch.no_grad()

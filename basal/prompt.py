@@ -8,6 +8,7 @@ prefilled with `{"answer": "` and the decision is the softmax over the next-toke
   option codes: A-Z, then two-character codes that are each one token at the answer position in the Bielik v3
   tokenizers (1.5B, 4.5B, 11B; Polish and English prompts). k options use the first k codes.
 """
+import functools
 import json
 from pathlib import Path
 
@@ -15,6 +16,29 @@ LETTERS = "ABCDEFGHIJ"
 MAX_OPTIONS = len(LETTERS)
 PREFILL = '{"answer": "'
 PL_CHARS = set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ")
+
+
+class RequestError(ValueError):
+    """An invalid request (a missing or wrong field, too many options or units, a prompt longer than the context):
+    basal-serve answers HTTP 422 with its message. A ValueError, so callers that catch ValueError keep working."""
+
+
+def reads_request(f):
+    """For the functions that read a request body: a missing key, a wrong type or a value that does not parse there is
+    the request's fault -> RequestError (HTTP 422), not a server error (HTTP 500). ValueError messages are kept."""
+    @functools.wraps(f)
+    def read(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except RequestError:
+            raise
+        except KeyError as e:
+            raise RequestError(f"missing field {e}") from e
+        except ValueError as e:
+            raise RequestError(str(e)) from e
+        except (TypeError, AttributeError, IndexError) as e:
+            raise RequestError(f"invalid request: {e}") from e
+    return read
 
 TEMPLATES = {
     "pl": dict(

@@ -17,7 +17,7 @@ benchmarking a GPU.
 | `sglang` | SGLang backend, same readout | CUDA GPUs supported by SGLang |
 | `eager` | plain PyTorch reference; `--device cuda\|mps\|cpu` (default: `BASAL_DEVICE`, else CUDA, else Apple Silicon, else CPU) | any GPU, Apple Silicon (MPS) or CPU |
 | `fast-exit` | `fast` + trained early-exit heads, exit policy chosen per request | models that ship `exit_heads/` (basal-1.0 only) |
-| `mlx` *(default on Apple Silicon with `basal[mlx]`)* | Apple Silicon with MLX / mlx-lm: the `-MLX-8bit` ports or bf16 weights; shared-prefix KV cache | Apple Silicon |
+| `mlx` *(default on Apple Silicon with `basal[mlx]`)* | Apple Silicon with MLX / mlx-lm: the `-MLX-8bit` ports or bf16 weights; shared-prefix KV cache (opt-in `--mlx-packed`: short Llama groups as one packed forward, [QUANTIZATION.md](QUANTIZATION.md#mlx-apple-silicon)) | Apple Silicon |
 | `mlx-q8` | `mlx` with 8-bit weights made from bf16 at load time (about half the memory, not faster) | Apple Silicon |
 | `mps` | the PyTorch engine without CUDA graphs: SOAM packing + token-budget batching; on the Mac's GPU, or on the CPU (`--device cpu`, the default without MPS), where a request's state runs once instead of once per prompt as in `eager` | Apple Silicon, CPU |
 | `gguf` | a GGUF file in process through llama.cpp (`--gguf <file>`, extra `basal[gguf]`) | Apple Silicon (Metal), CUDA, CPU |
@@ -34,9 +34,9 @@ benchmarking a GPU.
   transformers forward of 2.2. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
 - **basal-omni (Gemma 4) in `fast` / `fast-nocompile`** (2.3, text): the engine's own Gemma 4 layer code with SOAM
   over its sliding-window layers and the answer-rows-only last layers; `--gemma-attn auto` = FlashAttention 3 + flex,
-  compiled, on Hopper (`fast`), else eager's math kernel uncompiled; `fp8` / `nvfp4` quantisation at load time is
-  refused for it (serve an `-FP8` checkpoint). Without `--mode` it runs `fast` on Hopper with FlashAttention 3 and
-  `eager` on other GPUs. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
+  compiled, on Hopper, flex on Blackwell workstation GPUs (sm_120), else eager's math kernel uncompiled; `fp8` /
+  `nvfp4` quantisation at load time is refused for it (serve an `-FP8` checkpoint). Without `--mode` it runs `fast` on
+  Hopper with FlashAttention 3 and on sm_120 Blackwell, `eager` on other GPUs. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
 - `--calibration file.json` overrides the calibration file (default: `CALIBRATION.<mode>.json` when the model ships
   one for that engine, else `CALIBRATION.json`; `--mode gguf` loads `CALIBRATION.gguf.json` when the model ships one,
   else `CALIBRATION.json`; with `--orders 2`,
@@ -68,7 +68,19 @@ benchmarking a GPU.
 - **Engine v2.0.0 items** (bf16 weights in `--mode fast` on Hopper with FlashAttention 3; each item has a flag,
   `auto` = on):
   - `--batches compact`: single prompts packed back to back into one row (FA3 varlen), graphs per token count, no
-    padding to bucket lengths or row counts.
+    padding to bucket lengths or row counts. On other sm80+ GPUs `--batches compact` runs them through torch's varlen
+    attention (Llama models; `auto` keeps them off there). basal-2.0-mini on an RTX 4060 Ti 16 GB, against
+    `--batches default`: single questions 66.8 -> 109.4 decisions/s (template prefix on), the same top answer on 58
+    of 58 answers; the compact graphs take about 2.4 GB more GPU memory (13.4 -> 15.8 GB), and with the card full
+    five questions over ~1.5k tokens (a path compact rows do not change) ran 5.6% slower. The same kernel on an H100,
+    forced with `--attn fa2 --batches compact` (an H100 runs FlashAttention 3 otherwise; 16 clients, 2.3.1 check):
+    single questions +16% for basal-2.0-mini (79.0 -> 91.7 decisions/s) and basal-2.0-4.5B (27.9 -> 32.3), five
+    questions over 3k-10k tokens unchanged, GPU memory +5.8 / +7.2 GB, start-up +51 / +88 s; on dev v2 every decision
+    with margin >= 0.2 kept its top answer (4.5B with `--template-prefix off`, as for every engine; with it on, 4 of
+    9,064 changed). On a Blackwell RTX PRO 6000 (Server Edition, sm_120, torch 2.13, where `auto` runs no compact
+    rows): single questions +18% for mini (49.0 -> 57.9) and +13% for 4.5B (17.0 -> 19.1), five questions unchanged,
+    GPU memory +5.8 / +7.2 GB, start-up +31 / +112 s; dev v2 at margin >= 0.2: 7,632 / 7,632 (mini) and 9,047 /
+    9,049 (4.5B, template prefix off) kept their top answer.
   - `--template-prefix on`: the chat template, system prompt and user header of every prompt language are computed
     once at start-up; compact rows run only their own tokens over them (off for basal-2.0 4.5B, see the quick start).
   - `--scheduler on`: requests longer than `--long-tokens` (2,048) wait in a backlog and join engine calls in
@@ -85,7 +97,8 @@ benchmarking a GPU.
   - `--fp8-accum fast|full`: FP8 GEMM accumulation in the default mode (`--deterministic` always uses `full`).
   - Opt-in, off by default: `--lean on|pass2` (one compiled layer function: faster start-up, slower under load),
     `--tree flex` (a FlexAttention mask for the branches of a request), `--readout-layer on`, `--state-cache-gb N`
-    (a state cache across requests), `--prefix-cache`, `--long-lane`. Measurements:
+    (a state cache across requests; 2.3.1: also for states that begin with a cached one, e.g. agent traces, which then
+    compute only their new tokens), `--prefix-cache`, `--long-lane`. Measurements:
     [HARDWARE.md](HARDWARE.md#kernels-of-the-cuda-graph-engine-one-h100).
 - **vLLM options (2.3):** `--vllm-preset default | deterministic` (deterministic: batch-invariant kernels, no prefix
   cache, no chunked prefill; repeatable answers at a throughput cost) loads `CALIBRATION.vllm.<preset>.json` when the
@@ -96,6 +109,10 @@ benchmarking a GPU.
   documents. The `fast` mode is not affected.
 - `--log-decisions file.jsonl` appends one line per request with the served probabilities (a propensity log, for later
   use of production feedback).
+- **Status codes and load (2.3.1)**: an invalid request answers HTTP 422, the GPU out of memory 503 (retry later or
+  elsewhere) and any other server error 500, all with `{"error": "..."}`. `GET /health` returns the requests in flight
+  as `running` and `queued` (waiting for the engine); both 0 means idle, for a process manager that stops or restarts
+  the server. Definitions: [API.md](API.md).
 
 ## Inference on a JSONL file
 

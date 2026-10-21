@@ -24,7 +24,7 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 
 ## Contents
 
-- [What is new in basal 2.3](#what-is-new-in-basal-23) · [What is new in basal 2.2](#what-is-new-in-basal-22) ·
+- [What is new in basal 2.3.1](#what-is-new-in-basal-231) · [What is new in basal 2.3](#what-is-new-in-basal-23) · [What is new in basal 2.2](#what-is-new-in-basal-22) ·
   [What is new in basal 2.1](#what-is-new-in-basal-21) · [What is new in basal-2.0](#what-is-new-in-basal-20)
 - [Models](#models) · [Results](#results)
 - [Quick start](#quick-start) · [API](#api)
@@ -32,6 +32,21 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
 - [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) ·
   [Contributors](#contributors) · [License](#license)
+
+## What is new in basal 2.3.1
+
+- **Long states on one GPU:** basal-omni-1.0-ultra answers 76k- and 82k-token states on one 80 GB H100, in `--mode fast`
+  (prefill in chunks) and in `--mode eager`, also while short requests are being served.
+- **Incremental states** (`--state-cache-gb N`): a growing agent trace or chat history computes only its new tokens;
+  step 12 of an agent loop 0.39 -> 0.19 s on basal-2.0-4.5B and 0.79 -> 0.27 s on basal-omni-1.1-max.
+- **Faster multi-question requests:** no first-use compile pauses; five questions over a long state on basal-omni-1.0-mini
+  21.9 -> 33.7 questions/s on an H100.
+- **Blackwell workstation GPUs** run basal-omni's fast engine by default; basal-2.0 in `--mode eager` on Hopper answers
+  in 52 ms instead of 591 ms.
+- **For operators:** HTTP 422 / 503 / 500, `/health` with `running` and `queued`; `basal-calibrate` says when your labels
+  are too few for a target.
+- **From the community:** Milosz (@Butterski, #16, #20, #26, #29, #30), Grzegorz Brzezinka (@agentGreg, #18, #24, #25,
+  #27, #28), @piotrkowski (#21), Kamil (@kamilrosa, #7), @edurdias (#22). All changes: [WHATS_NEW](docs/WHATS_NEW.md).
 
 ## What is new in basal 2.3
 
@@ -187,7 +202,7 @@ NVIDIA GPU, with [uv](https://docs.astral.sh/uv/) in a fresh environment:
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.1.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -200,7 +215,7 @@ Apple Silicon:
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.1.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -266,7 +281,7 @@ The basal-omni models answer the same questions, and with `--media on` a request
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.1.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 
@@ -282,7 +297,7 @@ calibration, so validate them on your own media. Request format and limits:
 `decide_many`; `basal-mcp` is a stdio bridge for hosts that start local processes.
 
 ```bash
-uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.0.tar.gz"
+uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.1.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --host 127.0.0.1 --port 8000 --mcp on
 claude mcp add --transport http basal http://127.0.0.1:8000/mcp     # Claude Code; other hosts take the same URL
 ```
@@ -406,8 +421,10 @@ Thank you to the people whose work is in this repository, by pull request:
   there too ([#26](https://github.com/rkinas/basal/pull/26)).
 - Grzegorz Brzezinka ([@agentGreg](https://github.com/agentGreg)): the calibration report's per-type ECE as
   `basal-serve` applies the temperatures ([#24](https://github.com/rkinas/basal/pull/24)), the per-type label count
-  for the 1% target in CALIBRATION.md ([#25](https://github.com/rkinas/basal/pull/25)), and the Apple M5 Max
-  benchmark tables in [HARDWARE.md](docs/HARDWARE.md) ([#18](https://github.com/rkinas/basal/pull/18)).
+  for the 1% target in CALIBRATION.md ([#25](https://github.com/rkinas/basal/pull/25)), the Apple M5 Max
+  benchmark tables in [HARDWARE.md](docs/HARDWARE.md) ([#18](https://github.com/rkinas/basal/pull/18)), and
+  `--mlx-packed`, two option orders in one forward on Apple Silicon, with its root cause
+  ([#27](https://github.com/rkinas/basal/issues/27), [#28](https://github.com/rkinas/basal/pull/28)).
 - [@piotrkowski](https://github.com/piotrkowski): `--mode strix` reproduced on a second Strix Halo (ROG Flow Z13),
   bit-identical edge cases and a similar speed-up ([#21](https://github.com/rkinas/basal/pull/21)).
 
