@@ -1,4 +1,4 @@
-# What is new in basal 2.3.1 (not released yet)
+# What is new in basal 2.3.1
 
 - **basal-omni's fast mode on Blackwell workstation GPUs** (sm_120, such as the RTX PRO 6000): `--gemma-attn auto` is
   FlexAttention there, with tiles for their 99 KB of shared memory per block, and basal-omni without `--mode` runs
