@@ -445,6 +445,16 @@ def _copy_same(dst, src):
     return dst.copy_(src)
 
 
+def _graph_tokens(key):
+    """A graph's size for the capture order: (tokens it runs, pass 2: query-key pairs). key: ("p", rows, length),
+    ("c", tokens) or ("x", rows, branch length, root length)."""
+    if key[0] == "p":
+        return key[1] * key[2], 0
+    if key[0] == "c":
+        return key[1], 0
+    return key[1] * key[2], key[1] * key[2] * (key[3] + key[2])
+
+
 def _varlen_attention(q, k, v, cu, scale, layer=0, impl="fa3"):
     """Causal attention of compact rows: [1, heads, T, d] in (prompts packed back to back, cu = their cumulative token
     counts, int32, empty prompts at the end), [1, T, heads, d] out. impl (the backend's compact_kernel): "fa3" =
@@ -677,6 +687,7 @@ class GraphBackend(EagerBackend):
     softcap = None                # the model's final logit softcap (Gemma), applied to the fp32 code logits
     _out = None                   # Llama graphs: the output buffers their captures share (_shared_out)
     _side = None                  # the stream the captures warm up on (one: each new stream pins a cuBLAS workspace)
+    _deferred = None              # warm(), Llama: graphs warmed up, captured the largest first (_capture_deferred)
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
@@ -963,7 +974,10 @@ class GraphBackend(EagerBackend):
 
     def warm(self):
         """Capture every plain graph of the grid, and with `shared` the pass-2 graphs for roots up to the largest of
-        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx)."""
+        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx). Llama: every graph is warmed up here in this order and captured
+        afterwards, the largest first (_capture_deferred)."""
+        if self.gemma is None:  # (Gemma 4's _warm_long_sfx measures the pool as each graph is captured)
+            self._deferred = []
         if self.compact:  # plain graphs only for pass 1 of branched units (at most TREE_ROWS[-1] roots)
             for T in self.COMPACT_LENS:
                 self._graph_c(T)
@@ -984,6 +998,8 @@ class GraphBackend(EagerBackend):
                                 self._graph_sfx(b, S, L)
             if self.gemma is not None:
                 self._warm_long_sfx()
+        if self._deferred is not None:
+            self._capture_deferred()
         # beyond the largest graph the forwards run uncompiled; their first use sets up kernels and memory for long
         # shapes (3 s of the first long request on an H100), so a long prompt and a long branched unit run here once
         n = self.PLAIN_LENS[-1] + 64
@@ -1253,18 +1269,41 @@ class GraphBackend(EagerBackend):
         return m.norm(h)
 
     def _capture(self, key, fn, *static, warmup=3):
+        """Warm fn up (torch.compile compiles here, at its first call) and capture it as graph `key`; in warm()
+        (Llama) the capture waits for _capture_deferred."""
+        self._warm_up(fn, static, warmup)
+        if self._deferred is not None:
+            self._deferred.append((key, fn, static))
+            return None
+        return self._record(key, fn, static)
+
+    def _warm_up(self, fn, static, n):
         if self._side is None:
             self._side = torch.cuda.Stream()
         st = self._side; st.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st):
-            for _ in range(warmup):
+            for _ in range(n):
                 fn(*static)
         torch.cuda.current_stream().wait_stream(st)
+
+    def _record(self, key, fn, static):
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=self.pool):
             out = fn(*static)
         self.graphs[key] = (g, *static, out)
         return self.graphs[key]
+
+    def _capture_deferred(self):
+        """warm() (Llama): capture the graphs warmed up so far, the one with the most tokens first. Every graph's
+        memory stays in the shared pool; what a graph frees at the end of its capture, a later capture reuses, but only
+        in blocks no larger than the freed ones, so captured from the smallest up (the grid's order: compact graphs of
+        16, 32, ... 12,288 tokens) each larger graph allocated new blocks and the pool grew to many times the largest
+        graph's working set. torch.compile still sees the shapes in the grid's order (the warm-up calls in _capture),
+        so the compiled kernels are those of capturing in that order. RTX 4090, basal-2.0-mini, --batches compact,
+        21 Oct: graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical."""
+        deferred, self._deferred = self._deferred, None
+        for key, fn, static in sorted(deferred, key=lambda d: _graph_tokens(d[0]), reverse=True):
+            self._record(key, fn, static)
 
     def _graph(self, b, L):
         """Plain graph (b rows, length L): (graph, ids, kv buffers or None, hidden states [b, L, D]); Gemma 4: (graph,
@@ -1299,8 +1338,22 @@ class GraphBackend(EagerBackend):
             cu_k = cu.clone()
             gather = torch.zeros(T + self.COMPACT_SEQS * self.template_max, dtype=torch.long, device=self.dev)
             gather[:T] = self.template_tokens + torch.arange(T, device=self.dev)
-            return self._capture(key, self.fwd_c, ids, pos, cu, ro, cu_k, gather)
-        return self._capture(key, self.fwd_c, ids, pos, cu, *([ro] if ro is not None else []))
+            return self._capture(key, self._compact_out(T, ro), ids, pos, cu, ro, cu_k, gather)
+        return self._capture(key, self._compact_out(T, ro), ids, pos, cu, *([ro] if ro is not None else []))
+
+    def _compact_out(self, T, ro):
+        """The compact forward of T tokens, its hidden states [1, T, D] in the buffer every compact graph shares
+        (_shared_out; 104 graphs of up to 12,288 tokens kept 0.8 GB on basal-2.0-mini). With readout positions it
+        returns [COMPACT_SEQS, D] (a few KB per graph) as it is."""
+        if ro is not None or self.gemma is not None:
+            return self.fwd_c
+        D = self._hidden_size
+        out = self._shared_out("compact", max(self.COMPACT_LENS) * D, self._dtype)[: T * D].view(1, T, D)
+        fwd = self.fwd_c
+
+        def compact(*s):
+            return _copy_same(out, fwd(*s))
+        return compact
 
     def _graph_sfx(self, b, S, L):
         """Pass-2 graph (b rows of S tokens over root keys / values of length L, the layout of the plain graphs):

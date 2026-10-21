@@ -187,6 +187,40 @@ def test_shared_graph_outputs_keep_every_readout():
     assert len({g[2].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == "x"}) == 1
 
 
+def test_warm_captures_largest_first_after_every_warm_up():
+    """warm() (Llama) runs every graph's warm-up calls first, in the grid's order (torch.compile compiles there, so
+    the compiled kernels do not change), then captures them all, the most tokens first, so each capture can reuse the
+    pool blocks a larger one freed; replays still answer as separate forwards."""
+    from basal.engine import _graph_tokens
+
+    class Order(Stub):
+        SUFFIX_LENS = [8, 16]
+
+        def _capture(self, key, fn, *static, warmup=3):  # the engine's _capture, its two steps observed
+            self.events.append(("warm", key))
+            return GraphBackend._capture(self, key, fn, *static, warmup=warmup)
+
+        def _warm_up(self, fn, static, n):
+            fn(*static)
+
+        def _record(self, key, fn, static):
+            self.events.append(("capture", key))
+            r = Replay(fn, static)
+            self.graphs[key] = (r, *static, r.out)
+            return self.graphs[key]
+
+    be = Order(tiny())
+    be.events = []
+    be.warm()
+    kinds = [e[0] for e in be.events]
+    first = kinds.index("capture")
+    assert "warm" not in kinds[first:] and kinds.count("capture") == kinds.count("warm") > 20
+    caps = [_graph_tokens(k) for kind, k in be.events if kind == "capture"]
+    assert caps == sorted(caps, reverse=True) and {"p", "x"} <= {k[0] for _, k in be.events}
+    check(be, groups(random.Random(7)))
+
+
+
 def test_pass2_graphs_are_the_reachable_shapes():
     """Pass-2 graphs (rows, root length) exist exactly for the batches pass 1 can form (_chunks; state-cached roots
     are chunked the same way), and the key / value buffer holds the largest of those, not TREE_ROWS[-1] x LENS[-1]."""
