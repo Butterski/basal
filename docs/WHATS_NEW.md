@@ -71,6 +71,10 @@
   at 5% of basal-2.0-4.5B-MLX-8bit's shipped calibration moved by -0.20 pt [-0.60, +0.20] (QUANTIZATION.md).
   Root cause in [#27](https://github.com/rkinas/basal/issues/27), contributed by Grzegorz Brzezinka (@agentGreg),
   [#28](https://github.com/rkinas/basal/pull/28).
+- **`--lean on --tree flex` is refused before the model is resolved** also on CUDA GPUs without FlashAttention 3,
+  where choosing the default mode resolved the model first (offline: a download error instead of the refusal;
+  `tests/test_lean.py` failed on those GPUs). Contributed by Milosz (@Butterski),
+  [#30](https://github.com/rkinas/basal/pull/30).
 
 # What is new in basal 2.3
 
