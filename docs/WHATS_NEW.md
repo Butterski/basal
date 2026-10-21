@@ -5,7 +5,8 @@
   keys, summed in another order), so it needs no `[N, P + N]` mask and no copied keys, and a request with many
   questions is no longer split with the state recomputed per part. basal-2.0-mini fp32, a 3,278-token state: 40
   questions 105 -> 92 s, 120 questions 313 -> 207 s (the state once instead of 3 times), peak memory -0.5 / -0.75 GB,
-  the same top answer on 160 of 160 (max |Δp| 9e-6). Contributed by Milosz (@Butterski).
+  the same top answer on 160 of 160 (max |Δp| 9e-6). Contributed by Milosz (@Butterski),
+  [#34](https://github.com/rkinas/basal/pull/34).
 
 # What is new in basal 2.3.1
 
