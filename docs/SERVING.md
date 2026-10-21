@@ -72,8 +72,9 @@ benchmarking a GPU.
     attention (Llama models; `auto` keeps them off there). basal-2.0-mini on an RTX 4060 Ti 16 GB, against
     `--batches default`: single questions 66.8 -> 109.4 decisions/s (template prefix on), the same top answer on 58
     of 58 answers; the compact graphs take about 2.4 GB more GPU memory (13.4 -> 15.8 GB), and with the card full
-    five questions over ~1.5k tokens (a path compact rows do not change) ran 5.6% slower. The same kernel on an H100
-    (`--attn fa2 --batches compact`, 16 clients, 2.3.1 check): single questions +16% for basal-2.0-mini (79.0 -> 91.7
+    five questions over ~1.5k tokens (a path compact rows do not change) ran 5.6% slower. The same kernel on an H100,
+    forced with `--attn fa2 --batches compact` (an H100 runs FlashAttention 3 otherwise; 16 clients, 2.3.1 check; not
+    yet measured on Blackwell): single questions +16% for basal-2.0-mini (79.0 -> 91.7
     decisions/s) and basal-2.0-4.5B (27.9 -> 32.3), five questions over 3k-10k tokens unchanged, GPU memory +5.8 /
     +7.2 GB, start-up +51 / +88 s; on dev v2 every decision with margin >= 0.2 kept its top answer (4.5B with
     `--template-prefix off`, as for every engine; with it on, 4 of 9,064 changed).
