@@ -974,8 +974,8 @@ class GraphBackend(EagerBackend):
 
         def unit(L):  # five branches of 64 tokens below an L-token root
             return ([[pad] * L + [5 + k] + [7] * 63 for k in range(5)], [[10, 11]] * 5)
-        L = self.LENS[-1] + 64
-        if 2 * self._bucket(L, self.PLAIN_LENS) <= self.TOKEN_BUDGET:
+        L = self.LENS[-1] + 64  # a root of the plain graphs (none on ultra, whose grid ends at LENS: _fit_grid)
+        if L <= self.PLAIN_LENS[-1] and 2 * self._bucket(L, self.PLAIN_LENS) <= self.TOKEN_BUDGET:
             self.run_shared([unit(L)])
             self.run_shared([unit(L), unit(L)])
         self.run_shared([unit(n)])
