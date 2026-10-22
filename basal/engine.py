@@ -891,7 +891,10 @@ class GraphBackend(EagerBackend):
       from the root, and a block mask lets each branch see the root, its ancestors and itself only. Exactly equivalent
       to separate forwards, the state (usually most of the tokens) is computed once, and the long part runs with the
       flash kernel; pass 2 is short and replays a graph of the normal forward (up to 8 rows x 64 / 128 / 256 branch
-      tokens over roots up to the largest of LENS), or runs as a normal forward for other shapes.
+      tokens over roots up to the largest of LENS), or runs as a normal forward for other shapes. Llama on CUDA, where
+      such a forward's rows hold CASCADE_TOKENS or more tokens (compress, many questions) and torch's varlen attention
+      runs (sm80+, bf16 / fp16, seqused_k; _cascade_why): a cascade instead of the block mask, the roots' keys and
+      values and each block's ancestors in two varlen calls merged by log-sum-exp (_cascade_varlen).
 
     All forwards of a call are launched back to back; host buffers are pinned and copied asynchronously, and each
     forward's readout is copied back behind it, so a group is reported as soon as its forwards are done while later
