@@ -168,18 +168,20 @@ clients (decisions/s; questions/s with five per request). fla 0.5.2 for the Gate
 
 | path | short, 1 q: p50 / 16 clients | short, 5 q: p50 / 16 clients | long, 1 q: p50 / 16 clients | long, 5 q: p50 / 16 clients |
 |---|---|---|---|---|
-| `fast` (2.4) | 17.3 ms / 84.0 dec/s | 32.0 ms / 316.7 q/s | 67.2 ms / 21.9 dec/s | 112.3 ms / 79.6 q/s |
-| `fast-nocompile` (2.4) | 22.7 ms / 58.1 | 40.6 ms / 229.5 | 91.4 ms / 15.2 | 139.2 ms / 59.0 |
-| `eager` | 47.0 ms / 32.3 | 112.3 ms / 40.9 | 188.6 ms / 6.4 | 927.9 ms / 6.4 |
+| `fast` (2.4) | 15.4 ms / 115.0 dec/s | 29.2 ms / 388.4 q/s | 54.3 ms / 28.3 dec/s | 98.3 ms / 92.9 q/s |
+| `fast-nocompile` (2.4) | 22.3 ms / 60.2 | 40.1 ms / 240.0 | 86.7 ms / 15.6 | 136.7 ms / 60.1 |
+| `eager` | 47.2 ms / 32.3 | 112.0 ms / 41.3 | 186.2 ms / 6.5 | 919.7 ms / 6.5 |
 | `vllm` (vLLM 0.31.0; the model card's run) | 54.3 ms / 93.9 | 67 ms / 188.7 | 39 ms / 43.7 | 109 ms / 90.6 |
 
-- `fast` against `eager`: 2.7x lower latency and 2.6x the throughput on one question over a short state, 3.5x / 7.7x
-  with five questions, 8.3x / 12.4x with five questions over a long state (the state is computed once, not once per
-  question). Against vLLM: faster on short states, slower on one question over a long state.
-- Start-up: 105 s for `fast` (404 CUDA graphs, compiled), 75 s for `fast-nocompile`; 7.2 GB of GPU memory in
-  use after it (nvidia-smi), 8.7 GB at most under the load tests.
-- Measured on the gdn-2.4 branch before its last speed-up (the convolution of the Gated DeltaNet layers fused;
-  in process: one 1.5k-token question 13.8 -> 11.7 ms, a 6k-token one 48 -> 38 ms).
+- `fast` against `eager`: 3.1x lower latency and 3.6x the throughput on one question over a short state, 3.8x /
+  9.4x with five questions, 9.4x / 14.3x with five questions over a long state (the state is computed once, not once
+  per question). Against vLLM: faster on short states and on five questions over a long state; slower on one
+  question over a long state (54 against 39 ms).
+- Start-up: 108 s for `fast` (404 CUDA graphs, compiled), 72 s for `fast-nocompile`; at most 9.1 GB of GPU memory
+  in use under these loads (nvidia-smi).
+- Where the time goes (in process): one question over a 1.5k-token state takes 11.7 ms, 9.0 ms of it GPU kernels
+  (GEMMs ~3 ms, fla's Gated DeltaNet kernels ~1.8 ms, the convolutions 1.8 ms); a five-question request 28.6 ms, of
+  which 8.5 ms is the tokenizer (with `TOKENIZERS_PARALLELISM=false`, as in these runs).
 
 ## Kernels of the CUDA graph engine (one H100)
 

@@ -15,13 +15,14 @@
     convolution, rotary embedding, MLP), and the projections that read one input are one GEMM.
   Checked on one H100 with basal-omni-pico against `--mode eager`, on 1,700 held-out decisions as single questions,
   five questions over one state, two option orders, and both (17,000 prompts): in fp32 the top answer agrees on
-  99.94-99.99% (max |dp| 0.008), so the port computes what eager computes. In bf16, as served, each engine is
-  equally close to the fp32 answers (`fast` 99.47-99.76%, `eager` 99.48-99.71% by shape). `--deterministic`
-  against batched serving on the 10,606 decisions of the dev set: the same top answer on 99.73% (`eager`: 99.42%),
-  accuracy as `eager`'s (+0.03 points). Speed over HTTP (`eager` in brackets): one
-  question over a 1.5k-token state 17.3 ms at one client (47.0), 84 decisions/s at 16 clients (32.3); five questions
-  32.0 ms (112), 317 questions/s (41); five questions over a 3k-10k-token state 112 ms (928), 80 questions/s (6.4).
-  Details in [HARDWARE.md](HARDWARE.md#basal-omni-pico-qwen35-gated-deltanet-on-one-h100).
+  99.94-99.99% (max |dp| 0.008), so the port computes what eager computes. In bf16, as served, `fast` is as close to
+  the fp32 answers as `eager` is (99.48-99.76% against 99.48-99.71%, by shape). `--deterministic` against batched
+  serving on the 10,606 decisions of the dev set: the same top answer on 99.71% (`eager`: 99.42%), accuracy as
+  `eager`'s (+0.01 points). Speed over HTTP (`eager` in brackets): one question over a 1.5k-token state 15.4 ms at
+  one client (47.2), 115 decisions/s at 16 clients (32.3); five questions 29.2 ms (112.0), 388 questions/s (41.3);
+  five questions over a 3k-10k-token state 98 ms (920), 93 questions/s (6.5). One question over a long state is
+  slower than `--mode vllm` (54 against 39 ms). Details in
+  [HARDWARE.md](HARDWARE.md#basal-omni-pico-qwen35-gated-deltanet-on-one-h100).
 - **Without `--mode`** a Qwen3.5 model now runs `fast` on Hopper (H100, where the port passed its gates) when fla is
   installed (`pip install flash-linear-attention`), and `eager` elsewhere.
 - **Still refused for Qwen3.5 models** (before loading, each with what to use instead): `fp8`, `nvfp4`, `fast-exit`,
@@ -30,7 +31,7 @@
   shared-prefix engine and run `eager`.
 - **Other models are unchanged**: basal-2.0-mini (default and compact rows), basal-2.0-4.5B (compact rows) and
   basal-omni-1.0-mini in `--mode fast` give bit-identical probabilities to
-  2.3.3 (4,960 of 4,960 readouts on an H100).
+  2.3.4 (4,960 of 4,960 readouts on an H100).
 
 # What is new in basal 2.3.5
 
