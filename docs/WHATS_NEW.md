@@ -56,7 +56,7 @@
   `--mode fast`; torchao failed after the load before (#33, @krzysztofkaminski).
 - **Facts block** (@agentGreg): amounts with a dot thousands separator ("10.000,00 zł", #31); "roku" after a date is
   not a one-year duration (#32).
-- Other models are unchanged: basal-2.0-pico and basal-omni-1.0-mini still default to `fast`, with the same answers
+- Other models are unchanged: a Qwen3 model (attention only) and basal-omni-1.0-mini still default to `fast`, with the same answers
   as 2.3.1 on 200 held-out decisions (the same probabilities on every item, max |dp| 0).
 
 # What is new in basal 2.3.1

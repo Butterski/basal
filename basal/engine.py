@@ -138,7 +138,7 @@ class EagerBackend:
         if torch.device(dev).type == "cuda":
             # no cuDNN attention for any model (the graph engine never uses it either): it builds an execution plan for
             # every new prompt length (H100, torch 2.11: 573 ms for a new length, 20 ms for a repeated one), so
-            # basal-2.0-pico and basal-2.0 in eager paid ~0.45 s a request
+            # a Qwen3 model and basal-2.0 in eager paid ~0.45 s a request
             torch.backends.cuda.enable_cudnn_sdp(False)
         from .gemma4 import is_gemma4
         if is_gemma4(self.model):
