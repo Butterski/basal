@@ -231,6 +231,38 @@ def test_warm_captures_largest_first_after_every_warm_up(prefix):
     check(be, groups(random.Random(7)))
 
 
+def test_gemma_warm_captures_largest_first_then_the_long_roots():
+    """Gemma 4 (basal-omni): every graph of the grid, compact graphs included, is warmed up first and captured the
+    largest first; then the pass-2 graphs over roots longer than LENS (_warm_long_sfx), each captured right after its
+    warm-up, so the PASS2_POOL budget measures only what they add. The graph builders only record."""
+    from types import SimpleNamespace
+
+    from basal.engine import _graph_tokens
+
+    class Gemma(GraphBackend):
+        LENS, PLAIN_LENS, BATCHES, TOKEN_BUDGET = [16, 32], [16, 32, 64], [1, 2, 4], 128
+        SUFFIX_LENS, TREE_ROWS, COMPACT_LENS = [8, 16], [1, 2], [16, 32, 64, 128]
+
+    be, ev = Gemma.__new__(Gemma), []
+    be.gemma, be.compact, be.shared, be.prefix, be.dev = object(), True, True, False, torch.device("cpu")
+    be.model, be.graphs = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), {}
+    be._graph_c = lambda T: be._capture(("c", T), lambda: None)
+    be._graph = lambda b, L: be._capture(("p", b, L), lambda: None)
+    be._graph_sfx = lambda b, S, L: be._capture(("x", b, S, L), lambda: None)
+    be._warm_up = lambda fn, static, n: ev.append(("warm", None))
+    be._record = lambda key, fn, static: ev.append(("capture", key))
+    be.warm()
+    first = next(i for i, (kind, k) in enumerate(ev) if kind == "capture" and k[0] == "x" and k[3] > be.LENS[-1])
+    grid, long = ev[:first - 1], ev[first - 1:]
+    caps = [k for kind, k in grid if kind == "capture"]
+    assert [kind for kind, _ in grid] == ["warm"] * len(caps) + ["capture"] * len(caps)
+    assert [_graph_tokens(k) for k in caps] == sorted(map(_graph_tokens, caps), reverse=True)
+    assert {"c", "p", "x"} <= {k[0] for k in caps}
+    assert [kind for kind, _ in long] == ["warm", "capture"] * (len(long) // 2) and len(long) == 2 * 2 * 2
+    assert all(k[0] == "x" and k[3] == 64 for kind, k in long if kind == "capture")
+
+
+
 def test_pass2_graphs_are_the_reachable_shapes():
     """warm() captures pass-2 graphs (rows, root length) exactly for the batches pass 1 can form (_chunks; state-cached
     roots are chunked the same way), and the key / value buffer holds the largest of those, not TREE_ROWS[-1] x
