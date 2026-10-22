@@ -34,7 +34,7 @@ class Stub(GraphBackend):
         self._alloc_kv()
         self.replays = []
 
-    def _capture(self, key, fn, *static, warmup=3):
+    def _capture(self, key, fn, *static):
         r = Replay(fn, static)
         self.graphs[key] = (r, *static, r.out)
         return self.graphs[key]
@@ -265,11 +265,11 @@ def test_warm_captures_largest_first_after_every_warm_up(prefix):
         SUFFIX_LENS = PREFIX_SFX = [8, 16]
         PREFIX_ROWS = [1, 2, 4]
 
-        def _capture(self, key, fn, *static, warmup=3):  # the engine's _capture, its two steps observed
+        def _capture(self, key, fn, *static):  # the engine's _capture, its two steps observed
             self.events.append(("request", key))
-            return GraphBackend._capture(self, key, fn, *static, warmup=warmup)
+            return GraphBackend._capture(self, key, fn, *static)
 
-        def _warm_up(self, fn, static, n):
+        def _warm_up(self, fn, static):
             self.events.append(("warm", None))
             fn(*static)
 
