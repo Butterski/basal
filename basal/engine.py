@@ -367,10 +367,11 @@ def gemma_fast_kernels():
     (the math kernel, uncompiled; eager without --mode): fa3 where FlashAttention 3 runs (Hopper; E3, 20 Oct), flex on
     Blackwell workstation GPUs (sm_120: FlexAttention with the smaller tiles of 99 KB of shared memory per block; RTX
     PRO 6000, 20 Oct)."""
+    if attention_available("flex"):  # both run FlexAttention (fa3: in the 512-wide global layers)
+        return None
     if attention_available("fa3") is None:
         return "fa3"
-    if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
-            and attention_available("flex") is None):
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
         return "flex"
     return None
 
@@ -694,6 +695,8 @@ class GraphBackend(EagerBackend):
                    else torch_varlen_available(getattr(torch, dtype)))
             if why:
                 raise ValueError(compact_refused(why))
+        if gemma_attn in ("flex", "fa3") and attention_available("flex") and gemma4_graph.is_gemma4_dir(model_dir):
+            raise ValueError(f"--gemma-attn {gemma_attn}: {attention_available('flex')}")  # fa3: flex in global layers
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
         if self.fp8_checkpoint:
@@ -772,10 +775,7 @@ class GraphBackend(EagerBackend):
         if merge == "auto":
             merge = kernels != "math"
         if "fa3" in str(kernels) and attention_available("fa3"):
-            raise ValueError(f"--gemma-attn {kernels}: {attention_available('fa3')}")
-        if kernels in ("flex", "fa3") and attention_available("flex"):  # fa3: flex in the global layers
-            raise ValueError(f"--gemma-attn {kernels}: {attention_available('flex')}")
-        # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
+            raise ValueError(f"--gemma-attn {kernels}: {attention_available('fa3')}")        # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
         # agreement with eager 0.998-0.999 on dev v2, mini and 1.1-max); the compiled forward comes with the flex /
         # fa3 kernels
         compile = compile and kernels != "math"
