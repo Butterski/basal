@@ -7,6 +7,13 @@
   questions 105 -> 92 s, 120 questions 313 -> 207 s (the state once instead of 3 times), peak memory -0.5 / -0.75 GB,
   the same top answer on 160 of 160 (max |Δp| 9e-6). Contributed by Milosz (@Butterski),
   [#34](https://github.com/rkinas/basal/pull/34).
+- **Windows:** `--batches compact` and `--gemma-attn flex` / `fa3` are refused with the reason where torch is built
+  without FlashAttention or Triton is not installed (the Windows wheels), instead of failing at the first request.
+  basal reads and writes its text files (calibrations, question and input files, decision logs) as UTF-8 on every
+  system; on Windows it used the locale code page before. A file basal wrote on Windows with non-ASCII text (such as
+  Polish questions) does not load as UTF-8: convert it once, on the machine that wrote it,
+  `python -c "import locale, pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text(p.read_text(encoding=locale.getpreferredencoding(False)), encoding='utf-8')" FILE`,
+  or write it again ([#38](https://github.com/rkinas/basal/pull/38), @lukaszpodgorski-pl).
 
 # What is new in basal 2.3.2
 

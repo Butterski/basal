@@ -620,11 +620,11 @@ def load_calibration(md, kind, path, quant, orders, off=False, preset=None):
     for its temperatures without its thresholds, fitted fallback thresholds and task thresholds (max_error defers,
     tasks report automated: null), and the answers are marked unvalidated. An explicit --calibration file is not replaced."""
     cal = calibration_file(md, kind, path, quant, preset)
-    data = {} if off or not cal.exists() else json.loads(cal.read_text())
+    data = {} if off or not cal.exists() else json.loads(cal.read_text(encoding="utf-8"))
     fitted = calibration_orders(data)
     alt = cal.with_name(f"{cal.stem}.o{orders}{cal.suffix}")
     if fitted is not None and fitted != orders and not path and alt.exists():
-        cal, data = alt, json.loads(alt.read_text())
+        cal, data = alt, json.loads(alt.read_text(encoding="utf-8"))
         fitted = calibration_orders(data)
     if fitted is None or fitted == orders:
         return data, cal, None
@@ -648,7 +648,7 @@ def calibration_file(md, kind, path=None, quant=None, preset=None):
 def model_context(md):
     """The model's context in tokens (max_position_embeddings in its config.json), None when unknown."""
     try:
-        cfg = json.loads((Path(md) / "config.json").read_text())
+        cfg = json.loads((Path(md) / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     n = cfg.get("max_position_embeddings") or (cfg.get("text_config") or {}).get("max_position_embeddings")
@@ -793,7 +793,7 @@ class Server:
                   "orders)", flush=True)
         self.temps = self.cal.get("temperature_per_prim", {})
         self.soam = a.soam == "on"
-        self.log = open(a.log_decisions, "a", buffering=1) if a.log_decisions else None
+        self.log = open(a.log_decisions, "a", buffering=1, encoding="utf-8") if a.log_decisions else None
         self.letters = {}
         self.queue, self.max_batch, self.wait = asyncio.Queue(), a.max_batch, a.wait_ms / 1000
         self.window = a.batch_window_ms / 1000

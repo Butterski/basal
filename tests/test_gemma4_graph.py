@@ -254,9 +254,9 @@ def test_modelopt_fp8_gemma4_loads_tied_and_runs(tmp_path):
     for f in tmp_path.glob("*.safetensors"):
         f.unlink()
     save_file({k: v.contiguous() for k, v in sd.items()}, str(tmp_path / "model.safetensors"))
-    cfg = json.loads((tmp_path / "config.json").read_text())
+    cfg = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     cfg["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "FP8"}
-    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    (tmp_path / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
     q = load_modelopt_fp8(tmp_path, "cpu", torch.float32)
     assert q.lm_head.weight.data_ptr() == q.model.embed_tokens.weight.data_ptr()
     assert sum(isinstance(x, FP8Linear) for x in q.modules()) > 0

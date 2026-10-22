@@ -13,7 +13,7 @@ import basal.server as server_module
 from basal.facts import HEADER, facts, inject
 from basal.server import Server, default_mode, models_payload, named_options, parser, to_items
 
-SPEC = json.loads((Path(__file__).parent / "data/systemone_openapi.json").read_text())
+SPEC = json.loads((Path(__file__).parent / "data/systemone_openapi.json").read_text(encoding="utf-8"))
 
 
 def schema(name):
@@ -92,7 +92,7 @@ def test_fast_mode_loads_the_eager_fitted_calibration(tmp_path):
     readouts did not (OMNI.md), so a fast-only file must not be picked up unnoticed."""
     from basal.server import calibration_file
     for name in ("CALIBRATION.json", "CALIBRATION.fast.json"):
-        (tmp_path / name).write_text("{}")
+        (tmp_path / name).write_text("{}", encoding="utf-8")
     assert calibration_file(tmp_path, "graph") == tmp_path / "CALIBRATION.json"
 
 
@@ -102,10 +102,27 @@ def test_gemma_fast_kernels_by_gpu_class(monkeypatch, fa3, major, want):
     """basal-omni's fast kernels: fa3 where FlashAttention 3 runs, flex on sm_120 (RTX PRO 6000 class, gated 20 Oct),
     none elsewhere (B200's sm_100 and Ampere have no gate yet)."""
     import basal.engine as engine_module
-    monkeypatch.setattr(engine_module, "attention_available", lambda impl: fa3)
+    monkeypatch.setattr(engine_module, "attention_available", lambda impl: fa3 if impl == "fa3" else None)
     monkeypatch.setattr(engine_module.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(engine_module.torch.cuda, "get_device_capability", lambda *a: (major, 0))
     assert engine_module.gemma_fast_kernels() == want
+
+
+def test_gemma_fast_kernels_need_flex(monkeypatch):
+    """Without Triton (FlexAttention) neither fast configuration runs: fa3 takes flex in the global layers."""
+    import basal.engine as engine_module
+    monkeypatch.setattr(engine_module, "attention_available", lambda impl: "no Triton" if impl == "flex" else None)
+    assert engine_module.gemma_fast_kernels() is None
+
+
+def test_gemma_flex_refused_before_loading(tmp_path, monkeypatch):
+    import basal.engine as engine_module
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "gemma4"}), encoding="utf-8")
+    monkeypatch.setattr("basal.engine.AutoTokenizer.from_pretrained", lambda *_: pytest.fail("loaded before refusing"))
+    monkeypatch.setattr("basal.engine.set_attention", lambda *_, **__: "fa2")
+    monkeypatch.setattr(engine_module, "attention_available", lambda impl: "no Triton" if impl == "flex" else None)
+    with pytest.raises(ValueError, match="--gemma-attn flex: no Triton"):
+        engine_module.GraphBackend(str(tmp_path), gemma_attn="flex")
 
 
 def test_default_mode_requires_both_mlx_packages_on_mps(monkeypatch):

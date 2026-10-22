@@ -67,11 +67,11 @@ def test_format2_render_and_codes():
 
 def test_model_format_from_basal_json(tmp_path):
     assert P.model_format(tmp_path) == 1  # no basal.json
-    (tmp_path / "basal.json").write_text(json.dumps({"name": "x", "version": "1.5"}))
+    (tmp_path / "basal.json").write_text(json.dumps({"name": "x", "version": "1.5"}), encoding="utf-8")
     assert P.model_format(tmp_path) == 1
-    (tmp_path / "basal.json").write_text(json.dumps({"name": "x", "prompt": 2}))
+    (tmp_path / "basal.json").write_text(json.dumps({"name": "x", "prompt": 2}), encoding="utf-8")
     assert P.model_format(tmp_path) == 2
-    (tmp_path / "basal.json").write_text(json.dumps({"prompt": 3}))
+    (tmp_path / "basal.json").write_text(json.dumps({"prompt": 3}), encoding="utf-8")
     with pytest.raises(ValueError, match="unknown prompt format"):
         P.model_format(tmp_path)
 

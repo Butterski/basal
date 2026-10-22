@@ -119,14 +119,14 @@ class EagerBackend:
         cls = AutoModelForCausalLM
         if media:
             from .media import audio_window, kinds_of
-            self.media_kinds = kinds_of(json.loads((Path(model_dir) / "config.json").read_text()))
+            self.media_kinds = kinds_of(json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8")))
             if not self.media_kinds:
                 raise SystemExit("--media on: the model has no image or audio encoder (config.json: vision_config, "
                                  "audio_config)")
             from transformers import AutoModelForImageTextToText, AutoProcessor
             cls, self.proc = AutoModelForImageTextToText, AutoProcessor.from_pretrained(model_dir)
             pc = Path(model_dir) / "processor_config.json"
-            self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
+            self.max_audio_s = audio_window(json.loads(pc.read_text(encoding="utf-8"))) if pc.exists() else None
             _memo_media(self.proc)
         self.lock, self.media_lock = threading.Lock(), threading.Lock()
         self.model = cls.from_pretrained(model_dir, dtype=getattr(torch, dtype))
@@ -344,6 +344,9 @@ def attention_available(impl):
         return None
     if impl == "cudnn":
         return None if torch.backends.cudnn.is_available() else "cuDNN is not available"
+    if impl == "flex":  # Gemma 4's FlexAttention: Inductor generates its kernel with Triton (not in Windows wheels)
+        import importlib.util
+        return None if importlib.util.find_spec("triton") else "FlexAttention needs Triton (the triton package)"
     return f"unknown attention {impl!r} (one of {', '.join(ATTN)})"
 
 
@@ -364,6 +367,8 @@ def gemma_fast_kernels():
     (the math kernel, uncompiled; eager without --mode): fa3 where FlashAttention 3 runs (Hopper; E3, 20 Oct), flex on
     Blackwell workstation GPUs (sm_120: FlexAttention with the smaller tiles of 99 KB of shared memory per block; RTX
     PRO 6000, 20 Oct)."""
+    if attention_available("flex"):  # both run FlexAttention (fa3: in the 512-wide global layers)
+        return None
     if attention_available("fa3") is None:
         return "fa3"
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
@@ -422,6 +427,8 @@ def torch_varlen_available(dtype):
         return "needs an sm80+ GPU"
     if dtype not in (torch.bfloat16, torch.float16):
         return "needs bf16 / fp16 activations"
+    if not torch.backends.cuda.is_flash_attention_available():  # Windows wheels: built without USE_FLASH_ATTENTION
+        return "this torch is built without FlashAttention"
     try:
         from torch.nn.attention.varlen import varlen_attn
     except ImportError:
@@ -846,6 +853,8 @@ class GraphBackend(EagerBackend):
                    else torch_varlen_available(getattr(torch, dtype)))
             if why:
                 raise ValueError(compact_refused(why))
+        if gemma_attn in ("flex", "fa3") and attention_available("flex") and gemma4_graph.is_gemma4_dir(model_dir):
+            raise ValueError(f"--gemma-attn {gemma_attn}: {attention_available('flex')}")  # fa3: flex in global layers
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
         if self.fp8_checkpoint:
@@ -924,8 +933,7 @@ class GraphBackend(EagerBackend):
         if merge == "auto":
             merge = kernels != "math"
         if "fa3" in str(kernels) and attention_available("fa3"):
-            raise ValueError(f"--gemma-attn {kernels}: {attention_available('fa3')}")
-        # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
+            raise ValueError(f"--gemma-attn {kernels}: {attention_available('fa3')}")        # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
         # agreement with eager 0.998-0.999 on dev v2, mini and 1.1-max); the compiled forward comes with the flex /
         # fa3 kernels
         compile = compile and kernels != "math"
@@ -2119,7 +2127,7 @@ class ExitGraphBackend(GraphBackend):
         super().__init__(model_dir, dtype, quant, compile=False, shared=True, warm=False, attn=attn, merge=merge)
         hd = Path(heads_dir) if heads_dir else Path(model_dir) / "exit_heads"
         ck = torch.load(hd / "heads.pt", map_location="cpu")
-        th = json.loads((hd / "thresholds.json").read_text())
+        th = json.loads((hd / "thresholds.json").read_text(encoding="utf-8"))
         self.policies = {k: {int(L): t for L, t in v["taus"].items() if t <= 1.0} for k, v in th["levels"].items()}
         self.policies["off"] = {}
         self.default_policy = default_policy
@@ -2346,7 +2354,7 @@ class VLLMBackend:
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
                  fast_prefill=True, media=False):
         cfg_file = Path(model_dir) / "config.json"
-        cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
         kw, env = vllm_args(cfg, preset, media=media, fast_prefill=fast_prefill)
         if media:  # --media on: the media the model takes (basal/media.py), as EagerBackend
             from .media import audio_window, kinds_of
@@ -2361,7 +2369,7 @@ class VLLMBackend:
                                  "vLLM 0.31 reads their images and audio differently from the model's processor; use "
                                  "--mode eager --media on")
             pc = Path(model_dir) / "processor_config.json"
-            self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
+            self.max_audio_s = audio_window(json.loads(pc.read_text(encoding="utf-8"))) if pc.exists() else None
         os.environ.update(env)  # before vLLM starts its engine process, which reads it
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.prefill = PREFILL
@@ -2546,7 +2554,7 @@ class MLXBackend:
         import mlx.core as mx
         from mlx_lm.utils import load_model
         self.mx = mx
-        cfg = json.loads((md / "config.json").read_text())
+        cfg = json.loads((md / "config.json").read_text(encoding="utf-8"))
         if quant not in (None, "q8"):
             raise ValueError(f"unknown MLX quantisation {quant!r} (q8)")
         # lazy for q8: the weights are materialised once, after quantisation (never the full bf16 copy)
@@ -2815,7 +2823,7 @@ class GGUFBackend(GraphBackend):
         # a full model directory: its architecture must match the GGUF file; the -GGUF repositories carry tokenizer and
         # calibration without config.json (their .gguf files belong to them)
         cp = Path(model_dir) / "config.json"
-        cfg = json.loads(cp.read_text()) if cp.exists() else {}
+        cfg = json.loads(cp.read_text(encoding="utf-8")) if cp.exists() else {}
         cfg = cfg.get("text_config") or cfg  # Gemma 4 (basal-omni): the decoder's settings are in text_config
         for name, llama_name in (("num_hidden_layers", "llama_model_n_layer"), ("hidden_size", "llama_model_n_embd")):
             if not cfg:
@@ -3077,7 +3085,7 @@ def modelopt_fp8(model_dir):
     """True for a ModelOpt FP8 checkpoint (the -FP8 repositories): FP8 linear weights with static per-tensor weight and
     input scales."""
     p = Path(model_dir) / "config.json"
-    q = (json.loads(p.read_text()).get("quantization_config") or {}) if p.exists() else {}
+    q = (json.loads(p.read_text(encoding="utf-8")).get("quantization_config") or {}) if p.exists() else {}
     return q.get("quant_method") == "modelopt" and q.get("quant_algo") == "FP8"
 
 
