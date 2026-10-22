@@ -311,6 +311,38 @@ below 2%).
   but not fp32 (not verified).
 - `mlx-q8` changes one decision of 44 on the 4.5B (agreement 0.977; 1.000 on the M4 Max).
 
+### Apple M5 Pro (basal-2.0 and `--mlx-packed`)
+
+Measured by Kamil ([@kamilrosa](https://github.com/kamilrosa), [#36](https://github.com/rkinas/basal/issues/36)) on
+the same MacBook Pro as above (Apple M5 Pro, 20-core GPU, 64 GB), macOS 26.5.2, torch 2.14.1 (MPS), MLX 0.32.3, basal
+v2.3.1, mains power. `basal-bench` on the 44 bundled examples, both option orders, two repetitions with a cool-down
+before each (two values where they differ by more than 1%); agreement with `mps` (bf16) of the same run. `mlx` = bf16
+weights, `mlx-q8` = 8-bit weights made at load time; `--mlx-packed` is the opt-in packed forward of 2.3.1 (see the
+M5 Max section below).
+
+| model | mode | 2 orders (ms) | dec/s | agreement | accuracy | GB |
+|---|---|---|---|---|---|---|
+| basal-2.0-mini | `mps` (bf16) | 38.2 | 30.1 | reference | 0.750 | 4.1 |
+| | `mlx` | 46.7 | 21.9 | 1.000 | 0.750 | 3.1 |
+| | `mlx` `--mlx-packed` | **31.3** | **43.0** | 1.000 | 0.750 | 3.8 |
+| | `mlx-q8` | 73.4 | 14.0 | 0.977 | 0.727 | 2.1 |
+| | `mlx-q8` `--mlx-packed` | 41.4 | 35.3 / 33.5 | 0.977 | 0.727 | 2.4 |
+| basal-2.0 (4.5B) | `mps` (bf16) | 101.6 | 10.5 / 10.2 | reference | 0.795 | 10.1 |
+| | `mlx` | 133.4 / 135.1 | 7.7 / 7.6 | 1.000 | 0.795 | 9.0 |
+| | `mlx` `--mlx-packed` | **87.6 / 88.0** | **13.5 / 13.1** | 1.000 | 0.795 | 9.6 |
+| | `mlx-q8` | 193.0 / 195.3 | 5.2 / 5.1 | 0.977 | 0.773 | 5.3 |
+| | `mlx-q8` `--mlx-packed` | 99.7 / 101.5 | 11.2 / 11.1 | 0.955 | 0.795 | 5.6 |
+
+The `-MLX-8bit` ports (`--modes mlx`, as in #18): basal-2.0-mini 73 -> 41 ms with `--mlx-packed`, basal-2.0-4.5B
+186 -> 98 ms (one order: 49 and 95 ms, unchanged by the flag).
+
+- With `--mlx-packed`, `mlx` is the fastest route on this chip for both models (4.5B 88 vs 102 ms for `mps`, mini 31
+  vs 38 ms). Without it, `mlx` is 22-31% slower than `mps`.
+- Against the M5 Max (40 cores) on the same 4.5B port: 1.39x slower by default and 1.27x slower packed, with half
+  the GPU cores.
+- The 4.5B `mlx-q8` agreement (0.955 packed vs 0.977 default) is 2 of 44 decisions: near-tie flips of the 8-bit
+  weights.
+
 ### Apple M5 Max (basal-1.0 and basal-2.0)
 
 Measured by Greg Brzezinka with `basal-bench` on the **44 bundled examples**, like the M4 Max and M5 Pro tables above.
