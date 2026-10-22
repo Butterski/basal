@@ -238,7 +238,13 @@ class Qwen35Graph:
                    att_out=_att_out, rms=lambda h, w: _rms(h, w, eps))
         if compile:
             import torch._dynamo as dynamo
+            import torch._inductor.config as inductor
             dynamo.config.cache_size_limit = max(dynamo.config.cache_size_limit, 64)  # (as the Llama forward)
+            # the fused kernels round to bf16 where the uncompiled maths does (norms, gates, SwiGLU), so the compiled
+            # forward gives the uncompiled one's numbers (tiny model, bf16, CPU: bit-identical; max diff 0.023
+            # without). Without it the pico's top answers moved away from eager's (300 five-question x two-order
+            # requests on an H100: 99.3% against 99.6% for fast-nocompile)
+            inductor.emulate_precision_casts = True
             fns = {k: torch.compile(f, dynamic=True) for k, f in fns.items()}
         self.f = fns
 
