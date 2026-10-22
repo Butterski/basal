@@ -19,7 +19,7 @@
   (18.4 GB; out of memory before), 131.8 instead of 70.0 decisions per second. RTX 4090 after start-up: mini with
   compact rows 17.6 -> 9.4 GB, without 10.0 -> 9.0 GB, 4.5B 20.5 -> 19.3 GB; every probability bit-identical (420
   readouts per model and batching mode), the same decisions per second as before where both start.
-  Contributed by Milosz (@Butterski).
+  Contributed by Milosz (@Butterski), [#37](https://github.com/rkinas/basal/pull/37).
 
 # What is new in basal 2.3.1
 
