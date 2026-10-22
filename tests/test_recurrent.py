@@ -18,7 +18,7 @@ PICO08_LAYERS = (["linear_attention"] * 3 + ["full_attention"]) * 6  # Qwen3.5-0
 
 def write_config(d, cfg):
     d.mkdir(parents=True, exist_ok=True)
-    (d / "config.json").write_text(json.dumps(cfg))
+    (d / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
     return d
 
 

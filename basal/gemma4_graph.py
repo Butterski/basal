@@ -53,7 +53,7 @@ def is_gemma4_dir(model_dir):
     from pathlib import Path
     p = Path(model_dir) / "config.json"
     try:
-        return str(json.loads(p.read_text()).get("model_type", "")).startswith("gemma4")
+        return str(json.loads(p.read_text(encoding="utf-8")).get("model_type", "")).startswith("gemma4")
     except (OSError, ValueError):
         return False
 

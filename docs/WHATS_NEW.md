@@ -1,3 +1,42 @@
+# What is new in basal 2.3.3
+
+- **Less GPU memory for basal-2.0 in the graph engine** (`--mode fast`): the captured CUDA graphs of a family write
+  their outputs into one shared buffer (each graph kept its own hidden states in the graph pool: 169 plain graphs on
+  basal-2.0-mini), the pass-2 graphs share one mask buffer, the 12 pass-2 graphs that pass 1 can never fill (8 rows over
+  roots of 2,304-3,072 tokens) are no longer captured, so the key / value buffer holds 16,384 tokens instead of 24,576,
+  and the captures warm up on one stream (each new stream kept its own cuBLAS workspace). RTX 4090 after start-up:
+  basal-2.0-mini 12.7 -> 10.0 GB (compact rows 18.7 -> 17.6 GB), basal-2.0-4.5B 24.1 -> 20.5 GB of the card's 24.6;
+  every probability bit-identical (420 readouts per model and batching mode), the same decisions per second (128.7 /
+  128.4 single questions, 53.4 / 54.5 questions per second five at a time over 1.5k-token states) and start-up time.
+  Contributed by Milosz (@Butterski), [#35](https://github.com/rkinas/basal/pull/35).
+- **Compact rows on 16 GB and 24 GB cards** (`--batches compact`): the graph engine warms every CUDA graph up in the
+  usual order (so torch.compile compiles the same kernels) and then captures them largest first. Captured smallest
+  first, each larger graph took new memory in the shared graph pool instead of reusing what the smaller ones had freed
+  (basal-2.0-mini with compact rows: 9.0 GiB of graph pool, now 1.0). The compact graphs also share one output buffer.
+  basal-2.0-mini with compact rows now starts on an RTX 4060 Ti 16 GB (9.1 GB; out of memory before), with 117.6
+  instead of 57.4 decisions per second on single questions; basal-2.0-4.5B with compact rows starts on an RTX 4090
+  (18.4 GB; out of memory before), 131.8 instead of 70.0 decisions per second. RTX 4090 after start-up: mini with
+  compact rows 17.6 -> 9.4 GB, without 10.0 -> 9.0 GB, 4.5B 20.5 -> 19.3 GB; every probability bit-identical (420
+  readouts per model and batching mode), the same decisions per second as before where both start.
+  Contributed by Milosz (@Butterski), [#37](https://github.com/rkinas/basal/pull/37).
+- **Checked on one H100** (basal v2.3.2 against 2.3.3, `--mode fast`): GPU memory after start-up basal-2.0-mini 10.8 -> 7.1 GB (compact rows 16.6 -> 7.3 GB), basal-2.0-4.5B 20.1 -> 15.2 GB (compact rows 27.3 -> 15.4 GB), so the 4.5B with compact rows now fits a 24 GB card ([#33](https://github.com/rkinas/basal/issues/33)); 10,872 of 10,872 readouts bit-identical (default and compact rows, `--readout-layer on`, `--prefix-cache` with `--state-cache-gb`, basal-omni-1.0-mini), decisions per second within run-to-run noise.
+- **Long states on the CPU without dense masks** (`--mode mps --device cpu`): the branch pass attends to the state's
+  keys and values as they are and, per trie block, to its own ancestors, merged by log-sum-exp (the softmax over all
+  keys, summed in another order), so it needs no `[N, P + N]` mask and no copied keys, and a request with many
+  questions is no longer split with the state recomputed per part. basal-2.0-mini fp32, a 3,278-token state, 6 CPU
+  cores: 40 questions 105 -> 92 s, 120 questions 313 -> 207 s (the state once instead of 3 times), peak memory -0.5 /
+  -0.75 GB, the same top answer on 160 of 160 (max |Δp| 9e-6). On 32 threads of a Xeon 8460Y+ the 40-question case
+  runs at about the same speed (0.94-1.04x), 150 questions 1.24x faster. Contributed by Milosz (@Butterski),
+  [#34](https://github.com/rkinas/basal/pull/34).
+- **Windows:** `--batches compact` and `--gemma-attn flex` / `fa3` are refused with the reason where torch is built
+  without FlashAttention or Triton is not installed (the Windows wheels), instead of failing at the first request.
+  basal reads and writes its text files (calibrations, question and input files, decision logs) as UTF-8 on every
+  system; on Windows it used the locale code page before. A file basal wrote on Windows with non-ASCII text (such as
+  Polish questions) does not load as UTF-8: convert it once, on the machine that wrote it,
+  `python -c "import locale, pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text(p.read_text(encoding=locale.getpreferredencoding(False)), encoding='utf-8')" FILE`,
+  or write it again ([#38](https://github.com/rkinas/basal/pull/38), @lukaszpodgorski-pl).
+- **Docs:** Apple M5 Pro results for basal-2.0 with `--mlx-packed` and the first basal-omni numbers on an M5 (HARDWARE.md, OMNI.md; Kamil, @kamilrosa, [#36](https://github.com/rkinas/basal/issues/36)); basal-omni-pico (0.8B, Qwen3.5) in the README model table; the basal-omni-1.0-ultra `-GGUF` link.
+
 # What is new in basal 2.3.2
 
 - **Models with Gated DeltaNet layers** (Qwen3.5, such as the 0.8B pico): `--mode fast`, `fast-nocompile`,
@@ -17,7 +56,7 @@
   `--mode fast`; torchao failed after the load before (#33, @krzysztofkaminski).
 - **Facts block** (@agentGreg): amounts with a dot thousands separator ("10.000,00 zł", #31); "roku" after a date is
   not a one-year duration (#32).
-- Other models are unchanged: basal-2.0-pico and basal-omni-1.0-mini still default to `fast`, with the same answers
+- Other models are unchanged: a Qwen3 model (attention only) and basal-omni-1.0-mini still default to `fast`, with the same answers
   as 2.3.1 on 200 held-out decisions (the same probabilities on every item, max |dp| 0).
 
 # What is new in basal 2.3.1

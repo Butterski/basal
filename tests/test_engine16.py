@@ -3,6 +3,7 @@ graphs or a plain long forward, branched units in masked graphs or the two passe
 of all groups batched together and read out at once. Every readout equals a separate forward of its own prompt."""
 import random
 
+import pytest
 import torch
 
 from basal.engine import GraphBackend, causal_sdpa
@@ -10,11 +11,13 @@ from tests.test_engine import separate, tiny
 
 
 class Replay:
-    """Stand-in for a captured CUDA graph: replay() recomputes the output from the static inputs, in place."""
+    """Stand-in for a captured CUDA graph: replay() recomputes the output from the static inputs, in place. Its output
+    is the tensor the function returned at capture, as on the GPU: for Llama graphs a view of the buffer every graph
+    of its family writes (_shared_out)."""
 
     def __init__(self, fn, static):
         self.fn, self.static = fn, static
-        self.out = fn(*static).clone()
+        self.out = fn(*static)
 
     def replay(self):
         self.out.copy_(self.fn(*self.static))
@@ -67,9 +70,11 @@ def groups(rnd):
 def check(be, gs):
     m = be.model
     res = be.run_shared(gs)
+    assert len(res) == len(gs)
     for (toks, lids, *_), got in zip(gs, res):
-        for r, e in zip(got, separate(m, toks, lids)):
-            assert torch.allclose(torch.tensor(r), e, atol=1e-5)
+        assert len(got) == len(toks)
+        for r, e, ids in zip(got, separate(m, toks, lids), lids):
+            assert len(r) == len(ids) and torch.allclose(torch.tensor(r), e, atol=1e-5)
     return res
 
 
@@ -159,6 +164,91 @@ def test_pass2_graphs():
     gs.append(([s + list(range(3, 30)), s + list(range(30, 3, -1))], [[7, 8], [7, 8]]))  # 27-token branches: no graph
     check(be, gs)
     assert used and all(k[2] in (8, 16) for k in used)
+
+
+def test_shared_graph_outputs_keep_every_readout():
+    """Llama graphs share one output buffer per family (plain / pass 2) and one pass-2 mask buffer: a unit read out
+    both inside its root (pass 1's buffer) and below it (a pass-2 graph's), in one call with plain prompts and other
+    units, still reads its own forward's values, and the captured graphs keep no output of their own."""
+    class Warm(Stub):
+        SUFFIX_LENS = [8, 16]
+    rnd = random.Random(6)
+    be = Warm(tiny())
+    be.warm()
+    used = []
+    for key, g in be.graphs.items():
+        if key[0] == "x":
+            g[0].replay = (lambda r, k: lambda: (used.append(k), Replay.replay(r)))(g[0], key)
+    s = [1] + [rnd.randrange(3, 50) for _ in range(12)]
+    q = prompt(rnd, s, 8)  # rows of 10 tokens below the root: a pass-2 graph of 16 that covers the root's 13
+    check(be, [([s, q + [10, 11], q + [11, 10]], [[7, 8], [10, 11], [10, 11]]),  # readouts in the root and below
+               ([prompt(rnd, s, 5)], [[7, 8, 9]])])
+    assert used == [("x", 1, 16, 16)] and ("tree", 1, 13) in be.replays
+    check(be, groups(rnd))
+    for fam in "px":
+        assert len({g[-1].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == fam}) == 1
+    assert len({g[2].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == "x"}) == 1
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+def test_warm_captures_largest_first_after_every_warm_up(prefix):
+    """warm() (Llama) runs every graph's warm-up calls first, in the grid's order (torch.compile compiles there, so
+    the compiled kernels do not change), then captures them all, the most tokens first, so each capture can reuse the
+    pool blocks a larger one freed; replays still answer as separate forwards. With --prefix-cache the two pass-2
+    families share shapes: each graph is still warmed up and captured once."""
+    from basal.engine import _graph_tokens
+
+    class Order(Stub):
+        SUFFIX_LENS = PREFIX_SFX = [8, 16]
+        PREFIX_ROWS = [1, 2, 4]
+
+        def _capture(self, key, fn, *static, warmup=3):  # the engine's _capture, its two steps observed
+            self.events.append(("request", key))
+            return GraphBackend._capture(self, key, fn, *static, warmup=warmup)
+
+        def _warm_up(self, fn, static, n):
+            self.events.append(("warm", None))
+            fn(*static)
+
+        def _record(self, key, fn, static):
+            self.events.append(("capture", key))
+            r = Replay(fn, static)
+            self.graphs[key] = (r, *static, r.out)
+            return self.graphs[key]
+
+    Order.prefix = prefix
+    be = Order(tiny())
+    be.events = []
+    be.warm()
+    kinds = [e[0] for e in be.events]
+    first = kinds.index("capture")
+    caps = [k for kind, k in be.events if kind == "capture"]
+    requests = [k for kind, k in be.events if kind == "request"]
+    assert "warm" not in kinds[first:] and kinds.count("warm") == len(caps) == len(set(caps)) == len(set(requests)) > 20
+    assert (len(requests) > len(set(requests))) == prefix  # the shared shapes asked for twice
+    assert [_graph_tokens(k) for k in caps] == sorted(map(_graph_tokens, caps), reverse=True)
+    assert {"p", "x"} <= {k[0] for k in caps}
+    check(be, groups(random.Random(7)))
+
+
+def test_pass2_graphs_are_the_reachable_shapes():
+    """warm() captures pass-2 graphs (rows, root length) exactly for the batches pass 1 can form (_chunks; state-cached
+    roots are chunked the same way), and the key / value buffer holds the largest of those, not TREE_ROWS[-1] x
+    LENS[-1]. The default grid; the graph builders only record what warm() asks for."""
+    from types import SimpleNamespace
+    be = GraphBackend.__new__(GraphBackend)
+    be.shared, be.model, asked = True, SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), set()
+    be._graph = lambda b, L: None
+    be._graph_sfx = lambda b, S, L: asked.add((b, L))
+    be.warm()
+    reach = set()
+    for L in be.LENS:
+        for n in range(1, be.TREE_ROWS[-1] + 1):
+            for idx in be._chunks([L] * n, be.PLAIN_LENS, [8] * n, be.TREE_ROWS[-1]):
+                reach.add((be._bucket(len(idx), be.TREE_ROWS), L))
+    assert asked == reach
+    assert be._kv_tokens() == max(be.TOKEN_BUDGET, be.PLAIN_LENS[-1], max(b * L for b, L in reach))
+    assert be._kv_tokens() < be.TREE_ROWS[-1] * be.LENS[-1]
 
 
 def test_layered_forward_is_the_forward():

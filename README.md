@@ -1,4 +1,4 @@
-# basal 2.3.2
+# basal 2.3.3
 
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--2.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-20-6acd1712a8e443c86cd576fc)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--omni--1.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f)
@@ -24,7 +24,7 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 
 ## Contents
 
-- [What is new in basal 2.3.2](#what-is-new-in-basal-232) · [What is new in basal 2.3.1](#what-is-new-in-basal-231) · [What is new in basal 2.3](#what-is-new-in-basal-23) ·
+- [What is new in basal 2.3.3](#what-is-new-in-basal-233) · [What is new in basal 2.3.2](#what-is-new-in-basal-232) · [What is new in basal 2.3.1](#what-is-new-in-basal-231) · [What is new in basal 2.3](#what-is-new-in-basal-23) ·
   [What is new in basal 2.2](#what-is-new-in-basal-22) · [What is new in basal 2.1](#what-is-new-in-basal-21) · [What is new in basal-2.0](#what-is-new-in-basal-20)
 - [Models](#models) · [Results](#results)
 - [Quick start](#quick-start) · [API](#api)
@@ -32,6 +32,20 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
 - [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) ·
   [Contributors](#contributors) · [License](#license)
+
+## What is new in basal 2.3.3
+
+- **Less GPU memory in the graph engine** (`--mode fast`, basal-2.0): the CUDA graphs share their output buffers and are
+  captured largest first. On one H100: basal-2.0-mini 10.8 -> 7.1 GB, the 4.5B 20.1 -> 15.2 GB; with compact rows
+  16.6 -> 7.3 GB and 27.3 -> 15.4 GB, so the 4.5B with `--batches compact` now starts on a 24 GB card (#33). Every
+  probability is the same as in 2.3.2.
+- **Long states on the CPU** (`--mode mps --device cpu`): the state is computed once per request and the branch pass
+  needs no dense mask: up to 1.5x faster on a 6-core CPU, with about half the peak memory on many-question requests.
+- **Windows:** modes that need FlashAttention or Triton are refused before loading where the wheels lack them, and
+  every text file is read and written as UTF-8.
+- **basal-omni-pico** (0.8B) is in the model table: the smallest basal model, for a CPU or a small GPU.
+- **From the community:** Milosz (@Butterski, #34, #35, #37), @lukaszpodgorski-pl (#38), Kamil (@kamilrosa, #36: Apple
+  M5 Pro numbers). All changes: [WHATS_NEW](docs/WHATS_NEW.md).
 
 ## What is new in basal 2.3.2
 
@@ -167,18 +181,19 @@ Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the [release notes](https:
   port is checked against its bf16 model; its card has the numbers. Files in detail:
   [docs/INSTALL.md](docs/INSTALL.md#what-the-model-repositories-contain).
 
-**basal-omni** (experimental; text, images and audio; built on Google Gemma 4):
+**basal-omni** (experimental; text, images and audio; built on Google Gemma 4, pico on Qwen3.5):
 
 | model | params | use | Hugging Face |
 |---|---|---|---|
+| **basal-omni-pico** | 0.8B (Qwen3.5-0.8B) | the smallest basal model: text decisions on a CPU or a small GPU (Werdykt 0.660); needs basal 2.3.2 or later (`--mode eager`, or `--mode gguf` on the CPU) | [`Remek/basal-omni-pico`](https://huggingface.co/Remek/basal-omni-pico) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-pico-GGUF) |
 | **basal-omni-1.0-mini** | 4B (Gemma 4 E4B) | decisions about text, images and audio; about 16 GB of GPU memory | [`Remek/basal-omni-1.0-mini`](https://huggingface.co/Remek/basal-omni-1.0-mini) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-mini-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-mini-GGUF) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.0-mini-MLX) |
 | **basal-omni-1.0-max** | 12B | the default 12B model (Werdykt 0.823); text, images and audio; about 24 GB of GPU memory | [`Remek/basal-omni-1.0-max`](https://huggingface.co/Remek/basal-omni-1.0-max) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-max-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-max-GGUF) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.0-max-MLX) |
 | **basal-omni-1.1-max** | 12B | *experimental task model*: better on `classify`, `verify`, `compress` and `extract`, slightly behind 1.0-max on general decisions (Werdykt 0.821) | [`Remek/basal-omni-1.1-max`](https://huggingface.co/Remek/basal-omni-1.1-max) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.1-max-MLX) |
-| **basal-omni-1.0-ultra** | 31B (Gemma 4 31B) | highest Werdykt score of the basal models (0.879); text and images (no audio); 59 GB of bf16 weights | [`Remek/basal-omni-1.0-ultra`](https://huggingface.co/Remek/basal-omni-1.0-ultra) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-ultra-FP8) |
+| **basal-omni-1.0-ultra** | 31B (Gemma 4 31B) | highest Werdykt score of the basal models (0.879); text and images (no audio); 59 GB of bf16 weights | [`Remek/basal-omni-1.0-ultra`](https://huggingface.co/Remek/basal-omni-1.0-ultra) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-ultra-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-ultra-GGUF) |
 
 - bf16 weights, served by `basal-serve --mode eager` on an NVIDIA GPU (`--media on` for images and audio).
   The `-FP8` checkpoints (mini 12 GB, max 14 GB, ultra 33 GB) are served by `--mode vllm`, text only, each with its own
-  calibration (`CALIBRATION.vllm.json`). The `-GGUF` files (Q8_0 and Q6_K, mini and max) are served by `--mode gguf`
+  calibration (`CALIBRATION.vllm.json`). The `-GGUF` files (Q8_0 and Q6_K for mini and max, Q8_0 for ultra and pico) are served by `--mode gguf`
   (llama.cpp, with `CALIBRATION.gguf.json`) or in front of Ollama, text only. The `-MLX` ports (8-bit; 1.0-mini, 1.0-max
   and 1.1-max) are served by `--mode mlx` on Apple Silicon, text only, with `CALIBRATION.mlx.json`.
 - All models are fine-tuned from Apache-2.0 base models (Bielik v3 for basal-2.0, Gemma 4 for basal-omni; see
@@ -213,7 +228,7 @@ NVIDIA GPU, with [uv](https://docs.astral.sh/uv/) in a fresh environment:
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.2.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.3.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -226,7 +241,7 @@ Apple Silicon:
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.2.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.3.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -292,7 +307,7 @@ The basal-omni models answer the same questions, and with `--media on` a request
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.2.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.3.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 
@@ -308,7 +323,7 @@ calibration, so validate them on your own media. Request format and limits:
 `decide_many`; `basal-mcp` is a stdio bridge for hosts that start local processes.
 
 ```bash
-uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.2.tar.gz"
+uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.3.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --host 127.0.0.1 --port 8000 --mcp on
 claude mcp add --transport http basal http://127.0.0.1:8000/mcp     # Claude Code; other hosts take the same URL
 ```
@@ -428,8 +443,11 @@ Thank you to the people whose work is in this repository, by pull request:
   once per question, so a large task request on a long English state is prepared in milliseconds instead of half a
   second ([#17](https://github.com/rkinas/basal/pull/17)); sentence splitting for `compress` in linear time
   ([#16](https://github.com/rkinas/basal/pull/16)); `--mode gguf` on every physical core
-  ([#20](https://github.com/rkinas/basal/pull/20)); and `--mode mps` on the CPU, so a request's state is computed once
-  there too ([#26](https://github.com/rkinas/basal/pull/26)).
+  ([#20](https://github.com/rkinas/basal/pull/20)); `--mode mps` on the CPU, so a request's state is computed once
+  there too ([#26](https://github.com/rkinas/basal/pull/26)), and its branch pass without dense masks
+  ([#34](https://github.com/rkinas/basal/pull/34)); and less GPU memory in the graph engine: shared graph outputs
+  ([#35](https://github.com/rkinas/basal/pull/35)) and graphs captured largest first, so compact rows fit 16 GB and
+  24 GB cards ([#37](https://github.com/rkinas/basal/pull/37)).
 - Grzegorz Brzezinka ([@agentGreg](https://github.com/agentGreg)): the calibration report's per-type ECE as
   `basal-serve` applies the temperatures ([#24](https://github.com/rkinas/basal/pull/24)), the per-type label count
   for the 1% target in CALIBRATION.md ([#25](https://github.com/rkinas/basal/pull/25)), the Apple M5 Max
@@ -440,6 +458,8 @@ Thank you to the people whose work is in this repository, by pull request:
   "roku" after a date, which is not a one-year duration ([#32](https://github.com/rkinas/basal/pull/32)).
 - [@piotrkowski](https://github.com/piotrkowski): `--mode strix` reproduced on a second Strix Halo (ROG Flow Z13),
   bit-identical edge cases and a similar speed-up ([#21](https://github.com/rkinas/basal/pull/21)).
+- [@lukaszpodgorski-pl](https://github.com/lukaszpodgorski-pl): basal on Windows: kernel checks for torch builds without
+  FlashAttention or Triton, and UTF-8 for every text file ([#38](https://github.com/rkinas/basal/pull/38)).
 
 `--mode tpu` and `--mode strix` are community-maintained: their numbers in [HARDWARE.md](docs/HARDWARE.md) are the
 contributors' own measurements.
