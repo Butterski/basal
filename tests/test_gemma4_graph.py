@@ -346,3 +346,18 @@ def test_warm_captures_largest_first_then_long_pass2():
     res = be.run_shared([(toks[:4], lids[:4]), (toks[4:], lids[4:])])
     for r, e in zip(res[0] + res[1], separate(m, toks, lids)):
         assert torch.allclose(torch.tensor(r), e, atol=1e-6)
+
+
+@pytest.mark.parametrize("env, want", [(None, True), ("1", True), ("0", False)])
+def test_compiled_layers_in_inductor_deterministic_mode(monkeypatch, env, want):
+    """The compiled layer functions ask Inductor for its deterministic mode per compile (no kernel config chosen by
+    timing, so a cold and a warm compile cache give the same probabilities); TORCHINDUCTOR_DETERMINISTIC=0 turns it
+    off."""
+    seen = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: seen.append(kw) or fn)
+    if env is None:
+        monkeypatch.delenv("TORCHINDUCTOR_DETERMINISTIC", raising=False)
+    else:
+        monkeypatch.setenv("TORCHINDUCTOR_DETERMINISTIC", env)
+    Gemma4Graph(tiny("e4b"), compile=True)
+    assert len(seen) == 3 and all(kw == {"options": {"deterministic": want}} for kw in seen)
