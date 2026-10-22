@@ -290,9 +290,10 @@ def test_chunked_long_states_and_incremental_states_equal_separate(kind):
 
 def test_warm_captures_largest_first_then_long_pass2():
     """warm() (Gemma 4, basal 2.3.4): every graph's warm-up calls first, in the grid's order (torch.compile compiles
-    there), then the captures, the most tokens first; the pass-2 graphs over roots longer than LENS after those, each
-    captured as it is warmed up (_warm_long_sfx measures the graph pool as each one is captured). Replays still
-    answer as separate forwards."""
+    there), then the captures: the plain and compact graphs the most tokens first, the pass-2 graphs the fewest first
+    (while PASS2_RESERVE stays free); the pass-2 graphs over roots longer than LENS after those, each captured as it
+    is warmed up (_warm_long_sfx measures the graph pool as each one is captured). Replays still answer as separate
+    forwards."""
     from basal.engine import _graph_tokens
 
     class Replay:  # a captured graph's stand-in: replay() recomputes its output from the static inputs, in place
@@ -337,7 +338,10 @@ def test_warm_captures_largest_first_then_long_pass2():
     first = kinds.index("capture")
     caps = [k for kind, k in head if kind == "capture"]
     assert "warm" not in kinds[first:] and kinds.count("warm") == len(caps) == len(set(caps)) > 4
-    assert [_graph_tokens(k) for k in caps] == sorted(map(_graph_tokens, caps), reverse=True)
+    plain, pass2 = [k for k in caps if k[0] != "x"], [k for k in caps if k[0] == "x"]
+    assert caps == plain + pass2 and pass2
+    assert [_graph_tokens(k) for k in plain] == sorted(map(_graph_tokens, plain), reverse=True)
+    assert [_graph_tokens(k) for k in pass2] == sorted(map(_graph_tokens, pass2))
     for i in long:  # each long pass-2 graph: warmed up, then captured at once
         assert ev[i + 1] == ("warm", None) and ev[i + 2] == ("capture", ev[i][1])
     state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]  # a root of 12 tokens: the pass-2 graphs over roots of 16
