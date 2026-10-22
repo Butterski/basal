@@ -45,8 +45,8 @@ from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFB
                      MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, fp8_refused,
                      gemma_fast_kernels, recurrent_layers, recurrent_refused, resolve, set_fp8_fast_accum)
 from .evidence import Evidence
-from .gdn_graph import default_fast as gdn_default_fast, is_gdn, refused as gdn_refused
 from .facts import inject as inject_facts
+from .gdn_graph import default_fast as gdn_default_fast, is_gdn, refused as gdn_refused
 from . import tasks
 from .prompt import (FORMATS, MAX_OPTIONS, RequestError, lang_of, letter_ids, max_options, media_messages, model_format,
                      reads_request, render)

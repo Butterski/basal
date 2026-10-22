@@ -217,12 +217,16 @@ class Tok:
         return type("E", (), {"input_ids": texts})()
 
 
-def gdn_backend(monkeypatch, d, dtype="float32", **kw):
-    """GraphBackend of a Qwen3.5 checkpoint; on the CPU the port's two passes run without CUDA graphs."""
+def gdn_backend(monkeypatch, d, dtype="float32", cpu=True, **kw):
+    """GraphBackend of a Qwen3.5 checkpoint; on the CPU (also where CUDA is there) the port's two passes run without
+    CUDA graphs, with transformers' torch kernel for the Gated DeltaNet layers."""
     for mod in (engine_module, gdn_module):
         monkeypatch.setattr(mod.AutoTokenizer, "from_pretrained", lambda *a, **k: Tok())
-    if not torch.cuda.is_available():
+    if cpu:
         monkeypatch.setattr(gdn_module, "refused", lambda *a, **k: None)
+        with monkeypatch.context() as m:
+            m.setattr(gdn_module.torch.cuda, "is_available", lambda: False)
+            return GraphBackend(str(d), dtype, **kw)
     return GraphBackend(str(d), dtype, **kw)
 
 
@@ -303,7 +307,7 @@ def test_graphs_equal_eager_on_cuda(monkeypatch, tmp_path, dtype, tol):
     """The CUDA graphs of the port (captured as they are first used) against eager with fla, and a group batched with
     others against the same group alone."""
     tiny_qwen35(tmp_path / "tiny")
-    be = gdn_backend(monkeypatch, tmp_path / "tiny", dtype, warm=False)
+    be = gdn_backend(monkeypatch, tmp_path / "tiny", dtype, cpu=False, warm=False)
     ref = EagerBackend(str(tmp_path / "tiny"), dtype, device="cuda")
     got = be.run_shared(GROUPS)
     assert be.graphs and any(k[0] == "x" for k in be.graphs)

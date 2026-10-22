@@ -198,8 +198,9 @@ class Qwen35Graph:
         self.layers = list(self.m.layers[: cfg.num_hidden_layers])
         self.kinds = [cfg.layer_types[i] for i in range(len(self.layers))]
         self.eps = cfg.rms_norm_eps
-        # fla's kernel; transformers' torch version where fla is missing (the CPU tests: the same arguments)
-        self.rule = fla_rule() or q35.torch_chunk_gated_delta_rule
+        # fla's kernel on CUDA; transformers' torch version on the CPU (the tests: the same arguments)
+        cuda = next(model.parameters()).device.type == "cuda"
+        self.rule = (fla_rule() if cuda else None) or q35.torch_chunk_gated_delta_rule
         self.args = []  # per layer: its weights and sizes for the functions above
         for lay, kind in zip(self.layers, self.kinds):
             mlp = (lay.post_attention_layernorm.weight, _merged([lay.mlp.gate_proj, lay.mlp.up_proj])[0],
