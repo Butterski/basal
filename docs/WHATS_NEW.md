@@ -3,9 +3,10 @@
 - **Long states on the CPU without dense masks** (`--mode mps --device cpu`): the branch pass attends to the state's
   keys and values as they are and, per trie block, to its own ancestors, merged by log-sum-exp (the softmax over all
   keys, summed in another order), so it needs no `[N, P + N]` mask and no copied keys, and a request with many
-  questions is no longer split with the state recomputed per part. basal-2.0-mini fp32, a 3,278-token state: 40
-  questions 105 -> 92 s, 120 questions 313 -> 207 s (the state once instead of 3 times), peak memory -0.5 / -0.75 GB,
-  the same top answer on 160 of 160 (max |Δp| 9e-6). Contributed by Milosz (@Butterski),
+  questions is no longer split with the state recomputed per part. basal-2.0-mini fp32, a 3,278-token state, 6 CPU
+  cores: 40 questions 105 -> 92 s, 120 questions 313 -> 207 s (the state once instead of 3 times), peak memory -0.5 /
+  -0.75 GB, the same top answer on 160 of 160 (max |Δp| 9e-6). On 32 threads of a Xeon 8460Y+ the 40-question case
+  runs at about the same speed (0.94-1.04x), 150 questions 1.24x faster. Contributed by Milosz (@Butterski),
   [#34](https://github.com/rkinas/basal/pull/34).
 - **Windows:** `--batches compact` and `--gemma-attn flex` / `fa3` are refused with the reason where torch is built
   without FlashAttention or Triton is not installed (the Windows wheels), instead of failing at the first request.

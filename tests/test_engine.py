@@ -182,6 +182,17 @@ def test_cascade_only_for_attention_only_models():
     assert not cascade_ok(Qwen3_5TextConfig())  # Gated DeltaNet (linear attention) and attention layers
 
 
+def test_cascade_needs_the_cpu_flash_kernel(monkeypatch):
+    """A torch without the private CPU flash op that _attention_lse calls keeps the dense branch pass."""
+    import basal.engine as engine_module
+
+    class NoFlash:
+        def __getattr__(self, name):
+            raise AttributeError(name)
+    monkeypatch.setattr(engine_module.torch.ops, "aten", NoFlash())
+    assert not cascade_ok(LlamaConfig())
+
+
 def test_row_only_readout_equals_full_softmax():
     m = tiny()
     be = Stub(m)

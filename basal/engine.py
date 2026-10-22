@@ -638,10 +638,12 @@ def _block_plan(seg, parents, waste=1.5):
 def cascade_ok(cfg):
     """The CPU branch pass of _cascade covers attention-only models without a sliding window (the Llama-based basal
     models): every key a branch token sees is in the root or in its block's ancestors. Models with sliding-window or
-    linear-attention layers keep the dense pass over the transformers cache."""
+    linear-attention layers keep the dense pass over the transformers cache, as does a torch without the CPU flash
+    kernel _attention_lse calls (a private aten op; basal pins only torch>=2.11)."""
     cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
     return set(getattr(cfg, "layer_types", None) or ["full_attention"]) == {"full_attention"} \
-        and not getattr(cfg, "sliding_window", None)
+        and not getattr(cfg, "sliding_window", None) \
+        and hasattr(torch.ops.aten, "_scaled_dot_product_flash_attention_for_cpu")
 
 
 def _branch_attention(q, k, v, scale, plan):
