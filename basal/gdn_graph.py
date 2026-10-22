@@ -23,6 +23,7 @@ The layers are transformers' own modules (projections, norms, MLP, rotary embedd
 (flash-linear-attention), as in the eager reference. Not here (refused before loading, with what to use instead): fp8 /
 nvfp4, compact rows, the state and prefix caches, template prefixes, --readout-layer on, --lean, the long lane.
 """
+import inspect
 import json
 import os
 from pathlib import Path
@@ -120,15 +121,33 @@ def _gdn_in(h, nw, w_in, A_log, dt_bias, mask, eps, sizes):
     return qkv, z, beta, g
 
 
-def _conv(qkv, w, c0):
-    """The causal depthwise convolution and SiLU of Qwen3_5GatedDeltaNet (causal_conv1d_fn); c0 [b, kernel - 1,
-    channels]: the inputs before the rows (pass 2: the root's last ones)."""
+def _conv(qkv, w, c0, sizes):
+    """The causal depthwise convolution and SiLU of Qwen3_5GatedDeltaNet (causal_conv1d_fn) -> q, k, v (views); c0
+    [b, kernel - 1, channels]: the inputs before the rows (pass 2: the root's last ones)."""
     T = qkv.shape[1]
     if c0 is None:
         y = F.conv1d(qkv.transpose(1, 2).to(w.dtype), w, padding=w.shape[-1] - 1, groups=w.shape[0])[..., :T]
     else:
         y = F.conv1d(torch.cat([c0, qkv], 1).transpose(1, 2).to(w.dtype), w, groups=w.shape[0])
-    return F.silu(y).to(qkv.dtype).transpose(1, 2)
+    return F.silu(y).to(qkv.dtype).transpose(1, 2).split(sizes, -1)
+
+
+def _conv_fused(qkv, w, c0, sizes, n):
+    """_conv as n + 1 shifted multiply-adds over the tokens, for torch.compile: q, k and v each in one fused kernel,
+    written contiguous for fla. cuDNN's generic depthwise kernel and the transposes of q / k / v into fla's layout took
+    about a third of a forward's GPU time on an H100 (kernel profile, 1.5k-token state, 22 Oct). Summed in fp32 and
+    rounded once, as the convolution does."""
+    T = qkv.shape[1]
+    x = F.pad(qkv, (0, 0, n, 0)) if c0 is None else torch.cat([c0, qkv], 1)
+    out, a = [], 0
+    for m in sizes:  # per output: no shared fp32 buffer of all channels between kernels
+        xs, ws = x[..., a: a + m], w[a: a + m, 0].float()
+        y = xs[:, :T].float() * ws[:, 0]
+        for j in range(1, n + 1):
+            y = y + xs[:, j: j + T].float() * ws[:, j]
+        out.append(F.silu(y.to(qkv.dtype)))
+        a += m
+    return out
 
 
 def _gdn_out(h, o, z, gw, out_w, eps):
@@ -198,9 +217,10 @@ class Qwen35Graph:
         self.layers = list(self.m.layers[: cfg.num_hidden_layers])
         self.kinds = [cfg.layer_types[i] for i in range(len(self.layers))]
         self.eps = cfg.rms_norm_eps
-        # fla's kernel on CUDA; transformers' torch version on the CPU (the tests: the same arguments)
+        # fla's kernel on CUDA; transformers' torch version on the CPU (the tests: the same arguments; unwrapped, as
+        # transformers routes that name to fla whenever fla is installed)
         cuda = next(model.parameters()).device.type == "cuda"
-        self.rule = (fla_rule() if cuda else None) or q35.torch_chunk_gated_delta_rule
+        self.rule = (fla_rule() if cuda else None) or inspect.unwrap(q35.torch_chunk_gated_delta_rule)
         self.args = []  # per layer: its weights and sizes for the functions above
         for lay, kind in zip(self.layers, self.kinds):
             mlp = (lay.post_attention_layernorm.weight, _merged([lay.mlp.gate_proj, lay.mlp.up_proj])[0],
@@ -231,9 +251,11 @@ class Qwen35Graph:
         gs = self.args[self.kinds.index("linear_attention")]["sizes"]
         qs = self.args[self.kinds.index("full_attention")]["sizes"]
         rd = self.m.rotary_emb.inv_freq.shape[0] * 2  # rotated dims of a head (partial_rotary_factor)
+        cs, kn = [g.key_dim, g.key_dim, g.value_dim], g.conv_kernel_size - 1
         fns = dict(mlp=lambda h, nw, gu, down: _mlp(h, nw, gu, down, eps),
                    gdn_in=lambda h, nw, w, A_log, dt_bias, mask: _gdn_in(h, nw, w, A_log, dt_bias, mask, eps, gs),
-                   conv=_conv,
+                   conv=(lambda qkv, w, c0: _conv_fused(qkv, w, c0, cs, kn)) if compile else
+                   (lambda qkv, w, c0: _conv(qkv, w, c0, cs)),
                    gdn_out=lambda h, o, z, gw, out_w: _gdn_out(h, o, z, gw, out_w, geps),
                    att_in=lambda h, nw, w, qn, kn, cos, sin: _att_in(h, nw, w, qn, kn, cos, sin, eps, qs, d, rd),
                    att_out=_att_out, rms=lambda h, w: _rms(h, w, eps))
@@ -260,7 +282,7 @@ class Qwen35Graph:
         b, T, _ = h.shape
         qkv, z, beta, g = f["gdn_in"](h, x["nw"], x["w_in"], a.A_log, a.dt_bias, mask)
         w = a.conv1d.weight  # [channels, 1, kernel]
-        q, k, v = f["conv"](qkv, w, c0).split([a.key_dim, a.key_dim, a.value_dim], -1)
+        q, k, v = f["conv"](qkv, w, c0)
         q = q.reshape(b, T, -1, a.head_k_dim)
         k = k.reshape(b, T, -1, a.head_k_dim)
         v = v.reshape(b, T, -1, a.head_v_dim)
@@ -272,9 +294,9 @@ class Qwen35Graph:
         if out is not None:
             out[0].copy_(fs)
             n = w.shape[-1] - 1
-            xp = F.pad(qkv, (0, 0, n, 0))  # n zeros before position 0: a root shorter than the tail
-            ix = lens[:, None] + torch.arange(n, device=h.device)[None]  # tokens lens - n .. lens - 1
-            out[1].copy_(xp.gather(1, ix[..., None].expand(-1, -1, xp.shape[-1])))
+            ix = lens[:, None] - n + torch.arange(n, device=h.device)[None]  # tokens lens - n .. lens - 1
+            t = qkv.gather(1, ix.clamp_min(0)[..., None].expand(-1, -1, qkv.shape[-1]))
+            out[1].copy_(t * (ix >= 0)[..., None])  # before position 0: zeros (a root shorter than the tail)
         return f["gdn_out"](h, o, z.reshape(b, T, -1, a.head_v_dim), a.norm.weight, a.out_proj.weight)
 
     def _attention(self, x, h, cos, sin, out=None, prefix=None):
@@ -609,7 +631,9 @@ class GDNGraphBackend(GraphBackend):
             n = len(rows[part[-1]][1])
             S = next((x for x in self.LEAF_LENS if n <= x), None)
             Bp = self._bucket(len(part), self.LEAF_ROWS)
-            graph = self.graphs.get(("x", Bp, S, L2)) if captured and S is not None else None
+            graph = None  # (captured at start-up; without warm(), as first used)
+            if captured and S is not None and self._sfx_ok(Bp, S, L2):
+                graph = self._graph_sfx(Bp, S, L2)
             self._count("pass2", graph is not None, (len(part), n, L2))
             if graph is None:  # bucketed rows and lengths: the shapes fla's kernels were tuned and compiled for
                 S = -(-n // self.SUFFIX_EAGER) * self.SUFFIX_EAGER

@@ -3,6 +3,7 @@ the CUDA graph engine (--mode fast, fast-nocompile) serves Qwen3.5 decoders thro
 the recurrent state from the root into every branch; fast-exit, fp8, nvfp4, mps and every other recurrent model stay
 refused from config.json, before any weights are read. --mode fp8 stops before loading on GPUs below compute capability
 8.9. No GPU needed (the graph test at the end runs where CUDA and fla are installed)."""
+import inspect
 import json
 
 import pytest
@@ -219,10 +220,14 @@ class Tok:
 
 def gdn_backend(monkeypatch, d, dtype="float32", cpu=True, **kw):
     """GraphBackend of a Qwen3.5 checkpoint; on the CPU (also where CUDA is there) the port's two passes run without
-    CUDA graphs, with transformers' torch kernel for the Gated DeltaNet layers."""
+    CUDA graphs, with transformers' torch kernel for the Gated DeltaNet layers (in the eager reference too: transformers
+    routes it to fla whenever fla is installed, and fla needs CUDA tensors)."""
     for mod in (engine_module, gdn_module):
         monkeypatch.setattr(mod.AutoTokenizer, "from_pretrained", lambda *a, **k: Tok())
     if cpu:
+        from transformers.models.qwen3_5 import modeling_qwen3_5 as q35
+        for name in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule"):
+            monkeypatch.setattr(q35, name, inspect.unwrap(getattr(q35, name)))
         monkeypatch.setattr(gdn_module, "refused", lambda *a, **k: None)
         with monkeypatch.context() as m:
             m.setattr(gdn_module.torch.cuda, "is_available", lambda: False)
