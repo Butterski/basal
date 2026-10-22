@@ -76,7 +76,7 @@ def test_default_mode_gemma4_fast_only_where_its_gate_passed(monkeypatch, tmp_pa
     omni, llama = tmp_path / "omni", tmp_path / "llama"
     for d, t in ((omni, "gemma4"), (llama, "llama")):
         d.mkdir()
-        (d / "config.json").write_text(f'{{"model_type": "{t}"}}')
+        (d / "config.json").write_text(f'{{"model_type": "{t}"}}', encoding="utf-8")
     monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: True)
     for kernels in ("fa3", "flex"):
         monkeypatch.setattr(server_module, "gemma_fast_kernels", lambda: kernels)

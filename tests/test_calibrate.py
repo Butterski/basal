@@ -123,7 +123,8 @@ def test_gold_forms_and_groups(tmp_path):
     (tmp_path / "ok.jsonl").write_text("\n".join(json.dumps(r) for r in [
         {"state": "s", "questions": {"a": {"type": "noul", "gold": "yes", "evidence": True},
                                      "b": {"type": "noul", "gold": "no", "group": "twin-1"}}},
-        {"id": "x", "group": "twin-1", "state": "s", "questions": {"c": {"type": "noul", "gold": "no"}}}]) + "\n")
+        {"id": "x", "group": "twin-1", "state": "s", "questions": {"c": {"type": "noul", "gold": "no"}}}]) + "\n",
+                                     encoding="utf-8")
     bodies, decisions = load(tmp_path / "ok.jsonl")
     examples = Path(server_module.__file__).parent / "examples"                           # basal-run simple items
     assert [len(load(examples / f"{t}.jsonl")[1]) for t in ("choice", "noul", "score")] == [8, 8, 8]

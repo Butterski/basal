@@ -456,7 +456,7 @@ def recurrent_layers(model_dir):
     its config.json before any weights are -> e.g. "18 linear_attention layers" or "model_type qwen3_5_text"; None for
     an attention-only decoder or without a readable config.json."""
     try:
-        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+        cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     cfgs = (cfg, cfg.get("text_config") or {})  # multimodal models: the decoder's settings in text_config
@@ -933,7 +933,8 @@ class GraphBackend(EagerBackend):
         if merge == "auto":
             merge = kernels != "math"
         if "fa3" in str(kernels) and attention_available("fa3"):
-            raise ValueError(f"--gemma-attn {kernels}: {attention_available('fa3')}")        # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
+            raise ValueError(f"--gemma-attn {kernels}: {attention_available('fa3')}")
+        # the math kernel runs uncompiled in --mode fast too: the configuration its gate measured (E2, 20 Oct:
         # agreement with eager 0.998-0.999 on dev v2, mini and 1.1-max); the compiled forward comes with the flex /
         # fa3 kernels
         compile = compile and kernels != "math"
