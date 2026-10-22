@@ -495,6 +495,24 @@ def fp8_refused():
     return None
 
 
+def _copy_same(dst, src):
+    """dst.copy_(src) for a captured graph's shared output: the same dtype and shape, so the copy is exact."""
+    if dst.dtype != src.dtype or dst.shape != src.shape:
+        raise RuntimeError(f"graph output {tuple(src.shape)} {src.dtype} does not fit its buffer {tuple(dst.shape)} "
+                           f"{dst.dtype}")
+    return dst.copy_(src)
+
+
+def _graph_tokens(key):
+    """A graph's size for the capture order: (tokens it runs, pass 2: query-key pairs). key: ("p", rows, length),
+    ("c", tokens) or ("x", rows, branch length, root length)."""
+    if key[0] == "p":
+        return key[1] * key[2], 0
+    if key[0] == "c":
+        return key[1], 0
+    return key[1] * key[2], key[1] * key[2] * (key[3] + key[2])
+
+
 def _varlen_attention(q, k, v, cu, scale, layer=0, impl="fa3"):
     """Causal attention of compact rows: [1, heads, T, d] in (prompts packed back to back, cu = their cumulative token
     counts, int32, empty prompts at the end), [1, T, heads, d] out. impl (the backend's compact_kernel): "fa3" =
@@ -829,6 +847,9 @@ class GraphBackend(EagerBackend):
     state_cache = None            # StateCache: keys / values of request states, reused across requests
     gemma = None                  # basal/gemma4_graph.py: the forward of a Gemma 4 model (basal-omni)
     softcap = None                # the model's final logit softcap (Gemma), applied to the fp32 code logits
+    _out = None                   # Llama graphs: the output buffers their captures share (_shared_out)
+    _side = None                  # the stream the captures warm up on (one: each new stream pins a cuBLAS workspace)
+    _deferred = None              # warm(), Llama: graphs warmed up, captured the largest first (_capture_deferred)
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
@@ -1022,11 +1043,41 @@ class GraphBackend(EagerBackend):
             self.COMPACT_LENS = [x for x in self.COMPACT_LENS if x <= self.TOKEN_BUDGET]
 
     def _kv_tokens(self):
-        """Tokens of the key / value buffer: the largest plain graph and the largest pass-2 graph's rows over the
-        longest root (Gemma 4: within TOKEN_BUDGET, see _fit_grid)."""
+        """Tokens of the key / value buffer: the largest plain graph and the largest captured pass-2 graph's rows over
+        its root (_pass2_ok; Gemma 4: within TOKEN_BUDGET, see _fit_grid)."""
         if self.gemma is not None:
             return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1])
-        return max(self.TOKEN_BUDGET, self.PLAIN_LENS[-1], self.TREE_ROWS[-1] * self.LENS[-1])
+        n = [self.TOKEN_BUDGET, self.PLAIN_LENS[-1]]
+        n += [b * L for b in self.TREE_ROWS for L in self.LENS if self._pass2_ok(b, L)]
+        if self.prefix:
+            n += [b * L for L in self.LENS if L <= self.PREFIX_ROOT for S in self.PREFIX_SFX for b in self.PREFIX_ROWS
+                  if b * S <= self.TOKEN_BUDGET]
+        return max(n)
+
+    def _pass2_ok(self, b, L):
+        """Whether pass 1 can produce a batch for the pass-2 graph of b rows over roots of length L: that graph (b =
+        TREE_ROWS[i]) serves TREE_ROWS[i - 1] + 1 to b units, whose roots pass 1 runs padded to BATCHES rows x L
+        within TOKEN_BUDGET (_chunks; units with cached roots are chunked the same way). Llama: 12 of the 276 default
+        pass-2 graphs (8 rows over roots of 2,304-3,072 tokens) could never run, and the key / value buffer held
+        24,576 tokens for them instead of 16,384. Gemma 4: rows x root within TOKEN_BUDGET (_fit_grid)."""
+        if self.gemma is not None:
+            return b * L <= self.TOKEN_BUDGET
+        prev = ([0] + self.TREE_ROWS)[self.TREE_ROWS.index(b)]
+        return self._bucket(prev + 1, self.BATCHES) * L <= self.TOKEN_BUDGET
+
+    def _shared_out(self, name, n, dtype):
+        """A flat buffer of at least n elements shared by the captures of one graph family (Llama): a captured graph's
+        output stays allocated in the graph pool for as long as the graph lives, so 169 plain graphs kept 169 hidden
+        state tensors [b, L, D] (and 276 pass-2 graphs their outputs and masks) although every forward's readout is
+        copied out right after its replay, under _launch, on the same stream. RTX 4090, 21 Oct, with the one warm-up
+        stream and _pass2_ok: basal-2.0-mini 12.7 -> 10.0 GB after warm-up, basal-2.0-4.5B 24.1 -> 20.5 GB, the
+        probabilities bit-identical (420 of 420 readouts each), the same decisions per second."""
+        if self._out is None:
+            self._out = {}
+        buf = self._out.get(name)
+        if buf is None or buf.numel() < n or buf.dtype != dtype:
+            buf = self._out[name] = torch.zeros(n, dtype=dtype, device=self.dev)
+        return buf
 
     def _kv_new(self, L):
         """Fresh per-layer (K, V) buffers [1, kv heads, L, head size] (a root longer than the largest graph). Gemma 4:
@@ -1092,7 +1143,10 @@ class GraphBackend(EagerBackend):
 
     def warm(self):
         """Capture every plain graph of the grid, and with `shared` the pass-2 graphs for roots up to the largest of
-        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx)."""
+        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx). Llama: every graph is warmed up here in this order and captured
+        afterwards, the largest first (_capture_deferred)."""
+        if self.gemma is None:  # (Gemma 4's _warm_long_sfx measures the pool as each graph is captured)
+            self._deferred = {}  # key -> (function, static inputs), in warm-up order
         if self.compact:  # plain graphs only for pass 1 of branched units (at most TREE_ROWS[-1] roots)
             for T in self.COMPACT_LENS:
                 self._graph_c(T)
@@ -1103,7 +1157,7 @@ class GraphBackend(EagerBackend):
             for b in self.TREE_ROWS:
                 for L in self.LENS:
                     for S in self.SUFFIX_LENS:
-                        if b * S <= self.TOKEN_BUDGET and (self.gemma is None or b * L <= self.TOKEN_BUDGET):
+                        if b * S <= self.TOKEN_BUDGET and self._pass2_ok(b, L):
                             self._graph_sfx(b, S, L)
             if self.prefix:  # pass 2 of short requests over a cached template prefix
                 for L in (x for x in self.LENS if x <= self.PREFIX_ROOT):
@@ -1113,6 +1167,8 @@ class GraphBackend(EagerBackend):
                                 self._graph_sfx(b, S, L)
             if self.gemma is not None:
                 self._warm_long_sfx()
+        if self._deferred is not None:
+            self._capture_deferred()
         # beyond the largest graph the forwards run uncompiled; their first use sets up kernels and memory for long
         # shapes (3 s of the first long request on an H100), so a long prompt and a long branched unit run here once
         n = self.PLAIN_LENS[-1] + 64
@@ -1382,16 +1438,44 @@ class GraphBackend(EagerBackend):
         return m.norm(h)
 
     def _capture(self, key, fn, *static, warmup=3):
-        st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
+        """Warm fn up (torch.compile compiles here, at its first call) and capture it as graph `key`; in warm()
+        (Llama) the capture waits for _capture_deferred, and a key already waiting is not warmed up again (with
+        --prefix-cache the two pass-2 families share some shapes)."""
+        if self._deferred is not None:
+            if key not in self._deferred:
+                self._warm_up(fn, static, warmup)
+                self._deferred[key] = (fn, static)
+            return None
+        self._warm_up(fn, static, warmup)
+        return self._record(key, fn, static)
+
+    def _warm_up(self, fn, static, n):
+        if self._side is None:
+            self._side = torch.cuda.Stream()
+        st = self._side; st.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st):
-            for _ in range(warmup):
+            for _ in range(n):
                 fn(*static)
         torch.cuda.current_stream().wait_stream(st)
+
+    def _record(self, key, fn, static):
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=self.pool):
             out = fn(*static)
         self.graphs[key] = (g, *static, out)
         return self.graphs[key]
+
+    def _capture_deferred(self):
+        """warm() (Llama): capture the graphs warmed up so far, the one with the most tokens first. Every graph's
+        memory stays in the shared pool; what a graph frees at the end of its capture, a later capture reuses, but only
+        in blocks no larger than the freed ones, so captured from the smallest up (the grid's order: compact graphs of
+        16, 32, ... 12,288 tokens) each larger graph allocated new blocks and the pool grew to many times the largest
+        graph's working set. torch.compile still sees the shapes in the grid's order (the warm-up calls in _capture),
+        so the compiled kernels are those of capturing in that order. RTX 4090, basal-2.0-mini, --batches compact,
+        21 Oct: graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical."""
+        deferred, self._deferred = self._deferred, None
+        for key in sorted(deferred, key=_graph_tokens, reverse=True):
+            self._record(key, *deferred[key])
 
     def _graph(self, b, L):
         """Plain graph (b rows, length L): (graph, ids, kv buffers or None, hidden states [b, L, D]); Gemma 4: (graph,
@@ -1403,7 +1487,13 @@ class GraphBackend(EagerBackend):
         if self.gemma is not None:
             ro = torch.zeros((b, 1), dtype=torch.long, device=self.dev)
             return self._capture(key, self.fwd, ids, self._kv_views(b, L), ro)
-        return self._capture(key, self.fwd, ids, self._kv_views(b, L))
+        out = self._shared_out("plain", max(b * L for b, L in self.grid(self.PLAIN_LENS)) * self._hidden_size,
+                               self._dtype)[: b * L * self._hidden_size].view(b, L, -1)
+        fwd = self.fwd
+
+        def plain(i, kv):  # the output in the buffer every plain graph shares (_shared_out)
+            return _copy_same(out, fwd(i, kv))
+        return self._capture(key, plain, ids, self._kv_views(b, L))
 
     def _graph_c(self, T):
         """Compact graph of T tokens: (graph, ids, positions, cumulative counts, hidden states)."""
@@ -1420,8 +1510,22 @@ class GraphBackend(EagerBackend):
             cu_k = cu.clone()
             gather = torch.zeros(T + self.COMPACT_SEQS * self.template_max, dtype=torch.long, device=self.dev)
             gather[:T] = self.template_tokens + torch.arange(T, device=self.dev)
-            return self._capture(key, self.fwd_c, ids, pos, cu, ro, cu_k, gather)
-        return self._capture(key, self.fwd_c, ids, pos, cu, *([ro] if ro is not None else []))
+            return self._capture(key, self._compact_out(T, ro), ids, pos, cu, ro, cu_k, gather)
+        return self._capture(key, self._compact_out(T, ro), ids, pos, cu, *([ro] if ro is not None else []))
+
+    def _compact_out(self, T, ro):
+        """The compact forward of T tokens, its hidden states [1, T, D] in the buffer every compact graph shares
+        (_shared_out; 104 graphs of up to 12,288 tokens kept 0.8 GB on basal-2.0-mini). With readout positions it
+        returns [COMPACT_SEQS, D] (a few KB per graph) as it is."""
+        if ro is not None or self.gemma is not None:
+            return self.fwd_c
+        D = self._hidden_size
+        out = self._shared_out("compact", max(self.COMPACT_LENS) * D, self._dtype)[: T * D].view(1, T, D)
+        fwd = self.fwd_c
+
+        def compact(*s):
+            return _copy_same(out, fwd(*s))
+        return compact
 
     def _graph_sfx(self, b, S, L):
         """Pass-2 graph (b rows of S tokens over root keys / values of length L, the layout of the plain graphs):
@@ -1437,9 +1541,33 @@ class GraphBackend(EagerBackend):
             mask = TreeMask(torch.zeros(b, dtype=torch.long, device=self.dev),
                             torch.full((b, S), S, dtype=torch.long, device=self.dev),
                             torch.zeros((b, S + 1, S + 1), dtype=torch.bool, device=self.dev))
-        else:
+        elif self.gemma is not None:
             mask = torch.zeros((b, 1, S, L + S), dtype=dt, device=self.dev)
-        return self._capture(key, self.fwd_sfx, ids, mask, pos, self._kv_views(b, L), warmup=2)
+        else:  # the mask is written whole before every replay: one buffer for every pass-2 graph (_shared_out)
+            mask = self._shared_out("pass2 mask", self._pass2_max(lambda b, S, L: b * S * (L + S)), dt)[
+                : b * S * (L + S)].view(b, 1, S, L + S)
+        if self.gemma is not None or self.flex:
+            return self._capture(key, self.fwd_sfx, ids, mask, pos, self._kv_views(b, L), warmup=2)
+        out = self._shared_out("pass2", self._pass2_max(lambda b, S, L: b * S) * self._hidden_size, dt)[
+            : b * S * self._hidden_size].view(b, S, -1)
+        fwd = self.fwd_sfx
+
+        def suffix(i, m, p, kv):
+            return _copy_same(out, fwd(i, m, p, kv))
+        return self._capture(key, suffix, ids, mask, pos, self._kv_views(b, L), warmup=2)
+
+    @property
+    def _hidden_size(self):
+        return self.model.config.hidden_size
+
+    def _pass2_max(self, size):
+        """The largest size(b, S, L) over the pass-2 graphs warm captures (Llama)."""
+        shapes = [(b, S, L) for b in self.TREE_ROWS for L in self.LENS for S in self.SUFFIX_LENS
+                  if b * S <= self.TOKEN_BUDGET and self._pass2_ok(b, L)]
+        if self.prefix:
+            shapes += [(b, S, L) for L in self.LENS if L <= self.PREFIX_ROOT for S in self.PREFIX_SFX
+                       for b in self.PREFIX_ROWS if b * S <= self.TOKEN_BUDGET]
+        return max(size(*s) for s in shapes)
 
     def _tree_mask(self, seg, parents, roots, S):
         """The trie of pass-2 rows as a TreeMask (basal/lean.py): root tokens per row, block per token (S: padding),
@@ -1950,7 +2078,10 @@ class GraphBackend(EagerBackend):
     # -- public calls --------------------------------------------------------------------------------------------
     streams = True  # run_shared(..., done=callback) reports every group as soon as its forwards are read out
     inflight = 2    # calls the server may run at once: one call's host work overlaps the other's forwards
-    _launch = threading.Lock()  # a forward's input copies, replay and readout are enqueued by one call at a time
+    # a forward's input copies, replay and readout are enqueued by one call at a time, all on the device's default
+    # stream (every thread's current stream; nothing here sets another), so the graphs' static inputs, the key / value
+    # buffer and the shared graph outputs (_shared_out) are reused only after the previous call's reads, in launch order
+    _launch = threading.Lock()
 
     @torch.no_grad()
     def run(self, prompts, ids_list):
