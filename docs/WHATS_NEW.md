@@ -1,3 +1,32 @@
+# What is new in basal 2.3.4
+
+- **Less GPU memory for basal-omni in the graph engine** (`--mode fast`): basal-omni's CUDA graphs are now warmed up in
+  the usual order (so torch.compile compiles the same kernels) and captured largest first, as basal-2.0's are since
+  2.3.3 (#37). The pass-2 graphs over states beyond the largest root graph come last, each captured as it is warmed
+  up, so their graph-pool limit still holds. H100 after start-up: basal-omni-1.0-mini 27.8 -> 18.9 GB (graph pool
+  10.6 -> 1.7 GiB), basal-omni-1.0-max 45.3 -> 31.3 GB (16.2 -> 2.3 GiB); the same 520 graphs, every probability
+  bit-identical (840 identity readouts per model), the same start-up time and throughput (mini: 197-198 against 2.3.3's 201-216 single questions per second
+  at 32 clients, which moves this much between runs, 185-189 against 186-187 questions per second five at a time;
+  max: 183 against 186, 52.5 against 52.8).
+- **The same probabilities in every run** (basal-omni, `--mode fast`): Inductor timed some RMSNorm reduction kernels
+  at their first launch and kept the faster reduction block (4,096 or 2,048 values per step, timings within 1% of
+  each other). The block sets the order of the sum, so two processes could answer differently: on an H100, two runs
+  of basal-omni-1.0-mini on fresh compile caches differed in 485 of 840 identity readouts (top answer in 7), a cold
+  and a warm cache in 400 (top answer in 4; 2.3.2 and 2.3.3). The Gemma 4 forward now compiles in Inductor's
+  deterministic mode, where such a kernel has one config, chosen without timing: two cold runs and a warm one give
+  840 of 840 bit-identical readouts. `TORCHINDUCTOR_DETERMINISTIC=0` turns it off. Against 2.3.3 the top answer
+  moved in 2-13 of 840 identity readouts, about as much as 2.3.3 moved between its own runs (4-7), with no loss of
+  accuracy on 1,700 QD items: basal-omni-1.0-mini 82.47% -> 82.76% (7 newly right, 2 newly wrong, McNemar p 0.18),
+  1.0-max 85.12% -> 85.18% (1 newly right). basal-2.0 is unchanged (its compiled kernels have no timed choice that
+  changes the numbers): 4,120 of 4,120 readouts bit-identical to 2.3.3.
+- **`--deterministic` with basal-omni** still runs one request per forward. Batch-invariant kernels (fixed-tile GEMMs,
+  a row-wise RMSNorm, FlashAttention 3 with the window kept) made basal-omni-1.0-mini and 1.0-max bit-identical alone
+  and in any batch (840 of 840 readouts each), but batched they served fewer decisions per second than one request
+  per forward (H100, mini: 154 instead of 163 single questions per second at 32 clients, p50 15 instead of 9 ms;
+  136 instead of 140 questions per second five at a time; start-up 3 minutes longer), so they are not in this
+  release; a faster batch-invariant GEMM is future work. `--deterministic` itself serves as in 2.3.3, with the
+  smaller graph pool (mini 164 / 138, max 88 / 56; 100 of 100 answers identical alone and under load).
+
 # What is new in basal 2.3.3
 
 - **Less GPU memory for basal-2.0 in the graph engine** (`--mode fast`): the captured CUDA graphs of a family write

@@ -849,7 +849,7 @@ class GraphBackend(EagerBackend):
     softcap = None                # the model's final logit softcap (Gemma), applied to the fp32 code logits
     _out = None                   # Llama graphs: the output buffers their captures share (_shared_out)
     _side = None                  # the stream the captures warm up on (one: each new stream pins a cuBLAS workspace)
-    _deferred = None              # warm(), Llama: graphs warmed up, captured the largest first (_capture_deferred)
+    _deferred = None              # warm(): graphs warmed up, captured the largest first (_capture_deferred)
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
@@ -1143,10 +1143,10 @@ class GraphBackend(EagerBackend):
 
     def warm(self):
         """Capture every plain graph of the grid, and with `shared` the pass-2 graphs for roots up to the largest of
-        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx). Llama: every graph is warmed up here in this order and captured
-        afterwards, the largest first (_capture_deferred)."""
-        if self.gemma is None:  # (Gemma 4's _warm_long_sfx measures the pool as each graph is captured)
-            self._deferred = {}  # key -> (function, static inputs), in warm-up order
+        LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx). Every graph is warmed up here in this order and captured
+        afterwards, the largest first (_capture_deferred); Gemma 4's pass-2 graphs over roots beyond LENS after the
+        others, each as it is warmed up (_warm_long_sfx measures the pool as each of them is captured)."""
+        self._deferred = {}  # key -> (function, static inputs), in warm-up order
         if self.compact:  # plain graphs only for pass 1 of branched units (at most TREE_ROWS[-1] roots)
             for T in self.COMPACT_LENS:
                 self._graph_c(T)
@@ -1166,6 +1166,7 @@ class GraphBackend(EagerBackend):
                             if b * S <= self.TOKEN_BUDGET:
                                 self._graph_sfx(b, S, L)
             if self.gemma is not None:
+                self._capture_deferred()
                 self._warm_long_sfx()
         if self._deferred is not None:
             self._capture_deferred()
@@ -1438,9 +1439,9 @@ class GraphBackend(EagerBackend):
         return m.norm(h)
 
     def _capture(self, key, fn, *static, warmup=3):
-        """Warm fn up (torch.compile compiles here, at its first call) and capture it as graph `key`; in warm()
-        (Llama) the capture waits for _capture_deferred, and a key already waiting is not warmed up again (with
-        --prefix-cache the two pass-2 families share some shapes)."""
+        """Warm fn up (torch.compile compiles here, at its first call) and capture it as graph `key`; in warm() the
+        capture waits for _capture_deferred, and a key already waiting is not warmed up again (with --prefix-cache
+        the two pass-2 families share some shapes)."""
         if self._deferred is not None:
             if key not in self._deferred:
                 self._warm_up(fn, static, warmup)
@@ -1466,13 +1467,14 @@ class GraphBackend(EagerBackend):
         return self.graphs[key]
 
     def _capture_deferred(self):
-        """warm() (Llama): capture the graphs warmed up so far, the one with the most tokens first. Every graph's
+        """warm(): capture the graphs warmed up so far, the one with the most tokens first. Every graph's
         memory stays in the shared pool; what a graph frees at the end of its capture, a later capture reuses, but only
         in blocks no larger than the freed ones, so captured from the smallest up (the grid's order: compact graphs of
         16, 32, ... 12,288 tokens) each larger graph allocated new blocks and the pool grew to many times the largest
         graph's working set. torch.compile still sees the shapes in the grid's order (the warm-up calls in _capture),
         so the compiled kernels are those of capturing in that order. RTX 4090, basal-2.0-mini, --batches compact,
-        21 Oct: graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical."""
+        21 Oct: graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical. Gemma 4
+        the same from 2.3.4 (before it, its graphs were captured in the grid's order)."""
         deferred, self._deferred = self._deferred, None
         for key in sorted(deferred, key=_graph_tokens, reverse=True):
             self._record(key, *deferred[key])
