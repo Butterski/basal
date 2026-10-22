@@ -1147,8 +1147,10 @@ class GraphBackend(EagerBackend):
     def warm(self):
         """Capture every plain graph of the grid, and with `shared` the pass-2 graphs for roots up to the largest of
         LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx). Every graph is warmed up here in this order and captured
-        afterwards, the largest first (_capture_deferred); Gemma 4's pass-2 graphs over roots beyond LENS after the
-        others, each as it is warmed up (_warm_long_sfx measures the pool as each of them is captured)."""
+        afterwards (_capture_deferred): the plain and compact graphs the largest first, then the pass-2 graphs the
+        smallest first while PASS2_RESERVE stays free; Gemma 4's pass-2 graphs over roots beyond LENS after the
+        others, each as it is warmed up (_warm_long_sfx measures the pool as each of them is captured, and keeps the
+        reserve free)."""
         self._deferred = {}  # key -> (function, static inputs), in warm-up order
         if self.compact:  # plain graphs only for pass 1 of branched units (at most TREE_ROWS[-1] roots)
             for T in self.COMPACT_LENS:
@@ -1193,9 +1195,10 @@ class GraphBackend(EagerBackend):
         for L in (x for x in self.PLAIN_LENS if x > self.LENS[-1]):
             for b in (x for x in self.TREE_ROWS if x * L <= self.TOKEN_BUDGET):
                 for S in self.SUFFIX_LENS:
-                    if self.dev.type == "cuda" and torch.cuda.memory_reserved(self.dev) - r0 > self.PASS2_POOL:
+                    if (self.dev.type == "cuda" and torch.cuda.memory_reserved(self.dev) - r0 > self.PASS2_POOL
+                            or not self._room()):
                         return
-                    self._graph_sfx(b, S, L)
+                    self._measured(self._graph_sfx, b, S, L)
 
     def _warm_pass2(self, n):
         """Gemma 4: pass 2 without a graph calls one compiled flex_attention, which compiles anew for each shape class
@@ -1480,24 +1483,38 @@ class GraphBackend(EagerBackend):
         the same from 2.3.4 (before it, its graphs were captured in the grid's order).
 
         The pass-2 graphs come last, the smallest (the commonest shapes) first, and only while PASS2_RESERVE of GPU
-        memory stays free: each keeps 10-20 MB outside the pool for its kernels (basal-2.0-mini / 4.5B, RTX 4090),
-        264 of them about 5 GB on basal-2.0-4.5B, which therefore did not start on a 16 GB card. A pass 2 without its
-        graph runs uncompiled, as one beyond the grid does (_tree_hidden); the plain and compact graphs, which a
-        forward cannot do without, are all captured."""
+        memory stays free after the capture (_room: free memory less what the last capture took): each keeps 10-20 MB
+        outside the pool for its kernels (basal-2.0-mini / 4.5B, RTX 4090), 264 of them about 5 GB on basal-2.0-4.5B,
+        which therefore did not start on a 16 GB card. A pass 2 without its graph runs uncompiled, as one beyond the
+        grid does (_tree_hidden); the plain and compact graphs, which a forward cannot do without, are all captured."""
         deferred, self._deferred = self._deferred, None
         keys = sorted(deferred, key=_graph_tokens, reverse=True)
         for key in (k for k in keys if k[0] != "x"):
-            self._record(key, *deferred[key])
+            self._measured(self._record, key, *deferred[key])
         pass2 = [k for k in reversed(keys) if k[0] == "x"]
         if pass2 and self.dev.type == "cuda":
             torch.cuda.empty_cache()  # (blocks the warm-up calls left cached are no graph's)
         for n, key in enumerate(pass2):
-            free = self._free_memory()
-            if free is not None and free < self.PASS2_RESERVE:
+            if not self._room():
                 print(f"basal: {n} of {len(pass2)} pass-2 graphs captured, {self.PASS2_RESERVE >> 20} MiB of GPU "
                       "memory kept free; the other shapes run pass 2 without a graph", flush=True)
                 break
-            self._record(key, *deferred[key])
+            self._measured(self._record, key, *deferred[key])
+
+    _capture_cost = 0  # the GPU memory the last measured capture took (_measured): the estimate for the next one
+
+    def _room(self):
+        """Whether one more pass-2 graph fits: the free GPU memory less what the last capture took stays at or above
+        PASS2_RESERVE (always off CUDA)."""
+        free = self._free_memory()
+        return free is None or free - self._capture_cost >= self.PASS2_RESERVE
+
+    def _measured(self, capture, *args):
+        """capture(*args), keeping the GPU memory it took as _capture_cost."""
+        before = self._free_memory()
+        capture(*args)
+        if before is not None:
+            self._capture_cost = max(before - self._free_memory(), 0)
 
     def _free_memory(self):
         """Free GPU memory in bytes (None off CUDA: no budget)."""

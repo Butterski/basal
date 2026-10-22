@@ -264,12 +264,39 @@ def test_pass2_graphs_captured_while_memory_stays_free(card):
     kept = sorted((k for k in be.graphs if k[0] == "x"), key=_graph_tokens)
     assert len(plain) == len(be.grid(be.PLAIN_LENS))
     assert kept == sorted(every, key=_graph_tokens)[: len(kept)]
-    assert len(kept) == (card - len(plain) - be.PASS2_RESERVE + 1 if card < 100 else len(every))
+    assert len(kept) == (card - len(plain) - be.PASS2_RESERVE if card < 100 else len(every))
+    assert card - len(be.graphs) >= be.PASS2_RESERVE  # the reserve stays free after the last capture
     rnd = random.Random(9)
     roots = [[1] + [rnd.randrange(3, 50) for _ in range(11)] for _ in range(4)]
     four = [([r + [10, 11], r + [11, 10]], [[10, 11], [10, 11]]) for r in roots]  # 4 units, 4 tokens below 12
     assert (("x", 4, 8, 16) in be.graphs) == (card >= 100)
     check(be, four + groups(rnd))
+
+
+def test_gemma_long_root_graphs_keep_the_reserve():
+    """Gemma 4's pass-2 graphs over roots longer than LENS (_warm_long_sfx) also stop where PASS2_RESERVE would no
+    longer stay free (simulated: one unit per graph), not only at PASS2_POOL, which counts the pool and not the
+    memory a graph keeps for its kernels."""
+    from types import SimpleNamespace
+
+    class Gemma(GraphBackend):
+        LENS, PLAIN_LENS, BATCHES, TOKEN_BUDGET = [16, 32], [16, 32, 64], [1, 2, 4], 128
+        SUFFIX_LENS, TREE_ROWS, PASS2_RESERVE = [8, 16], [1, 2], 10
+
+    be = Gemma.__new__(Gemma)
+    be.gemma, be.compact, be.shared, be.prefix, be.dev = object(), False, True, False, torch.device("cpu")
+    be.model, be.graphs = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), {}
+    be._graph = lambda b, L: be._capture(("p", b, L), lambda: None)
+    be._graph_sfx = lambda b, S, L: be._capture(("x", b, S, L), lambda: None)
+    be._warm_up = lambda fn, static, n: None
+    be._record = lambda key, fn, static: be.graphs.setdefault(key, key)
+    grid = len(be.grid(be.PLAIN_LENS)) + 2 * 2 * 2  # plain (b <= 4) + pass 2 within LENS: all fit on this card
+    be._free_memory = lambda: grid + 2 + be.PASS2_RESERVE - len(be.graphs)  # room for two more graphs
+    be.warm()
+    long = [k for k in be.graphs if k[0] == "x" and k[3] > be.LENS[-1]]
+    assert len(be.graphs) == grid + 2 and len(long) == 2
+    assert grid + 2 + be.PASS2_RESERVE - len(be.graphs) >= be.PASS2_RESERVE
+
 
 def test_pass2_graphs_are_the_reachable_shapes():
     """warm() captures pass-2 graphs (rows, root length) exactly for the batches pass 1 can form (_chunks; state-cached
