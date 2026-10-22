@@ -1,6 +1,7 @@
 """Fast path routing on CPU (graphs replaced by eager replays of the same static buffers): single prompts in plain
 graphs or a plain long forward, branched units in masked graphs or the two passes over the root's KV cache, all units
 of all groups batched together and read out at once. Every readout equals a separate forward of its own prompt."""
+import contextlib
 import random
 
 import pytest
@@ -250,6 +251,28 @@ def test_shared_graph_outputs_keep_every_readout():
     for fam in "px":
         assert len({g[-1].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == fam}) == 1
     assert len({g[2].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == "x"}) == 1
+
+
+def test_each_graph_warmed_up_once_before_its_capture(monkeypatch):
+    """The engine's _capture / _warm_up (torch.cuda's stream calls as no-ops on the CPU): a graph's function runs once
+    before its capture, the first call that compiles and sets up what the capture cannot. 3 calls per plain graph
+    (2 per pass-2 graph) cost 414 s of basal-2.0-4.5B's 1,094 s warm-up on an RTX 4060 Ti."""
+    class Stream:
+        def wait_stream(self, other):
+            pass
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: Stream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    calls, recorded = [], []
+    be = GraphBackend.__new__(GraphBackend)
+    be._side, be._deferred = None, {}
+    be._record = lambda key, fn, static: recorded.append(key)
+    for key in (("p", 2, 16), ("x", 1, 8, 16), ("p", 2, 16)):  # the last one waits already: not warmed up again
+        GraphBackend._capture(be, key, lambda *s, k=key: calls.append((k, s)), "static")
+    assert calls == [(("p", 2, 16), ("static",)), (("x", 1, 8, 16), ("static",))] and not recorded
+    be._deferred = None  # outside warm(): warmed up once, then captured
+    GraphBackend._capture(be, ("c", 64), lambda *s: calls.append((("c", 64), s)), "static")
+    assert calls[2:] == [(("c", 64), ("static",))] and recorded == [("c", 64)]
 
 
 @pytest.mark.parametrize("prefix", [False, True])
