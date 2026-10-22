@@ -1,3 +1,13 @@
+# What is new in basal 2.3.3 (not released yet)
+
+- **Long states on the CPU without dense masks** (`--mode mps --device cpu`): the branch pass attends to the state's
+  keys and values as they are and, per trie block, to its own ancestors, merged by log-sum-exp (the softmax over all
+  keys, summed in another order), so it needs no `[N, P + N]` mask and no copied keys, and a request with many
+  questions is no longer split with the state recomputed per part. basal-2.0-mini fp32, a 3,278-token state: 40
+  questions 105 -> 92 s, 120 questions 313 -> 207 s (the state once instead of 3 times), peak memory -0.5 / -0.75 GB,
+  the same top answer on 160 of 160 (max |Δp| 9e-6). Contributed by Milosz (@Butterski),
+  [#34](https://github.com/rkinas/basal/pull/34).
+
 # What is new in basal 2.3.2
 
 - **Models with Gated DeltaNet layers** (Qwen3.5, such as the 0.8B pico): `--mode fast`, `fast-nocompile`,
