@@ -89,8 +89,10 @@ benchmarking a GPU.
     GPU memory +5.8 / +7.2 GB, start-up +31 / +112 s; dev v2 at margin >= 0.2: 7,632 / 7,632 (mini) and 9,047 /
     9,049 (4.5B, template prefix off) kept their top answer. On an RTX 3090 (Ampere, sm_86; @krzysztofkaminski, #33):
     +68% on short prompts and +20% / +18% (mini / 4.5B) on ~1.6k-token states, GPU memory +5.9 GB for mini, the
-    same top answer on 58 of 58; the 4.5B with compact rows runs out of memory at start-up on 24 GB (it starts with
-    `GraphBackend.TREE_ROWS = [1, 2, 4]`).
+    same top answer on 58 of 58; up to 2.3.2 the 4.5B with compact rows ran out of memory at start-up on 24 GB.
+    From 2.3.3 (#35, #37, @Butterski) the graphs share their output buffers and are captured largest first, so
+    compact rows cost only 0.1-0.2 GB more than default rows (H100 after warm-up: mini 7.1 / 7.3 GB, 4.5B 15.2 /
+    15.4 GB, every probability as in 2.3.2), and the 4.5B with compact rows starts on a 24 GB RTX 4090.
   - `--template-prefix on`: the chat template, system prompt and user header of every prompt language are computed
     once at start-up; compact rows run only their own tokens over them (off for basal-2.0 4.5B, see the quick start).
   - `--scheduler on`: requests longer than `--long-tokens` (2,048) wait in a backlog and join engine calls in
