@@ -45,6 +45,7 @@ from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFB
                      MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, fp8_refused,
                      gemma_fast_kernels, recurrent_layers, recurrent_refused, resolve, set_fp8_fast_accum)
 from .evidence import Evidence
+from .gdn_graph import default_fast as gdn_default_fast, is_gdn, refused as gdn_refused
 from .facts import inject as inject_facts
 from . import tasks
 from .prompt import (FORMATS, MAX_OPTIONS, RequestError, lang_of, letter_ids, max_options, media_messages, model_format,
@@ -86,12 +87,13 @@ def default_mode(model=None, revision=None):
     with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only on the
     GPU classes where its fast configuration passed its gate (gemma_fast_kernels: Hopper with flash_attn_3, Blackwell
     workstation GPUs), eager on other GPUs until they pass theirs (2.2.0 had no working default for it there: fast
-    stopped at "'Gemma4Model' object has no attribute 'layers'"). A model with recurrent-state layers (Qwen3.5: Gated
-    DeltaNet) gets eager on CUDA and Apple Silicon: fast and mps refuse it (recurrent_refused), mlx is not checked on
-    it."""
+    stopped at "'Gemma4Model' object has no attribute 'layers'"). A model with recurrent-state layers gets eager on CUDA
+    and Apple Silicon (mps refuses it, mlx is not checked on it), except a Qwen3.5 model (Gated DeltaNet), which gets
+    fast on the GPU class where the graph engine's port passed its gate (gdn_graph.default_fast: Hopper with fla)."""
     if torch.cuda.is_available():
-        if model is not None and (_recurrent(model, revision)
-                                  or gemma_fast_kernels() is None and _gemma4(model, revision)):
+        if model is not None and _recurrent(model, revision):
+            return "fast" if _gdn(model, revision) and gdn_default_fast() else "eager"
+        if model is not None and gemma_fast_kernels() is None and _gemma4(model, revision):
             return "eager"
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
@@ -125,6 +127,15 @@ def _recurrent(model, revision=None):
         return recurrent_layers(resolve(model, revision, metadata_only=True))
     except Exception:
         return None
+
+
+def _gdn(model, revision=None):
+    """A Qwen3.5 model of Gated DeltaNet and attention layers (gdn_graph.is_gdn: the recurrent models the CUDA graph
+    engine serves), from its config.json; False when that cannot be read."""
+    try:
+        return is_gdn(resolve(model, revision, metadata_only=True))
+    except Exception:
+        return False
 
 
 def validate_quant(mode, quant):
@@ -711,8 +722,18 @@ class Server:
             raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
         if kind in ("graph", "exit"):  # before the weights are downloaded (mps: MPSBackend, when it shares prefixes)
             what = _recurrent(a.model, a.revision)
-            if what:
-                raise SystemExit(recurrent_refused(a.model, what))
+            gdn = bool(what) and _gdn(a.model, a.revision)
+            if what and (kind == "exit" or not gdn):
+                raise SystemExit(recurrent_refused(a.model, what, gdn))
+            if gdn:  # Qwen3.5 in the graph engine (basal 2.4): bf16, plain and branched rows
+                why = gdn_refused(a.quant or quant, getattr(a, "state_cache_gb", 0),
+                                  getattr(a, "prefix_cache", "off") == "on", getattr(a, "batches", "default"),
+                                  lean_arg(getattr(a, "lean", "off")), getattr(a, "tree", "dense"),
+                                  getattr(a, "readout_layer", "off"), getattr(a, "template_prefix", "off"))
+                if not why and getattr(a, "long_lane", "off") == "on":
+                    why = "--long-lane is not available for Qwen3.5 (Gated DeltaNet) models"
+                if why:
+                    raise SystemExit(f"{a.model}: {why}")
         if kind in ("graph", "exit") and (a.quant or quant) == "fp8" and fp8_refused():
             raise SystemExit(fp8_refused())
         # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
