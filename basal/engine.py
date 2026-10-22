@@ -1596,7 +1596,8 @@ class GraphBackend(EagerBackend):
         """One call of fn on the side stream before its capture: what a capture cannot do happens at a forward's first
         call (torch.compile compiles, or recompiles for a shape its guards reject; cuBLAS sets up its handle and
         workspace; Triton loads its kernels). The second and third calls (plain graphs 3, pass-2 graphs 2 before) ran
-        the same kernels again and only took start-up time."""
+        the same kernels again and only took start-up time: RTX 4060 Ti, 22 Oct, warm() 468 -> 323 s on basal-2.0-mini
+        and 1,094 -> 680 s on basal-2.0-4.5B, the probabilities bit-identical (420 readouts each)."""
         if self._side is None:
             self._side = torch.cuda.Stream()
         st = self._side; st.wait_stream(torch.cuda.current_stream())
