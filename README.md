@@ -445,7 +445,9 @@ Thank you to the people whose work is in this repository, by pull request:
   ([#16](https://github.com/rkinas/basal/pull/16)); `--mode gguf` on every physical core
   ([#20](https://github.com/rkinas/basal/pull/20)); `--mode mps` on the CPU, so a request's state is computed once
   there too ([#26](https://github.com/rkinas/basal/pull/26)), and its branch pass without dense masks
-  ([#34](https://github.com/rkinas/basal/pull/34)); and less GPU memory in the graph engine: shared graph outputs
+  ([#34](https://github.com/rkinas/basal/pull/34)); compact rows on any sm80+ GPU through torch varlen attention
+  ([#29](https://github.com/rkinas/basal/pull/29)); `--lean` refused on `--tree flex` before the model loads
+  ([#30](https://github.com/rkinas/basal/pull/30)); and less GPU memory in the graph engine: shared graph outputs
   ([#35](https://github.com/rkinas/basal/pull/35)) and graphs captured largest first, so compact rows fit 16 GB and
   24 GB cards ([#37](https://github.com/rkinas/basal/pull/37)).
 - Grzegorz Brzezinka ([@agentGreg](https://github.com/agentGreg)): the calibration report's per-type ECE as
@@ -460,6 +462,11 @@ Thank you to the people whose work is in this repository, by pull request:
   bit-identical edge cases and a similar speed-up ([#21](https://github.com/rkinas/basal/pull/21)).
 - [@lukaszpodgorski-pl](https://github.com/lukaszpodgorski-pl): basal on Windows: kernel checks for torch builds without
   FlashAttention or Triton, and UTF-8 for every text file ([#38](https://github.com/rkinas/basal/pull/38)).
+
+Measurements in the docs, from issues: Kamil ([@kamilrosa](https://github.com/kamilrosa)), Apple M5 Pro numbers for
+basal-1.0, basal-2.0 and basal-omni ([#7](https://github.com/rkinas/basal/issues/7),
+[#36](https://github.com/rkinas/basal/issues/36)), and [@krzysztofkaminski](https://github.com/krzysztofkaminski), the
+first Ampere numbers on an RTX 3090 ([#33](https://github.com/rkinas/basal/issues/33)).
 
 `--mode tpu` and `--mode strix` are community-maintained: their numbers in [HARDWARE.md](docs/HARDWARE.md) are the
 contributors' own measurements.
