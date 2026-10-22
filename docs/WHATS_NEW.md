@@ -9,6 +9,16 @@
   every probability bit-identical (420 readouts per model and batching mode), the same decisions per second (128.7 /
   128.4 single questions, 53.4 / 54.5 questions per second five at a time over 1.5k-token states) and start-up time.
   Contributed by Milosz (@Butterski), [#35](https://github.com/rkinas/basal/pull/35).
+- **Compact rows on 16 GB and 24 GB cards** (`--batches compact`): the graph engine warms every CUDA graph up in the
+  usual order (so torch.compile compiles the same kernels) and then captures them largest first. Captured smallest
+  first, each larger graph took new memory in the shared graph pool instead of reusing what the smaller ones had freed
+  (basal-2.0-mini with compact rows: 9.0 GiB of graph pool, now 1.0). The compact graphs also share one output buffer.
+  basal-2.0-mini with compact rows now starts on an RTX 4060 Ti 16 GB (9.1 GB; out of memory before), with 117.6
+  instead of 57.4 decisions per second on single questions; basal-2.0-4.5B with compact rows starts on an RTX 4090
+  (18.4 GB; out of memory before), 131.8 instead of 70.0 decisions per second. RTX 4090 after start-up: mini with
+  compact rows 17.6 -> 9.4 GB, without 10.0 -> 9.0 GB, 4.5B 20.5 -> 19.3 GB; every probability bit-identical (420
+  readouts per model and batching mode), the same decisions per second as before where both start.
+  Contributed by Milosz (@Butterski), [#37](https://github.com/rkinas/basal/pull/37).
 
 # What is new in basal 2.3.2
 
