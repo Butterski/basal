@@ -977,7 +977,7 @@ class GraphBackend(EagerBackend):
         LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx). Llama: every graph is warmed up here in this order and captured
         afterwards, the largest first (_capture_deferred)."""
         if self.gemma is None:  # (Gemma 4's _warm_long_sfx measures the pool as each graph is captured)
-            self._deferred = []
+            self._deferred = {}  # key -> (function, static inputs), in warm-up order
         if self.compact:  # plain graphs only for pass 1 of branched units (at most TREE_ROWS[-1] roots)
             for T in self.COMPACT_LENS:
                 self._graph_c(T)
@@ -1270,11 +1270,14 @@ class GraphBackend(EagerBackend):
 
     def _capture(self, key, fn, *static, warmup=3):
         """Warm fn up (torch.compile compiles here, at its first call) and capture it as graph `key`; in warm()
-        (Llama) the capture waits for _capture_deferred."""
-        self._warm_up(fn, static, warmup)
+        (Llama) the capture waits for _capture_deferred, and a key already waiting is not warmed up again (with
+        --prefix-cache the two pass-2 families share some shapes)."""
         if self._deferred is not None:
-            self._deferred.append((key, fn, static))
+            if key not in self._deferred:
+                self._warm_up(fn, static, warmup)
+                self._deferred[key] = (fn, static)
             return None
+        self._warm_up(fn, static, warmup)
         return self._record(key, fn, static)
 
     def _warm_up(self, fn, static, n):
@@ -1302,8 +1305,8 @@ class GraphBackend(EagerBackend):
         so the compiled kernels are those of capturing in that order. RTX 4090, basal-2.0-mini, --batches compact,
         21 Oct: graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical."""
         deferred, self._deferred = self._deferred, None
-        for key, fn, static in sorted(deferred, key=lambda d: _graph_tokens(d[0]), reverse=True):
-            self._record(key, fn, static)
+        for key in sorted(deferred, key=_graph_tokens, reverse=True):
+            self._record(key, *deferred[key])
 
     def _graph(self, b, L):
         """Plain graph (b rows, length L): (graph, ids, kv buffers or None, hidden states [b, L, D]); Gemma 4: (graph,

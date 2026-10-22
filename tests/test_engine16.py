@@ -3,6 +3,7 @@ graphs or a plain long forward, branched units in masked graphs or the two passe
 of all groups batched together and read out at once. Every readout equals a separate forward of its own prompt."""
 import random
 
+import pytest
 import torch
 
 from basal.engine import GraphBackend, causal_sdpa
@@ -187,20 +188,24 @@ def test_shared_graph_outputs_keep_every_readout():
     assert len({g[2].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == "x"}) == 1
 
 
-def test_warm_captures_largest_first_after_every_warm_up():
+@pytest.mark.parametrize("prefix", [False, True])
+def test_warm_captures_largest_first_after_every_warm_up(prefix):
     """warm() (Llama) runs every graph's warm-up calls first, in the grid's order (torch.compile compiles there, so
     the compiled kernels do not change), then captures them all, the most tokens first, so each capture can reuse the
-    pool blocks a larger one freed; replays still answer as separate forwards."""
+    pool blocks a larger one freed; replays still answer as separate forwards. With --prefix-cache the two pass-2
+    families share shapes: each graph is still warmed up and captured once."""
     from basal.engine import _graph_tokens
 
     class Order(Stub):
-        SUFFIX_LENS = [8, 16]
+        SUFFIX_LENS = PREFIX_SFX = [8, 16]
+        PREFIX_ROWS = [1, 2, 4]
 
         def _capture(self, key, fn, *static, warmup=3):  # the engine's _capture, its two steps observed
-            self.events.append(("warm", key))
+            self.events.append(("request", key))
             return GraphBackend._capture(self, key, fn, *static, warmup=warmup)
 
         def _warm_up(self, fn, static, n):
+            self.events.append(("warm", None))
             fn(*static)
 
         def _record(self, key, fn, static):
@@ -209,16 +214,19 @@ def test_warm_captures_largest_first_after_every_warm_up():
             self.graphs[key] = (r, *static, r.out)
             return self.graphs[key]
 
+    Order.prefix = prefix
     be = Order(tiny())
     be.events = []
     be.warm()
     kinds = [e[0] for e in be.events]
     first = kinds.index("capture")
-    assert "warm" not in kinds[first:] and kinds.count("capture") == kinds.count("warm") > 20
-    caps = [_graph_tokens(k) for kind, k in be.events if kind == "capture"]
-    assert caps == sorted(caps, reverse=True) and {"p", "x"} <= {k[0] for _, k in be.events}
+    caps = [k for kind, k in be.events if kind == "capture"]
+    requests = [k for kind, k in be.events if kind == "request"]
+    assert "warm" not in kinds[first:] and kinds.count("warm") == len(caps) == len(set(caps)) == len(set(requests)) > 20
+    assert (len(requests) > len(set(requests))) == prefix  # the shared shapes asked for twice
+    assert [_graph_tokens(k) for k in caps] == sorted(map(_graph_tokens, caps), reverse=True)
+    assert {"p", "x"} <= {k[0] for k in caps}
     check(be, groups(random.Random(7)))
-
 
 
 def test_pass2_graphs_are_the_reachable_shapes():
