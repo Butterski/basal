@@ -42,8 +42,8 @@ from pathlib import Path
 import torch
 
 from .engine import (ATTN, EAGER_FORWARDS, EagerBackend, ExitGraphBackend, GGUFBackend, GraphBackend, LlamaCppBackend,
-                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, gemma_fast_kernels,
-                     resolve, set_fp8_fast_accum)
+                     MLXBackend, MPSBackend, OllamaBackend, SGLangBackend, VLLM_PRESETS, VLLMBackend, fp8_refused,
+                     gemma_fast_kernels, recurrent_layers, recurrent_refused, resolve, set_fp8_fast_accum)
 from .evidence import Evidence
 from .facts import inject as inject_facts
 from . import tasks
@@ -58,7 +58,7 @@ from .tools import answer as tool_answer
 from .tools import parse as parse_tools
 from .tools import set_answer as tool_set_answer
 
-RELEASE_DATE = "2026-10-19"  # the engine's release date (GET /v1/models), not the served model's
+RELEASE_DATE = "2026-10-22"  # the engine's release date (GET /v1/models), not the served model's
 
 MODES = {
     # mode: (backend, quantisation, compile)
@@ -86,12 +86,17 @@ def default_mode(model=None, revision=None):
     with basal[tpu] installed, else eager. basal-omni (Gemma 4; model: its directory or repo id) gets fast only on the
     GPU classes where its fast configuration passed its gate (gemma_fast_kernels: Hopper with flash_attn_3, Blackwell
     workstation GPUs), eager on other GPUs until they pass theirs (2.2.0 had no working default for it there: fast
-    stopped at "'Gemma4Model' object has no attribute 'layers'")."""
+    stopped at "'Gemma4Model' object has no attribute 'layers'"). A model with recurrent-state layers (Qwen3.5: Gated
+    DeltaNet) gets eager on CUDA and Apple Silicon: fast and mps refuse it (recurrent_refused), mlx is not checked on
+    it."""
     if torch.cuda.is_available():
-        if model is not None and gemma_fast_kernels() is None and _gemma4(model, revision):
+        if model is not None and (_recurrent(model, revision)
+                                  or gemma_fast_kernels() is None and _gemma4(model, revision)):
             return "eager"
         return "fast"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        if model is not None and _recurrent(model, revision):
+            return "eager"
         try:
             import mlx.core  # noqa: F401
             import mlx_lm  # noqa: F401
@@ -111,6 +116,15 @@ def _gemma4(model, revision=None):
         return is_gemma4_dir(resolve(model, revision, metadata_only=True))
     except Exception:  # offline without the model cached, a wrong name: the model load reports it
         return False
+
+
+def _recurrent(model, revision=None):
+    """The recurrent-state layers of a model (recurrent_layers), from its config.json; None when that cannot be read
+    (the model load reports it)."""
+    try:
+        return recurrent_layers(resolve(model, revision, metadata_only=True))
+    except Exception:
+        return None
 
 
 def validate_quant(mode, quant):
@@ -695,6 +709,12 @@ class Server:
             raise SystemExit("--mlx-packed needs --mode mlx (or mlx-q8)")
         if kind == "mps" and a.device == "cuda":
             raise SystemExit("--mode mps runs on Apple Silicon or the CPU (--device mps / cpu); on CUDA: --mode fast")
+        if kind in ("graph", "exit"):  # before the weights are downloaded (mps: MPSBackend, when it shares prefixes)
+            what = _recurrent(a.model, a.revision)
+            if what:
+                raise SystemExit(recurrent_refused(a.model, what))
+        if kind in ("graph", "exit") and (a.quant or quant) == "fp8" and fp8_refused():
+            raise SystemExit(fp8_refused())
         # GGUF modes: the engine serves the GGUF weights, so only tokenizer, template and calibration are downloaded
         md = resolve(a.model, a.revision, metadata_only=kind in ("gguf", "ollama", "llamacpp"))
         self.fmt = model_format(md)  # prompt format of the model (basal.json "prompt"; 1 when absent)

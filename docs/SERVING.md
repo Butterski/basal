@@ -29,6 +29,12 @@ benchmarking a GPU.
 - Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `tpu` on a TPU VM with
   `basal[tpu]`, `eager` otherwise. On a CPU, `--mode mps` computes a request's state once for all its prompts and is
   faster for requests with several questions or option orders; `eager` stays the default there (the reference path).
+- **Models with Gated DeltaNet layers** (Qwen3.5 and other hybrid models with recurrent-state layers, such as the 0.8B
+  pico; 2.3.2): `fast`, `fast-nocompile`, `fast-exit`, `fp8`, `nvfp4` and `mps` keep attention keys and values only, so
+  they refuse such a model before loading it (2.3.1 served it in `fast` with wrong answers). Without `--mode` it runs
+  `eager` on CUDA and Apple Silicon; `--mode vllm` is faster on CUDA, `--mode gguf` runs it on Metal, CUDA or the CPU.
+- **`--mode fp8` below compute capability 8.9** (Ampere, e.g. RTX 3090 / A100) stops before loading the model (2.3.2;
+  before, torchao failed after the load): serve bf16 with `--mode fast` there.
 - **basal-omni (Gemma 4) in `eager`** (2.3): the engine's own Gemma 4 forward: a request's state (and media) once,
   then every question over it, and mini's last layers at the answer rows only; `--eager-forward hf` keeps the
   transformers forward of 2.2. [OMNI.md](OMNI.md#what-the-engine-does-differently-for-gemma-4)
