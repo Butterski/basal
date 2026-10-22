@@ -281,6 +281,22 @@ def test_leaves_of_a_trie():
     assert reads == [(0, 1), (1, 1), (2, 0), (None, 2)]
 
 
+@pytest.mark.parametrize("L2", [512, 8192])
+def test_pass2_parts_keep_the_budgets(L2):
+    """Leaf rows are run shortest first, at most LEAF_ROWS[-1] (and PASS2_KEYS // root bucket) per forward, rows x
+    length within TOKEN_BUDGET unless a row is alone; every row once."""
+    be = GDNGraphBackend.__new__(GDNGraphBackend)
+    lens = [30] * 70 + [300] * 20 + [700] * 13 + [2000]
+    parts = be._parts(lens, L2)
+    assert sorted(q for p in parts for q in p) == list(range(len(lens)))
+    for p in parts:
+        n = max(lens[q] for q in p)
+        S = next((x for x in be.LEAF_LENS if n <= x), -(-n // be.SUFFIX_EAGER) * be.SUFFIX_EAGER)
+        assert len(p) <= min(be.LEAF_ROWS[-1], be.PASS2_KEYS // L2)
+        assert len(p) == 1 or be._bucket(len(p), be.LEAF_ROWS) * S <= be.TOKEN_BUDGET
+    assert [lens[q] for p in parts for q in p] == sorted(lens)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or gdn_module.fla_rule() is None, reason="needs CUDA and fla")
 @pytest.mark.parametrize("dtype, tol", [("float32", 1e-4), ("bfloat16", 0.03)])
 def test_graphs_equal_eager_on_cuda(monkeypatch, tmp_path, dtype, tol):
