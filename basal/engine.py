@@ -2653,7 +2653,8 @@ class GGUFBackend(GraphBackend):
             raise ValueError(f"llama.cpp could not load {gguf}")
         self.arch = self._meta("general.architecture") or ""
         self.recurrent = bool(C.llama_model_is_recurrent(self.cmodel) or C.llama_model_is_hybrid(self.cmodel)
-                              or self.arch.startswith(self.RECURRENT_ARCHS) or self._meta(f"{self.arch}.ssm.state_size"))
+                              or self.arch.startswith(self.RECURRENT_ARCHS)
+                              or self._meta(f"{self.arch}.ssm.state_size"))
         if self.recurrent:
             self.N_SEQ = 1
         # a full model directory: its architecture must match the GGUF file; the -GGUF repositories carry tokenizer and

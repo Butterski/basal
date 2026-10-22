@@ -1,3 +1,25 @@
+# What is new in basal 2.3.2
+
+- **Models with Gated DeltaNet layers** (Qwen3.5, such as the 0.8B pico): `--mode fast`, `fast-nocompile`,
+  `fast-exit`, `fp8`, `nvfp4` and `mps` refuse them before their weights are downloaded or loaded, and without
+  `--mode` they run in `eager` (CUDA and Apple Silicon). Those engines share a request's state as attention keys and
+  values only, so the recurrent state of the Gated DeltaNet layers was lost: 2.3.1 served the pico in `fast` (the
+  CUDA default) with wrong answers and no error. The pico served without `--mode` on an H100: `eager`, top answer as
+  the trainer's readout on 99.65% of 1,700 QD items in bf16 (99.94% in fp32, max |dp| 0.005). The fast engine for
+  these models comes in 2.4.
+- **`--mode gguf` on hybrid and recurrent models** (GGUF architecture `qwen35`, Mamba, RWKV, the others llama.cpp
+  flags): one prompt per `llama_decode`. On the CPU, llama.cpp returned non-finite probabilities whenever a decode held
+  several prompts of such a model (300 of 300 QD prompts at 16 per call, every request with several questions). The
+  pico's Q8_0 now: no non-finite probability, top answer as eager on 99.0% of 300 QD items on 16 CPU threads,
+  99.0% of 1,700 on an H100, 99.0% of 300 on an Apple M4 Pro (Metal); five-question requests answered on all
+  three. A request's state is computed once per question and option order for these models.
+- **`--mode fp8` below compute capability 8.9** (Ampere: RTX 3090, A100) stops before loading the model and suggests
+  `--mode fast`; torchao failed after the load before (#33, @krzysztofkaminski).
+- **Facts block** (@agentGreg): amounts with a dot thousands separator ("10.000,00 zł", #31); "roku" after a date is
+  not a one-year duration (#32).
+- Other models are unchanged: basal-2.0-pico and basal-omni-1.0-mini still default to `fast`, with the same answers
+  as 2.3.1 on 200 QD items (the same probabilities on every item, max |dp| 0).
+
 # What is new in basal 2.3.1
 
 - **basal-omni's fast mode on Blackwell workstation GPUs** (sm_120, such as the RTX PRO 6000): `--gemma-attn auto` is

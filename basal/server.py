@@ -58,7 +58,7 @@ from .tools import answer as tool_answer
 from .tools import parse as parse_tools
 from .tools import set_answer as tool_set_answer
 
-RELEASE_DATE = "2026-10-19"  # the engine's release date (GET /v1/models), not the served model's
+RELEASE_DATE = "2026-10-22"  # the engine's release date (GET /v1/models), not the served model's
 
 MODES = {
     # mode: (backend, quantisation, compile)
@@ -87,7 +87,8 @@ def default_mode(model=None, revision=None):
     GPU classes where its fast configuration passed its gate (gemma_fast_kernels: Hopper with flash_attn_3, Blackwell
     workstation GPUs), eager on other GPUs until they pass theirs (2.2.0 had no working default for it there: fast
     stopped at "'Gemma4Model' object has no attribute 'layers'"). A model with recurrent-state layers (Qwen3.5: Gated
-    DeltaNet) gets eager on CUDA and Apple Silicon: fast and mps refuse it (recurrent_refused), mlx is not checked on it."""
+    DeltaNet) gets eager on CUDA and Apple Silicon: fast and mps refuse it (recurrent_refused), mlx is not checked on
+    it."""
     if torch.cuda.is_available():
         if model is not None and (_recurrent(model, revision)
                                   or gemma_fast_kernels() is None and _gemma4(model, revision)):
