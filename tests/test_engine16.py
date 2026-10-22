@@ -148,6 +148,68 @@ def test_prompt_that_ends_at_the_root():
     assert [r[0] for r in be.replays] == ["tree"]
 
 
+def ref_varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale, causal=False, used=None):
+    """basal.engine._varlen (torch's varlen attention) written out: per packed sequence, grouped-query heads, causal
+    aligned at the end, the first used[i] keys of sequence i -> (o [Tq, H, d], lse [Tq, H] fp32)."""
+    cu_q, cu_k = cu_q.tolist(), cu_k.tolist()
+    used = used.tolist() if used is not None else None
+    r = q.shape[1] // k.shape[1]
+    o, lse = torch.zeros_like(q), torch.zeros(q.shape[:2])
+    for i in range(len(cu_q) - 1):
+        a, b, c = cu_q[i], cu_q[i + 1], cu_k[i]
+        e = c + used[i] if used is not None else cu_k[i + 1]
+        assert b - a <= max_q and e - c <= max_k
+        s = torch.einsum("qhd,khd->hqk", q[a:b].float(), k[c:e].float().repeat_interleave(r, 1)) * scale
+        if causal:
+            s = s.masked_fill(torch.ones(b - a, e - c, dtype=torch.bool).triu(e - c - (b - a) + 1), float("-inf"))
+        lse[a:b] = s.logsumexp(-1).transpose(0, 1)
+        o[a:b] = torch.einsum("hqk,khd->qhd", s.softmax(-1), v[c:e].float().repeat_interleave(r, 1)).to(q.dtype)
+    return o, lse
+
+
+def test_cascade_pass2_equals_separate(monkeypatch):
+    """The CUDA cascade pass 2 (_varlen_tree, _cascade_varlen: the root's keys with per-row key counts, each trie block
+    over its ancestors, merged by log-sum-exp) on the CPU, torch's varlen attention written out (ref_varlen): every
+    readout equals its prompt run alone. Several units per forward with different root and branch lengths (padding,
+    stale buffer keys past each root), nested option orders, readouts inside the root; below CASCADE_TOKENS the dense
+    pass 2 runs."""
+    import basal.engine as E
+    calls = []
+    monkeypatch.setattr(E, "_varlen", lambda *a, **k: calls.append(k.get("causal", False)) or ref_varlen(*a, **k))
+    be = Stub(tiny())
+    be._cascade_why, be.CASCADE_TOKENS = None, 0
+    rnd = random.Random(8)
+    s = [1] + [rnd.randrange(3, 50) for _ in range(12)]
+    gs = groups(rnd) + [([s, s + [10, 11], s + [11, 10]], [[7, 8], [10, 11], [10, 11]])] + groups(rnd)
+    check(be, gs)
+    assert {True, False} <= set(calls) and any(r[0] == "tree" and r[1] > 1 for r in be.replays)
+    calls.clear()
+    be.CASCADE_TOKENS = 1 << 30
+    check(be, gs)
+    assert not calls
+
+
+def test_cascade_why(monkeypatch):
+    """The cascade pass 2 needs CUDA, a model with attention layers only and no --lean; the CPU flash op that the CPU
+    cascade needs (cascade_ok) plays no part on CUDA."""
+    import basal.engine as E
+    be = Stub(tiny())
+    assert be._cascade_why is not None  # the CPU
+    be = Stub(tiny())
+    be.dev, be.lean = torch.device("cuda"), object()
+    assert "lean" in be._cascade_why
+
+    class NoFlash:
+        def __getattr__(self, name):
+            raise AttributeError(name)
+    pytest.importorskip("torch.nn.attention.varlen")  # (its first import reads torch.ops.aten)
+    monkeypatch.setattr(E.torch.ops, "aten", NoFlash())
+    monkeypatch.setattr(E, "torch_varlen_available", lambda dtype: None)
+    be = Stub(tiny())
+    be.dev = torch.device("cuda")
+    assert be._cascade_why is None and not E.cascade_ok(be.model.config)
+
+
 def test_pass2_graphs():
     """With the pass-2 graphs captured (warm), short branch rows replay a graph; longer ones run without one."""
     class Warm(Stub):
