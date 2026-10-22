@@ -7,7 +7,7 @@
   over 1.5k-6k-token documents 1.14-1.39x faster (basal-2.0-mini and basal-2.0-4.5B, RTX 4090 and A100), 40 questions
   1.07-1.11x, 2.1-2.5 GB less GPU memory for the largest of them; smaller requests run as before, bit-identical.
   Answers within bf16 rounding: against fp32, mean |Δp| 6.9e-3 (the dense bf16 pass: 7.0e-3).
-  Contributed by Milosz (@Butterski).
+  Contributed by Milosz (@Butterski), [#39](https://github.com/rkinas/basal/pull/39).
 
 # What is new in basal 2.3.3
 
