@@ -1,3 +1,11 @@
+# What is new in basal 2.4.1 (not released yet)
+
+- **Shorter start-up of the graph engine** (`--mode fast`): every CUDA graph is warmed up once before its capture
+  instead of three times (pass-2 graphs: twice). torch.compile compiles and cuBLAS and Triton set up at the first
+  call; the further calls ran the same kernels again. RTX 4060 Ti 16 GB, the graph warm-up: basal-2.0-mini 468 ->
+  323 s, basal-2.0-4.5B 1,094 -> 680 s (with the pass-2 graph budget it needs there); the same GPU memory and speed,
+  every probability bit-identical (420 readouts per model). Contributed by Miłosz Kucharski (@Butterski).
+
 # What is new in basal 2.4
 
 - **Qwen3.5 models in the fast engine** (`--mode fast`, `fast-nocompile`), such as basal-omni-pico (0.8B: 18 Gated
