@@ -65,7 +65,10 @@ benchmarking a GPU.
 - **`--deterministic`**: answers do not depend on load or on the other requests: every request runs in its own
   forward passes, never batched with others, with deterministic kernels (FP8 checkpoints: GEMMs with full
   accumulation). Costs about 4% of the throughput under load with one option order; in-process engines only
-  (`basal-loadtest --determinism N` checks a running server, including decision flips under load).
+  (`basal-loadtest --determinism N` checks a running server, including decision flips under load). Batch-invariant
+  kernels (2.3.4, tested, not shipped) made basal-omni's batched answers bit-identical, but were slower than one
+  request per forward (H100, basal-omni-1.0-mini: 154 instead of 163 decisions/s), so `--deterministic` keeps one
+  request per forward; a faster batch-invariant GEMM is future work.
 - **Long states**: `--context-overflow truncate` (the default) cuts the middle of a state that does not fit the
   context (the first 1/3 and the last 2/3 of the kept tokens, `--truncate-head`; the question and options stay whole)
   and says what was cut in `usage.truncated`; `--context-overflow refuse` returns HTTP 422 instead. The context is
@@ -92,7 +95,9 @@ benchmarking a GPU.
     same top answer on 58 of 58; up to 2.3.2 the 4.5B with compact rows ran out of memory at start-up on 24 GB.
     From 2.3.3 (#35, #37, @Butterski) the graphs share their output buffers and are captured largest first, so
     compact rows cost only 0.1-0.2 GB more than default rows (H100 after warm-up: mini 7.1 / 7.3 GB, 4.5B 15.2 /
-    15.4 GB, every probability as in 2.3.2), and the 4.5B with compact rows starts on a 24 GB RTX 4090.
+    15.4 GB, every probability as in 2.3.2), and the 4.5B with compact rows starts on a 24 GB RTX 4090. From 2.3.4
+    basal-omni's graphs are captured largest first too (H100 after warm-up: basal-omni-1.0-mini 27.8 -> 18.9 GB,
+    1.0-max 45.3 -> 31.3 GB, every probability as in 2.3.3).
   - `--template-prefix on`: the chat template, system prompt and user header of every prompt language are computed
     once at start-up; compact rows run only their own tokens over them (off for basal-2.0 4.5B, see the quick start).
   - `--scheduler on`: requests longer than `--long-tokens` (2,048) wait in a backlog and join engine calls in
