@@ -4,7 +4,8 @@
   every graph is warmed up in the usual order and then captured largest first, so each capture reuses the pool memory a
   larger one freed; the pass-2 graphs over longer roots follow one at a time, within their 1 GB budget as before.
   basal-omni-1.0-mini on an A100 (default rows): graph pool 4.5 -> 3.2 GiB, 1.3 GB less GPU memory after start-up,
-  every probability bit-identical (420 readouts). Suggested in #37. Contributed by Milosz (@Butterski).
+  every probability bit-identical (420 readouts). Suggested in #37. Contributed by Milosz (@Butterski),
+  [#40](https://github.com/rkinas/basal/pull/40).
 
 # What is new in basal 2.3.3
 
