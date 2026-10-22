@@ -142,7 +142,7 @@ def load_questions(paths, n, seed=0):
     with "questions" are skipped)."""
     if isinstance(paths, (str, Path)):
         paths = [paths]
-    qs = [json.loads(line) for p in paths for line in Path(p).read_text().splitlines() if line.strip()]
+    qs = [json.loads(line) for p in paths for line in Path(p).read_text(encoding="utf-8").splitlines() if line.strip()]
     qs = [q for q in qs if "options" in q]
     random.Random(seed).shuffle(qs)
     return qs[:n]
@@ -269,7 +269,7 @@ def main():
         print(f"{r['mode']:<18}{r['lat2_ms']:>9.1f}{r['lat1_ms']:>9.1f}{r['dec_s']:>8.1f}"
               f"{r.get('agree', float('nan')):>8.3f}{r.get('acc', float('nan')):>7.3f}{r['mem_gb']:>6.1f}")
     if a.out:
-        Path(a.out).write_text(json.dumps(rows, indent=1))
+        Path(a.out).write_text(json.dumps(rows, indent=1), encoding="utf-8")
 
 
 if __name__ == "__main__":

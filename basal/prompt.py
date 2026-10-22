@@ -81,7 +81,7 @@ def max_options(fmt=1):
 def model_format(model_dir):
     """Prompt format of a model directory: `"prompt"` in its basal.json (1 when absent or without basal.json)."""
     p = Path(model_dir) / "basal.json"
-    fmt = json.loads(p.read_text()).get("prompt", 1) if p.exists() else 1
+    fmt = json.loads(p.read_text(encoding="utf-8")).get("prompt", 1) if p.exists() else 1
     if fmt not in FORMATS:
         raise ValueError(f"{p}: unknown prompt format {fmt!r} (supported: {sorted(FORMATS)})")
     return fmt

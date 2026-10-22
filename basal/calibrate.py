@@ -932,7 +932,7 @@ def compared(md, kind, path, quant, orders, off, preset=None):
         return {}, None
     if orders is None:  # a server that does not report its orders: the file as it is
         f = calibration_file(md, kind, path, quant, preset)
-        return (json.loads(f.read_text()) if f.exists() else {}), f
+        return (json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}), f
     data, f, why = load_calibration(md, kind, path, quant, orders, preset=preset)
     if why:
         print(f"warning: {why}: its thresholds are not compared or kept (as in basal-serve)", file=sys.stderr)
@@ -1011,7 +1011,7 @@ def reference_values(ref):
     p = Path(ref)
     if not p.exists():
         raise SystemExit(f"--reference {ref}: not {' or '.join(REFERENCE)} and no such file")
-    lf = (json.loads(p.read_text()).get("gates") or {}).get("ece_lofo") or {}
+    lf = (json.loads(p.read_text(encoding="utf-8")).get("gates") or {}).get("ece_lofo") or {}
     vals = {t: v["mean"] for t, v in lf.items() if isinstance(v, dict) and v.get("mean") is not None}
     if not vals:
         raise SystemExit(f"--reference {ref}: the file has no gates.ece_lofo means")
@@ -1207,7 +1207,7 @@ def refit(a, targets, reference, reference_name):
     for w in small:
         print(f"warning: {w}", file=sys.stderr)
     base_file = Path(a.calibration) if a.calibration else (Path(head["baseline"]) if head.get("baseline") else None)
-    baseline = json.loads(base_file.read_text()) if base_file is not None and base_file.exists() else {}
+    baseline = json.loads(base_file.read_text(encoding="utf-8")) if base_file is not None and base_file.exists() else {}
     fo = calibration_orders(baseline)
     if baseline and fo is not None and head.get("orders") is not None and fo != head["orders"]:  # as basal-serve
         print(f"warning: {base_file.name} was fitted on {fo} option order(s), the rows on {head['orders']}: its "
@@ -1233,7 +1233,7 @@ def refit(a, targets, reference, reference_name):
     if a.report_only:
         print("\n--report-only: no file written")
     else:
-        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
+        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"\nwrote {a.out} (calibration file {head['fmt']}, engine {cal['engine']}, refitted from {a.input})")
     summary(small + cert_notes(report, None, targets))
     if a.strict:
@@ -1384,7 +1384,7 @@ def main(argv=None):
         head = dict(basal_calibrate_rows=1, fmt=fmt, kind=kind, quant=quant, vllm_preset=preset, model=str(model),
                     engine=engine, data=Path(a.input).name, requests=len(bodies) - len(failed),
                     baseline=str(base_file) if baseline else None, orders=orders)
-        with open(a.save_rows, "w") as f:
+        with open(a.save_rows, "w", encoding="utf-8") as f:
             for x in [head] + rows:
                 f.write(json.dumps(x, ensure_ascii=False) + "\n")
     cal["engine"] = engine_name(kind, quant, preset)
@@ -1419,7 +1419,7 @@ def main(argv=None):
     if a.report_only:
         print("\n--report-only: no file written")
     else:
-        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n")
+        Path(a.out).write_text(json.dumps(cal, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"\nwrote {a.out} (calibration file {fmt}, engine {cal['engine']})\n"
               f"  basal-serve --model {a.model or '<model>'} --mode {mode} --calibration {a.out}")
     summary(small + cert_notes(report, task_report, targets))
