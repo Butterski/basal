@@ -439,9 +439,9 @@ Thank you to the people whose work is in this repository, by pull request:
 - [@lukaspoloki](https://github.com/lukaspoloki): `basal-viz`, a local page that shows every step of a decision, from
   the prompt to the per-layer readout, the calibration and the decision
   ([#2](https://github.com/rkinas/basal/pull/2)).
-- Milosz ([@Butterski](https://github.com/Butterski)): the prompt language is detected once per request instead of
-  once per question, so a large task request on a long English state is prepared in milliseconds instead of half a
-  second ([#17](https://github.com/rkinas/basal/pull/17)); sentence splitting for `compress` in linear time
+- Miłosz Kucharski ([@Butterski](https://github.com/Butterski)): the prompt language is detected once per request
+  instead of once per question, so a large task request on a long English state is prepared in milliseconds instead
+  of half a second ([#17](https://github.com/rkinas/basal/pull/17)); sentence splitting for `compress` in linear time
   ([#16](https://github.com/rkinas/basal/pull/16)); `--mode gguf` on every physical core
   ([#20](https://github.com/rkinas/basal/pull/20)); `--mode mps` on the CPU, so a request's state is computed once
   there too ([#26](https://github.com/rkinas/basal/pull/26)), and its branch pass without dense masks
