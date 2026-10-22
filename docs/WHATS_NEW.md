@@ -1,3 +1,15 @@
+# What is new in basal 2.3.3 (not released yet)
+
+- **Less GPU memory for basal-2.0 in the graph engine** (`--mode fast`): the captured CUDA graphs of a family write
+  their outputs into one shared buffer (each graph kept its own hidden states in the graph pool: 169 plain graphs on
+  basal-2.0-mini), the pass-2 graphs share one mask buffer, the 12 pass-2 graphs that pass 1 can never fill (8 rows over
+  roots of 2,304-3,072 tokens) are no longer captured, so the key / value buffer holds 16,384 tokens instead of 24,576,
+  and the captures warm up on one stream (each new stream kept its own cuBLAS workspace). RTX 4090 after start-up:
+  basal-2.0-mini 12.7 -> 10.0 GB (compact rows 18.7 -> 17.6 GB), basal-2.0-4.5B 24.1 -> 20.5 GB of the card's 24.6;
+  every probability bit-identical (420 readouts per model and batching mode), the same decisions per second (128.7 /
+  128.4 single questions, 53.4 / 54.5 questions per second five at a time over 1.5k-token states) and start-up time.
+  Contributed by Milosz (@Butterski), [#35](https://github.com/rkinas/basal/pull/35).
+
 # What is new in basal 2.3.2
 
 - **Models with Gated DeltaNet layers** (Qwen3.5, such as the 0.8B pico): `--mode fast`, `fast-nocompile`,
