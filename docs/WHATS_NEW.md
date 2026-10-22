@@ -1,15 +1,15 @@
 # What is new in basal 2.3.4 (not released yet)
 
 - **basal-2.0-4.5B on 16 GB cards** (`--mode fast`; RTX 4060 Ti 16 GB, 4080, 5060 Ti): the graph engine captures its
-  pass-2 graphs (the questions over a state) only while 1.5 GiB of GPU memory stays free, the smallest (commonest)
-  shapes first; every plain graph is captured as before, and a pass 2 without its graph runs uncompiled, as for shapes
-  beyond the grid. Each captured graph keeps device memory for its kernels (about 19.5 MB per pass-2 graph on the
-  4.5B), so the 264 of them kept 2.3.3 from starting on 16 GB. RTX 4060 Ti 16 GB: 81 of 264 pass-2 graphs, 14.4 GB
-  after start-up, 20.5 single questions per second, 9.7 questions per second five at a time over 1.5k-token states, no
-  errors; very large `compress` requests (6k-token documents) can still run out of memory there without the CUDA
-  cascade. On 24 GB and larger cards every graph is captured as before, the probabilities bit-identical (420 of 420,
-  RTX 4090); where graphs are left out, the requests that would have used them change by bf16 rounding only (same top
-  answer on 200 of 200, max |Δp| 0.04). Contributed by Miłosz Kucharski (@Butterski),
+  pass-2 graphs (the questions over a state) only while 1.5 GiB of GPU memory stays free after each capture, the
+  smallest (commonest) shapes first; every plain graph is captured as before, and a pass 2 without its graph runs
+  uncompiled, as for shapes beyond the grid. Each captured graph keeps device memory for its kernels (about 19.5 MB
+  per pass-2 graph on the 4.5B), so the 264 of them kept 2.3.3 from starting on 16 GB. RTX 4060 Ti 16 GB: 80 of 264
+  pass-2 graphs, 14.4 GB after start-up, 22.6 single questions per second, 9.7 questions per second five at a time
+  over 1.5k-token states, no errors; very large `compress` requests (6k-token documents) can still run out of memory
+  there without the CUDA cascade. On 24 GB and larger cards every graph is captured as before, the probabilities
+  bit-identical (420 of 420, RTX 4090); where graphs are left out, the requests that would have used them change by
+  bf16 rounding only (same top answer on 200 of 200, max |Δp| 0.04). Contributed by Miłosz Kucharski (@Butterski),
   [#41](https://github.com/rkinas/basal/pull/41).
 
 - **basal-omni's CUDA graphs captured largest first too** (`--mode fast`, Gemma 4): as for the Llama models in 2.3.3,
