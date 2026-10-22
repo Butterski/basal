@@ -2618,13 +2618,23 @@ class GGUFBackend(GraphBackend):
     GraphBackend: the state once, every question and option order after it) becomes llama.cpp sequences: every readout
     has its own sequence and every token belongs to the sequences of all readouts below its block, so a shared prefix
     is computed once and each readout sees its own prompt only. All rows of a chunk go through one llama_decode
-    (unified KV cache, cleared per chunk)."""
+    (unified KV cache, cleared per chunk).
+
+    Hybrid and recurrent architectures (Qwen3.5's Gated DeltaNet layers: GGUF architecture qwen35; Mamba, RWKV) keep
+    a recurrent state per sequence, which a token shared by several sequences cannot have; on the CPU llama.cpp
+    returned non-finite logits whenever several sequences shared one llama_decode (the 0.8B pico's Q8_0: 300 of 300
+    QD prompts at 16 per decode, 0 of 300 at one; llama-cpp-python 0.3.36, 22 Oct). Such a model decodes one prompt
+    per llama_decode, from its first token (N_SEQ = 1: every group is split into single prompts), so a request's
+    state is computed once per question and option order."""
 
     streams, inflight = False, 1  # its own run_shared: no early readouts, one call at a time
 
     N_CTX = 16384  # KV cells per chunk: room for a single long prompt
     context, context_reason = N_CTX, f"the in-process llama.cpp context ({N_CTX} cells)"
     N_SEQ = 64     # readouts (sequences) per chunk
+    # GGUF architectures with recurrent-state layers (beside llama.cpp's own is_recurrent / is_hybrid flags)
+    RECURRENT_ARCHS = ("qwen35", "qwen3next", "mamba", "rwkv", "jamba", "falcon-h1", "plamo2", "granitehybrid",
+                       "nemotron_h", "lfm2", "kimi-linear")
 
     def __init__(self, model_dir, gguf, n_gpu_layers=-1):
         import logging
@@ -2641,6 +2651,11 @@ class GGUFBackend(GraphBackend):
         self.cmodel = C.llama_model_load_from_file(str(gguf).encode(), mp)
         if not self.cmodel:
             raise ValueError(f"llama.cpp could not load {gguf}")
+        self.arch = self._meta("general.architecture") or ""
+        self.recurrent = bool(C.llama_model_is_recurrent(self.cmodel) or C.llama_model_is_hybrid(self.cmodel)
+                              or self.arch.startswith(self.RECURRENT_ARCHS) or self._meta(f"{self.arch}.ssm.state_size"))
+        if self.recurrent:
+            self.N_SEQ = 1
         # a full model directory: its architecture must match the GGUF file; the -GGUF repositories carry tokenizer and
         # calibration without config.json (their .gguf files belong to them)
         cp = Path(model_dir) / "config.json"
@@ -2676,6 +2691,13 @@ class GGUFBackend(GraphBackend):
         if not self.ctx:
             raise ValueError("llama.cpp could not create a context")
         self.batch = C.llama_batch_init(self.N_CTX, 0, self.N_SEQ)  # a prefix token belongs to every readout below it
+
+    def _meta(self, key):
+        """A metadata value of the GGUF file as a string, None if absent."""
+        import ctypes
+        buf = ctypes.create_string_buffer(256)
+        n = self.C.llama_model_meta_val_str(self.cmodel, key.encode(), buf, ctypes.sizeof(buf))
+        return buf.value.decode() if n >= 0 else None
 
     def __del__(self):
         C = getattr(self, "C", None)
