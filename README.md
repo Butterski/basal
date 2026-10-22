@@ -167,18 +167,19 @@ Full list: [docs/WHATS_NEW.md](docs/WHATS_NEW.md) and the [release notes](https:
   port is checked against its bf16 model; its card has the numbers. Files in detail:
   [docs/INSTALL.md](docs/INSTALL.md#what-the-model-repositories-contain).
 
-**basal-omni** (experimental; text, images and audio; built on Google Gemma 4):
+**basal-omni** (experimental; text, images and audio; built on Google Gemma 4, pico on Qwen3.5):
 
 | model | params | use | Hugging Face |
 |---|---|---|---|
+| **basal-omni-pico** | 0.8B (Qwen3.5-0.8B) | the smallest basal model: text decisions on a CPU or a small GPU (Werdykt 0.660); needs basal 2.3.2 or later (`--mode eager`, or `--mode gguf` on the CPU) | [`Remek/basal-omni-pico`](https://huggingface.co/Remek/basal-omni-pico) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-pico-GGUF) |
 | **basal-omni-1.0-mini** | 4B (Gemma 4 E4B) | decisions about text, images and audio; about 16 GB of GPU memory | [`Remek/basal-omni-1.0-mini`](https://huggingface.co/Remek/basal-omni-1.0-mini) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-mini-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-mini-GGUF) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.0-mini-MLX) |
 | **basal-omni-1.0-max** | 12B | the default 12B model (Werdykt 0.823); text, images and audio; about 24 GB of GPU memory | [`Remek/basal-omni-1.0-max`](https://huggingface.co/Remek/basal-omni-1.0-max) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-max-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-max-GGUF) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.0-max-MLX) |
 | **basal-omni-1.1-max** | 12B | *experimental task model*: better on `classify`, `verify`, `compress` and `extract`, slightly behind 1.0-max on general decisions (Werdykt 0.821) | [`Remek/basal-omni-1.1-max`](https://huggingface.co/Remek/basal-omni-1.1-max) · [`-MLX`](https://huggingface.co/Remek/basal-omni-1.1-max-MLX) |
-| **basal-omni-1.0-ultra** | 31B (Gemma 4 31B) | highest Werdykt score of the basal models (0.879); text and images (no audio); 59 GB of bf16 weights | [`Remek/basal-omni-1.0-ultra`](https://huggingface.co/Remek/basal-omni-1.0-ultra) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-ultra-FP8) |
+| **basal-omni-1.0-ultra** | 31B (Gemma 4 31B) | highest Werdykt score of the basal models (0.879); text and images (no audio); 59 GB of bf16 weights | [`Remek/basal-omni-1.0-ultra`](https://huggingface.co/Remek/basal-omni-1.0-ultra) · [`-FP8`](https://huggingface.co/Remek/basal-omni-1.0-ultra-FP8) · [`-GGUF`](https://huggingface.co/Remek/basal-omni-1.0-ultra-GGUF) |
 
 - bf16 weights, served by `basal-serve --mode eager` on an NVIDIA GPU (`--media on` for images and audio).
   The `-FP8` checkpoints (mini 12 GB, max 14 GB, ultra 33 GB) are served by `--mode vllm`, text only, each with its own
-  calibration (`CALIBRATION.vllm.json`). The `-GGUF` files (Q8_0 and Q6_K, mini and max) are served by `--mode gguf`
+  calibration (`CALIBRATION.vllm.json`). The `-GGUF` files (Q8_0 and Q6_K for mini and max, Q8_0 for ultra and pico) are served by `--mode gguf`
   (llama.cpp, with `CALIBRATION.gguf.json`) or in front of Ollama, text only. The `-MLX` ports (8-bit; 1.0-mini, 1.0-max
   and 1.1-max) are served by `--mode mlx` on Apple Silicon, text only, with `CALIBRATION.mlx.json`.
 - All models are fine-tuned from Apache-2.0 base models (Bielik v3 for basal-2.0, Gemma 4 for basal-omni; see
