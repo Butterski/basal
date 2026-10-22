@@ -2623,7 +2623,7 @@ class GGUFBackend(GraphBackend):
     Hybrid and recurrent architectures (Qwen3.5's Gated DeltaNet layers: GGUF architecture qwen35; Mamba, RWKV) keep
     a recurrent state per sequence, which a token shared by several sequences cannot have; on the CPU llama.cpp
     returned non-finite logits whenever several sequences shared one llama_decode (the 0.8B pico's Q8_0: 300 of 300
-    QD prompts at 16 per decode, 0 of 300 at one; llama-cpp-python 0.3.36, 22 Oct). Such a model decodes one prompt
+    held-out prompts at 16 per decode, 0 of 300 at one; llama-cpp-python 0.3.36, 22 Oct). Such a model decodes one prompt
     per llama_decode, from its first token (N_SEQ = 1: every group is split into single prompts), so a request's
     state is computed once per question and option order."""
 
