@@ -9,7 +9,8 @@
   errors; very large `compress` requests (6k-token documents) can still run out of memory there without the CUDA
   cascade. On 24 GB and larger cards every graph is captured as before, the probabilities bit-identical (420 of 420,
   RTX 4090); where graphs are left out, the requests that would have used them change by bf16 rounding only (same top
-  answer on 200 of 200, max |Δp| 0.04). Contributed by Miłosz Kucharski (@Butterski).
+  answer on 200 of 200, max |Δp| 0.04). Contributed by Miłosz Kucharski (@Butterski),
+  [#41](https://github.com/rkinas/basal/pull/41).
 
 # What is new in basal 2.3.4
 
