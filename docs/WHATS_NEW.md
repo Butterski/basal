@@ -1,3 +1,13 @@
+# What is new in basal 2.3.2 (not released yet)
+
+- **Windows:** `--batches compact` and `--gemma-attn flex` / `fa3` are refused with the reason where torch is built
+  without FlashAttention or Triton is not installed (the Windows wheels), instead of failing at the first request.
+  basal reads and writes its text files (calibrations, question and input files, decision logs) as UTF-8 on every
+  system; on Windows it used the locale code page before. A file basal wrote on Windows with non-ASCII text (such as
+  Polish questions) does not load as UTF-8: convert it once, on the machine that wrote it,
+  `python -c "import locale, pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text(p.read_text(encoding=locale.getpreferredencoding(False)), encoding='utf-8')" FILE`,
+  or write it again.
+
 # What is new in basal 2.3.1
 
 - **basal-omni's fast mode on Blackwell workstation GPUs** (sm_120, such as the RTX PRO 6000): `--gemma-attn auto` is
