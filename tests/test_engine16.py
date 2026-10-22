@@ -70,9 +70,11 @@ def groups(rnd):
 def check(be, gs):
     m = be.model
     res = be.run_shared(gs)
+    assert len(res) == len(gs)
     for (toks, lids, *_), got in zip(gs, res):
-        for r, e in zip(got, separate(m, toks, lids)):
-            assert torch.allclose(torch.tensor(r), e, atol=1e-5)
+        assert len(got) == len(toks)
+        for r, e, ids in zip(got, separate(m, toks, lids), lids):
+            assert len(r) == len(ids) and torch.allclose(torch.tensor(r), e, atol=1e-5)
     return res
 
 
@@ -230,15 +232,21 @@ def test_warm_captures_largest_first_after_every_warm_up(prefix):
 
 
 def test_pass2_graphs_are_the_reachable_shapes():
-    """Pass-2 graphs (rows, root length) exist exactly for the batches pass 1 can form (_chunks; state-cached roots
-    are chunked the same way), and the key / value buffer holds the largest of those, not TREE_ROWS[-1] x LENS[-1]."""
-    be = GraphBackend.__new__(GraphBackend)  # the default grid
+    """warm() captures pass-2 graphs (rows, root length) exactly for the batches pass 1 can form (_chunks; state-cached
+    roots are chunked the same way), and the key / value buffer holds the largest of those, not TREE_ROWS[-1] x
+    LENS[-1]. The default grid; the graph builders only record what warm() asks for."""
+    from types import SimpleNamespace
+    be = GraphBackend.__new__(GraphBackend)
+    be.shared, be.model, asked = True, SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), set()
+    be._graph = lambda b, L: None
+    be._graph_sfx = lambda b, S, L: asked.add((b, L))
+    be.warm()
     reach = set()
     for L in be.LENS:
         for n in range(1, be.TREE_ROWS[-1] + 1):
             for idx in be._chunks([L] * n, be.PLAIN_LENS, [8] * n, be.TREE_ROWS[-1]):
                 reach.add((be._bucket(len(idx), be.TREE_ROWS), L))
-    assert {(b, L) for b in be.TREE_ROWS for L in be.LENS if be._pass2_ok(b, L)} == reach
+    assert asked == reach
     assert be._kv_tokens() == max(be.TOKEN_BUDGET, be.PLAIN_LENS[-1], max(b * L for b, L in reach))
     assert be._kv_tokens() < be.TREE_ROWS[-1] * be.LENS[-1]
 
