@@ -340,8 +340,8 @@ The `-MLX-8bit` ports (`--modes mlx`, as in #18): basal-2.0-mini 73 -> 41 ms wit
   vs 38 ms). Without it, `mlx` is 22-31% slower than `mps`.
 - Against the M5 Max (40 cores) on the same 4.5B port: 1.39x slower by default and 1.27x slower packed, with half
   the GPU cores.
-- The 4.5B `mlx-q8` agreement (0.955 packed vs 0.977 default) is 2 of 44 decisions: near-tie flips of the 8-bit
-  weights.
+- The 4.5B `mlx-q8` agreement is 0.955 packed against 0.977 default: one more of the 44 decisions changes. Whether
+  packing changes the 8-bit rounding is not checked yet.
 
 ### Apple M5 Max (basal-1.0 and basal-2.0)
 
