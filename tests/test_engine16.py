@@ -257,9 +257,12 @@ def test_gemma_warm_captures_largest_first_then_the_long_roots():
     caps = [k for kind, k in grid if kind == "capture"]
     assert [kind for kind, _ in grid] == ["warm"] * len(caps) + ["capture"] * len(caps)
     assert [_graph_tokens(k) for k in caps] == sorted(map(_graph_tokens, caps), reverse=True)
-    assert {"c", "p", "x"} <= {k[0] for k in caps}
-    assert [kind for kind, _ in long] == ["warm", "capture"] * (len(long) // 2) and len(long) == 2 * 2 * 2
-    assert all(k[0] == "x" and k[3] == 64 for kind, k in long if kind == "capture")
+    want = {("c", T) for T in (16, 32, 64, 128)}  # compact rows: plain graphs of at most TREE_ROWS[-1] rows
+    want |= {("p", b, L) for L in (16, 32, 64) for b in (1, 2) if b * L <= 128 or b == 1}
+    want |= {("x", b, S, L) for b in (1, 2) for L in (16, 32) for S in (8, 16)}  # rows x root within the budget
+    assert len(caps) == len(set(caps)) and set(caps) == want
+    assert [kind for kind, _ in long] == ["warm", "capture"] * (len(long) // 2)
+    assert {k for kind, k in long if kind == "capture"} == {("x", b, S, 64) for b in (1, 2) for S in (8, 16)}
 
 
 
