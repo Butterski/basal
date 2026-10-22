@@ -24,7 +24,7 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 
 ## Contents
 
-- [What is new in basal 2.3.4](#what-is-new-in-basal-234) · [What is new in basal 2.3.3](#what-is-new-in-basal-233) · [What is new in basal 2.3.2](#what-is-new-in-basal-232) · [What is new in basal 2.3.1](#what-is-new-in-basal-231) · [What is new in basal 2.3](#what-is-new-in-basal-23) ·
+- [What is new in basal 2.3.5](#what-is-new-in-basal-235) · [What is new in basal 2.3.4](#what-is-new-in-basal-234) · [What is new in basal 2.3.3](#what-is-new-in-basal-233) · [What is new in basal 2.3.2](#what-is-new-in-basal-232) · [What is new in basal 2.3.1](#what-is-new-in-basal-231) · [What is new in basal 2.3](#what-is-new-in-basal-23) ·
   [What is new in basal 2.2](#what-is-new-in-basal-22) · [What is new in basal 2.1](#what-is-new-in-basal-21) · [What is new in basal-2.0](#what-is-new-in-basal-20)
 - [Models](#models) · [Results](#results)
 - [Quick start](#quick-start) · [API](#api)
@@ -32,6 +32,16 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
 - [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) ·
   [Contributors](#contributors) · [License](#license)
+
+## What is new in basal 2.3.5
+
+- **Compress and many-question requests faster on CUDA** (`--mode fast`, basal-2.0, torch 2.13): the questions over a
+  long state attend to it without a dense mask. `compress` over 1.5k-6k-token documents up to 1.5x faster, with less
+  GPU memory; the same top answers. Contributed by Milosz (@Butterski), #39.
+- **basal-2.0-4.5B on 16 GB cards** (`--mode fast`): the graph engine keeps 1.5 GiB of GPU memory free at start-up and
+  leaves out the pass-2 graphs that do not fit. On 24 GB and larger cards nothing changes. Contributed by Miłosz
+  Kucharski (@Butterski), #41.
+- All changes: [WHATS_NEW](docs/WHATS_NEW.md).
 
 ## What is new in basal 2.3.4
 

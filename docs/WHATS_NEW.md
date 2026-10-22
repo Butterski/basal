@@ -1,4 +1,4 @@
-# What is new in basal 2.3.5 (not released yet)
+# What is new in basal 2.3.5
 
 - **Compress and many-question requests faster on CUDA** (`--mode fast`, the Llama-based basal-2.0 models, bf16 on
   sm80+ GPUs where torch's varlen attention runs with per-sequence key counts): a pass 2 without a CUDA graph whose
@@ -20,6 +20,12 @@
   bit-identical (420 of 420, RTX 4090); where graphs are left out, the requests that would have used them change by
   bf16 rounding only (same top answer on 200 of 200, max |Δp| 0.04). Contributed by Miłosz Kucharski (@Butterski),
   [#41](https://github.com/rkinas/basal/pull/41).
+- **Checked on one H100** (basal v2.3.4 against 2.3.5, `--mode fast`): every probability bit-identical on the usual
+  paths (basal-2.0-mini and 4.5B, default and compact rows, basal-omni-1.0-mini; 5,800 identity readouts), the same
+  graphs, GPU memory and start-up time. With torch 2.13 (#39 needs its varlen attention; torch 2.11 keeps the dense
+  pass): compress 1.18-1.30x faster on mini and 1.27-1.49x on the 4.5B, 40 questions 0.90x / 1.11x, the same top
+  answer on 240 of 240 decisions per model (max |Δp| 0.031). With a 16 GB budget simulated on the H100 the 4.5B kept
+  200 of 264 pass-2 graphs (compact rows) and 2.0 GB free, its identity readouts the same as with every graph.
 
 # What is new in basal 2.3.4
 
