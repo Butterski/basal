@@ -1,3 +1,37 @@
+# What is new in basal 2.4 (draft)
+
+- **Qwen3.5 models in the fast engine** (`--mode fast`, `fast-nocompile`), such as basal-omni-pico (0.8B: 18 Gated
+  DeltaNet layers and 6 attention layers). 2.3.2 refused them there: the engine shared a request's state between its
+  questions as attention keys and values only, and the Gated DeltaNet layers lost their recurrent state. The port
+  (`basal/gdn_graph.py`) keeps the CUDA graphs, batching and readout of the fast engine and carries the state:
+  - the state pass writes, for every request state, the recurrent state of each Gated DeltaNet layer (16 heads x 128 x
+    128 in fp32, 1 MB per layer) and the last inputs of its short convolution, at the state's last token (rows are
+    padded on the right; padding gets no update and no decay, so the padded row ends in the same state);
+  - the question pass runs one row per question and option order, each from that state and over the state's keys and
+    values: a question's text under its two option orders runs once per order, since one recurrent state cannot
+    continue into two branches of one packed row;
+  - the Gated DeltaNet layers run fla's kernels (flash-linear-attention, as in the eager reference) at fixed shapes
+    inside the CUDA graphs; `--mode fast` compiles the layer code between them (norms, projections, gates,
+    convolution, rotary embedding, MLP), and the projections that read one input are one GEMM.
+  Checked on one H100 with basal-omni-pico against `--mode eager`, on 1,700 held-out decisions as single questions,
+  five questions over one state, two option orders, and both (17,000 prompts): in fp32 the top answer agrees on
+  99.94-99.99% (max |dp| 0.008), so the port computes what eager computes. In bf16, as served, each engine is
+  equally close to the fp32 answers (`fast` 99.47-99.76%, `eager` 99.48-99.71% by shape). `--deterministic`
+  against batched serving on the 10,606 decisions of the dev set: the same top answer on 99.73% (`eager`: 99.42%),
+  accuracy as `eager`'s (+0.03 points). Speed over HTTP (`eager` in brackets): one
+  question over a 1.5k-token state 17.3 ms at one client (47.0), 84 decisions/s at 16 clients (32.3); five questions
+  32.0 ms (112), 317 questions/s (41); five questions over a 3k-10k-token state 112 ms (928), 80 questions/s (6.4).
+  Details in [HARDWARE.md](HARDWARE.md#basal-omni-pico-qwen35-gated-deltanet-on-one-h100).
+- **Without `--mode`** a Qwen3.5 model now runs `fast` on Hopper (H100, where the port passed its gates) when fla is
+  installed (`pip install flash-linear-attention`), and `eager` elsewhere.
+- **Still refused for Qwen3.5 models** (before loading, each with what to use instead): `fp8`, `nvfp4`, `fast-exit`,
+  `mps`, `--batches compact`, `--state-cache-gb`, `--prefix-cache`, `--template-prefix on`, `--readout-layer on`,
+  `--lean`, `--long-lane`. Other recurrent models (Qwen3-Next, Mamba and other hybrids) stay refused by every
+  shared-prefix engine and run `eager`.
+- **Other models are unchanged**: basal-2.0-mini (default and compact rows), basal-2.0-4.5B (compact rows) and
+  basal-omni-1.0-mini in `--mode fast` give bit-identical probabilities to
+  2.3.3 (4,960 of 4,960 readouts on an H100).
+
 # What is new in basal 2.3.5
 
 - **Compress and many-question requests faster on CUDA** (`--mode fast`, the Llama-based basal-2.0 models, bf16 on

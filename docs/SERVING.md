@@ -29,10 +29,15 @@ benchmarking a GPU.
 - Without `--mode`: `fast` on CUDA, `mlx` on Apple Silicon (`mps` without `basal[mlx]`), `tpu` on a TPU VM with
   `basal[tpu]`, `eager` otherwise. On a CPU, `--mode mps` computes a request's state once for all its prompts and is
   faster for requests with several questions or option orders; `eager` stays the default there (the reference path).
-- **Models with Gated DeltaNet layers** (Qwen3.5 and other hybrid models with recurrent-state layers, such as the 0.8B
-  pico; 2.3.2): `fast`, `fast-nocompile`, `fast-exit`, `fp8`, `nvfp4` and `mps` keep attention keys and values only, so
-  they refuse such a model before loading it (2.3.1 served it in `fast` with wrong answers). Without `--mode` it runs
-  `eager` on CUDA and Apple Silicon; `--mode vllm` is faster on CUDA, `--mode gguf` runs it on Metal, CUDA or the CPU.
+- **Qwen3.5 models (Gated DeltaNet layers)**, such as basal-omni-pico: `fast` and `fast-nocompile` serve them since 2.4
+  (2.3.2 refused them): the graph engine keeps each request state's recurrent state beside its keys and values and
+  continues every question from it (one row per question and option order in the branch pass), with fla
+  (flash-linear-attention) for the Gated DeltaNet layers. Without `--mode` they run `fast` on Hopper (H100, the GPU
+  class the port was gated on) when fla is installed, `eager` elsewhere. Not with them yet: `fp8` / `nvfp4`, `fast-exit`,
+  `mps`, `--batches compact`, `--state-cache-gb`, `--prefix-cache`, `--template-prefix on`, `--readout-layer on`,
+  `--lean` and `--long-lane` (each refused before loading). `--mode vllm` and `--mode gguf` serve Qwen3.5 models
+  too. Other models with recurrent-state layers (Qwen3-Next, Mamba and other hybrids) are refused by every
+  shared-prefix engine and run `eager` without `--mode`.
 - **`--mode fp8` below compute capability 8.9** (Ampere, e.g. RTX 3090 / A100) stops before loading the model (2.3.2;
   before, torchao failed after the load): serve bf16 with `--mode fast` there.
 - **basal-omni (Gemma 4) in `eager`** (2.3): the engine's own Gemma 4 forward: a request's state (and media) once,
