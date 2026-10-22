@@ -1,4 +1,4 @@
-# basal 2.3.2
+# basal 2.3.3
 
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--2.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-20-6acd1712a8e443c86cd576fc)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-basal--omni--1.0%20models-yellow)](https://huggingface.co/collections/Remek/basal-omni-10-6acea28e8b5baed2db475c1f)
@@ -24,7 +24,7 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 
 ## Contents
 
-- [What is new in basal 2.3.2](#what-is-new-in-basal-232) · [What is new in basal 2.3.1](#what-is-new-in-basal-231) · [What is new in basal 2.3](#what-is-new-in-basal-23) ·
+- [What is new in basal 2.3.3](#what-is-new-in-basal-233) · [What is new in basal 2.3.2](#what-is-new-in-basal-232) · [What is new in basal 2.3.1](#what-is-new-in-basal-231) · [What is new in basal 2.3](#what-is-new-in-basal-23) ·
   [What is new in basal 2.2](#what-is-new-in-basal-22) · [What is new in basal 2.1](#what-is-new-in-basal-21) · [What is new in basal-2.0](#what-is-new-in-basal-20)
 - [Models](#models) · [Results](#results)
 - [Quick start](#quick-start) · [API](#api)
@@ -32,6 +32,20 @@ answers, and triage with a confidence threshold that sends uncertain cases to a 
 - [Documentation](#documentation): install paths, serving, API reference, results, formats, hardware
 - [Limitations](#limitations) · [Previous releases](#previous-releases) · [Citation](#citation) ·
   [Contributors](#contributors) · [License](#license)
+
+## What is new in basal 2.3.3
+
+- **Less GPU memory in the graph engine** (`--mode fast`, basal-2.0): the CUDA graphs share their output buffers and are
+  captured largest first. On one H100: basal-2.0-mini 10.8 -> 7.1 GB, the 4.5B 20.1 -> 15.2 GB; with compact rows
+  16.6 -> 7.3 GB and 27.3 -> 15.4 GB, so the 4.5B with `--batches compact` now starts on a 24 GB card (#33). Every
+  probability is the same as in 2.3.2.
+- **Long states on the CPU** (`--mode mps --device cpu`): the state is computed once per request and the branch pass
+  needs no dense mask: up to 1.5x faster on a 6-core CPU, with about half the peak memory on many-question requests.
+- **Windows:** modes that need FlashAttention or Triton are refused before loading where the wheels lack them, and
+  every text file is read and written as UTF-8.
+- **basal-omni-pico** (0.8B) is in the model table: the smallest basal model, for a CPU or a small GPU.
+- **From the community:** Milosz (@Butterski, #34, #35, #37), @lukaszpodgorski-pl (#38), Kamil (@kamilrosa, #36: Apple
+  M5 Pro numbers). All changes: [WHATS_NEW](docs/WHATS_NEW.md).
 
 ## What is new in basal 2.3.2
 
@@ -214,7 +228,7 @@ NVIDIA GPU, with [uv](https://docs.astral.sh/uv/) in a fresh environment:
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.2.tar.gz"
+uv pip install "basal[fp8] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.3.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --port 8000
 ```
 
@@ -227,7 +241,7 @@ Apple Silicon:
 
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-mlx && source ~/basal-mlx/bin/activate
-uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.2.tar.gz"
+uv pip install "basal[mlx] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.3.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B-MLX-8bit --mode mlx --port 8000
 ```
 
@@ -293,7 +307,7 @@ The basal-omni models answer the same questions, and with `--media on` a request
 ```bash
 uv venv --python 3.12 --allow-existing ~/basal-env && source ~/basal-env/bin/activate
 uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
-uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.2.tar.gz"
+uv pip install "basal[media] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.3.tar.gz"
 basal-serve --model Remek/basal-omni-1.0-mini --mode eager --media on --port 8000   # or Remek/basal-omni-1.0-max
 ```
 
@@ -309,7 +323,7 @@ calibration, so validate them on your own media. Request format and limits:
 `decide_many`; `basal-mcp` is a stdio bridge for hosts that start local processes.
 
 ```bash
-uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.2.tar.gz"
+uv pip install "basal[fp8,mcp] @ https://github.com/rkinas/basal/archive/refs/tags/v2.3.3.tar.gz"
 basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --host 127.0.0.1 --port 8000 --mcp on
 claude mcp add --transport http basal http://127.0.0.1:8000/mcp     # Claude Code; other hosts take the same URL
 ```
@@ -429,8 +443,11 @@ Thank you to the people whose work is in this repository, by pull request:
   once per question, so a large task request on a long English state is prepared in milliseconds instead of half a
   second ([#17](https://github.com/rkinas/basal/pull/17)); sentence splitting for `compress` in linear time
   ([#16](https://github.com/rkinas/basal/pull/16)); `--mode gguf` on every physical core
-  ([#20](https://github.com/rkinas/basal/pull/20)); and `--mode mps` on the CPU, so a request's state is computed once
-  there too ([#26](https://github.com/rkinas/basal/pull/26)).
+  ([#20](https://github.com/rkinas/basal/pull/20)); `--mode mps` on the CPU, so a request's state is computed once
+  there too ([#26](https://github.com/rkinas/basal/pull/26)), and its branch pass without dense masks
+  ([#34](https://github.com/rkinas/basal/pull/34)); and less GPU memory in the graph engine: shared graph outputs
+  ([#35](https://github.com/rkinas/basal/pull/35)) and graphs captured largest first, so compact rows fit 16 GB and
+  24 GB cards ([#37](https://github.com/rkinas/basal/pull/37)).
 - Grzegorz Brzezinka ([@agentGreg](https://github.com/agentGreg)): the calibration report's per-type ECE as
   `basal-serve` applies the temperatures ([#24](https://github.com/rkinas/basal/pull/24)), the per-type label count
   for the 1% target in CALIBRATION.md ([#25](https://github.com/rkinas/basal/pull/25)), the Apple M5 Max
@@ -441,6 +458,8 @@ Thank you to the people whose work is in this repository, by pull request:
   "roku" after a date, which is not a one-year duration ([#32](https://github.com/rkinas/basal/pull/32)).
 - [@piotrkowski](https://github.com/piotrkowski): `--mode strix` reproduced on a second Strix Halo (ROG Flow Z13),
   bit-identical edge cases and a similar speed-up ([#21](https://github.com/rkinas/basal/pull/21)).
+- [@lukaszpodgorski-pl](https://github.com/lukaszpodgorski-pl): basal on Windows: kernel checks for torch builds without
+  FlashAttention or Triton, and UTF-8 for every text file ([#38](https://github.com/rkinas/basal/pull/38)).
 
 `--mode tpu` and `--mode strix` are community-maintained: their numbers in [HARDWARE.md](docs/HARDWARE.md) are the
 contributors' own measurements.

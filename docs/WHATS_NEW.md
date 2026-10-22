@@ -1,4 +1,4 @@
-# What is new in basal 2.3.3 (not released yet)
+# What is new in basal 2.3.3
 
 - **Less GPU memory for basal-2.0 in the graph engine** (`--mode fast`): the captured CUDA graphs of a family write
   their outputs into one shared buffer (each graph kept its own hidden states in the graph pool: 169 plain graphs on
