@@ -193,8 +193,9 @@ def test_shared_graph_outputs_keep_every_readout():
 @pytest.mark.parametrize("prefix", [False, True])
 def test_warm_captures_largest_first_after_every_warm_up(prefix):
     """warm() (Llama) runs every graph's warm-up calls first, in the grid's order (torch.compile compiles there, so
-    the compiled kernels do not change), then captures them all, the most tokens first, so each capture can reuse the
-    pool blocks a larger one freed; replays still answer as separate forwards. With --prefix-cache the two pass-2
+    the compiled kernels do not change), then captures the plain graphs, the most tokens first, so each capture can
+    reuse the pool blocks a larger one freed, then the pass-2 graphs, the smallest first (_capture_deferred's memory
+    budget keeps the commonest); replays still answer as separate forwards. With --prefix-cache the two pass-2
     families share shapes: each graph is still warmed up and captured once."""
     from basal.engine import _graph_tokens
 
@@ -226,15 +227,56 @@ def test_warm_captures_largest_first_after_every_warm_up(prefix):
     requests = [k for kind, k in be.events if kind == "request"]
     assert "warm" not in kinds[first:] and kinds.count("warm") == len(caps) == len(set(caps)) == len(set(requests)) > 20
     assert (len(requests) > len(set(requests))) == prefix  # the shared shapes asked for twice
-    assert [_graph_tokens(k) for k in caps] == sorted(map(_graph_tokens, caps), reverse=True)
-    assert {"p", "x"} <= {k[0] for k in caps}
+    plain, pass2 = [k for k in caps if k[0] != "x"], [k for k in caps if k[0] == "x"]
+    assert caps == plain + pass2 and plain and pass2
+    assert [_graph_tokens(k) for k in plain] == sorted(map(_graph_tokens, plain), reverse=True)
+    assert [_graph_tokens(k) for k in pass2] == sorted(map(_graph_tokens, pass2))
     check(be, groups(random.Random(7)))
 
 
+@pytest.mark.parametrize("card", [24, 1000])
+def test_pass2_graphs_captured_while_memory_stays_free(card):
+    """With little GPU memory (simulated: every captured graph takes one unit of a `card`-unit GPU, PASS2_RESERVE 10)
+    every plain graph is captured, then the pass-2 graphs, the smallest first, while PASS2_RESERVE stays free; a
+    pass 2 whose graph was not captured runs without one, and every readout equals its prompt run alone. With room
+    for all of them, all are captured."""
+    from basal.engine import _graph_tokens
+
+    class Tight(Stub):
+        SUFFIX_LENS, PASS2_RESERVE = [8, 16], 10
+        _capture = GraphBackend._capture
+
+        def _warm_up(self, fn, static, n):
+            fn(*static)
+
+        def _record(self, key, fn, static):
+            r = Replay(fn, static)
+            self.graphs[key] = (r, *static, r.out)
+            return self.graphs[key]
+
+        def _free_memory(self):
+            return card - len(self.graphs)
+
+    be = Tight(tiny())
+    be.warm()
+    every = [("x", b, S, L) for b in be.TREE_ROWS for L in be.LENS for S in be.SUFFIX_LENS if be._pass2_ok(b, L)]
+    plain = [k for k in be.graphs if k[0] == "p"]
+    kept = sorted((k for k in be.graphs if k[0] == "x"), key=_graph_tokens)
+    assert len(plain) == len(be.grid(be.PLAIN_LENS))
+    assert kept == sorted(every, key=_graph_tokens)[: len(kept)]
+    assert len(kept) == (card - len(plain) - be.PASS2_RESERVE + 1 if card < 100 else len(every))
+    rnd = random.Random(9)
+    roots = [[1] + [rnd.randrange(3, 50) for _ in range(11)] for _ in range(4)]
+    four = [([r + [10, 11], r + [11, 10]], [[10, 11], [10, 11]]) for r in roots]  # 4 units, 4 tokens below 12
+    assert (("x", 4, 8, 16) in be.graphs) == (card >= 100)
+    check(be, four + groups(rnd))
+
+
 def test_gemma_warm_captures_largest_first_then_the_long_roots():
-    """Gemma 4 (basal-omni): every graph of the grid, compact graphs included, is warmed up first and captured the
-    largest first; then the pass-2 graphs over roots longer than LENS (_warm_long_sfx), each captured right after its
-    warm-up, so the PASS2_POOL budget measures only what they add. The graph builders only record."""
+    """Gemma 4 (basal-omni): every graph of the grid, compact graphs included, is warmed up first, then the compact
+    and plain graphs are captured the largest first and the pass-2 graphs within LENS the smallest first; then the
+    pass-2 graphs over roots longer than LENS (_warm_long_sfx), each captured right after its warm-up, so the
+    PASS2_POOL budget measures only what they add. The graph builders only record."""
     from types import SimpleNamespace
 
     from basal.engine import _graph_tokens
@@ -256,7 +298,10 @@ def test_gemma_warm_captures_largest_first_then_the_long_roots():
     grid, long = ev[:first - 1], ev[first - 1:]
     caps = [k for kind, k in grid if kind == "capture"]
     assert [kind for kind, _ in grid] == ["warm"] * len(caps) + ["capture"] * len(caps)
-    assert [_graph_tokens(k) for k in caps] == sorted(map(_graph_tokens, caps), reverse=True)
+    plain, pass2 = [k for k in caps if k[0] != "x"], [k for k in caps if k[0] == "x"]
+    assert caps == plain + pass2
+    assert [_graph_tokens(k) for k in plain] == sorted(map(_graph_tokens, plain), reverse=True)
+    assert [_graph_tokens(k) for k in pass2] == sorted(map(_graph_tokens, pass2))
     want = {("c", T) for T in (16, 32, 64, 128)}  # compact rows: plain graphs of at most TREE_ROWS[-1] rows
     want |= {("p", b, L) for L in (16, 32, 64) for b in (1, 2) if b * L <= 128 or b == 1}
     want |= {("x", b, S, L) for b in (1, 2) for L in (16, 32) for S in (8, 16)}  # rows x root within the budget

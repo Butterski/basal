@@ -1021,6 +1021,9 @@ class GraphBackend(EagerBackend):
             if self.shared else None
 
     PASS2_POOL = 1 << 30  # Gemma 4: the most the pass-2 graphs over roots longer than LENS may add to the GPU memory
+    # pass-2 graphs are captured only while at least this much GPU memory stays free (_capture_deferred): the forwards
+    # without a graph (states beyond the grid, pass 2 of other shapes) need room at run time
+    PASS2_RESERVE = 3 << 29  # 1.5 GiB
     KV_SHARE = 0.15  # Gemma 4: the most of the free GPU memory (after the weights) its key / value buffers may take
 
     def _fit_grid(self):
@@ -1473,10 +1476,31 @@ class GraphBackend(EagerBackend):
         12,288 tokens) each larger graph allocated new blocks and the pool grew to many times the largest graph's
         working set. torch.compile still sees the shapes in the grid's order (the warm-up calls in _capture), so the
         compiled kernels are those of capturing in that order. RTX 4090, basal-2.0-mini, --batches compact, 21 Oct:
-        graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical."""
+        graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical.
+
+        The pass-2 graphs come last, the smallest (the commonest shapes) first, and only while PASS2_RESERVE of GPU
+        memory stays free: each keeps 10-20 MB outside the pool for its kernels (basal-2.0-mini / 4.5B, RTX 4090),
+        264 of them about 5 GB on basal-2.0-4.5B, which therefore did not start on a 16 GB card. A pass 2 without its
+        graph runs uncompiled, as one beyond the grid does (_tree_hidden); the plain and compact graphs, which a
+        forward cannot do without, are all captured."""
         deferred, self._deferred = self._deferred, None
-        for key in sorted(deferred, key=_graph_tokens, reverse=True):
+        keys = sorted(deferred, key=_graph_tokens, reverse=True)
+        for key in (k for k in keys if k[0] != "x"):
             self._record(key, *deferred[key])
+        pass2 = [k for k in reversed(keys) if k[0] == "x"]
+        if pass2 and self.dev.type == "cuda":
+            torch.cuda.empty_cache()  # (blocks the warm-up calls left cached are no graph's)
+        for n, key in enumerate(pass2):
+            free = self._free_memory()
+            if free is not None and free < self.PASS2_RESERVE:
+                print(f"basal: {n} of {len(pass2)} pass-2 graphs captured, {self.PASS2_RESERVE >> 20} MiB of GPU "
+                      "memory kept free; the other shapes run pass 2 without a graph", flush=True)
+                break
+            self._record(key, *deferred[key])
+
+    def _free_memory(self):
+        """Free GPU memory in bytes (None off CUDA: no budget)."""
+        return torch.cuda.mem_get_info(self.dev)[0] if self.dev.type == "cuda" else None
 
     def _graph(self, b, L):
         """Plain graph (b rows, length L): (graph, ids, kv buffers or None, hidden states [b, L, D]); Gemma 4: (graph,
