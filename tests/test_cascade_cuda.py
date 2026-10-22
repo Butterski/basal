@@ -9,6 +9,12 @@ from basal.engine import _cascade_varlen, _varlen, _varlen_tree, torch_varlen_av
 from tests.test_engine16 import ref_varlen
 
 why = torch_varlen_available(torch.bfloat16)
+if why is None:  # the cascade also needs seqused_k (_cascade_why), which torch_varlen_available does not ask for
+    import inspect
+
+    from torch.nn.attention.varlen import varlen_attn
+    if "seqused_k" not in inspect.signature(varlen_attn).parameters:
+        why = "this torch's varlen_attn has no seqused_k"
 cuda = pytest.mark.skipif(why is not None, reason=f"torch varlen attention: {why}")
 H, HKV, D = 16, 2, 128  # basal-2.0-4.5B: 8 query heads per key / value head, head size 128
 
