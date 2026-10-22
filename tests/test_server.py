@@ -116,14 +116,14 @@ def test_default_mode_requires_both_mlx_packages_on_mps(monkeypatch):
 
 
 def test_benchmark_mps_default_avoids_eager_fp32(monkeypatch):
-    monkeypatch.setattr(bench_module, "default_mode", lambda: "mlx")
+    monkeypatch.setattr(bench_module, "default_mode", lambda model=None: "mlx")
     monkeypatch.setattr(bench_module.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(bench_module.torch.backends.mps, "is_available", lambda: True)
     assert bench_module.default_modes() == ["mps", "mlx"]
 
 
 def test_benchmark_cuda_default_preserves_fp32_reference(monkeypatch):
-    monkeypatch.setattr(bench_module, "default_mode", lambda: "fast")
+    monkeypatch.setattr(bench_module, "default_mode", lambda model=None: "fast")
     monkeypatch.setattr(bench_module.torch.cuda, "is_available", lambda: True)
     assert bench_module.default_modes() == ["eager-fp32", "fast"]
 

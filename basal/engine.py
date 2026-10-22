@@ -437,6 +437,57 @@ def compact_refused(why):
             f"torch's varlen attention ({why})")
 
 
+# config.json "layer_types" of attention layers; any other kind (Qwen3.5's linear_attention: Gated DeltaNet, Mamba,
+# conv) carries a recurrent state from token to token
+ATTENTION_LAYERS = {"full_attention", "sliding_attention", "chunked_attention"}
+RECURRENT_MODEL_TYPES = ("qwen3_5", "qwen3_next", "mamba", "jamba", "zamba", "bamba", "falcon_h1", "granitemoehybrid",
+                         "nemotron_h", "lfm2", "recurrent_gemma", "rwkv")
+
+
+def recurrent_layers(model_dir):
+    """The recurrent-state layers of a model (Gated DeltaNet / linear attention as in Qwen3.5, Mamba, conv), read from
+    its config.json before any weights are -> e.g. "18 linear_attention layers" or "model_type qwen3_5_text"; None for
+    an attention-only decoder or without a readable config.json."""
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    cfgs = (cfg, cfg.get("text_config") or {})  # multimodal models: the decoder's settings in text_config
+    for c in cfgs:
+        kinds = [k for k in c.get("layer_types") or () if k not in ATTENTION_LAYERS]
+        if kinds:
+            return ", ".join(f"{kinds.count(k)} {k}" for k in sorted(set(kinds))) + " layers"
+    for c in cfgs:
+        if str(c.get("model_type") or "").startswith(RECURRENT_MODEL_TYPES):
+            return f"model_type {c['model_type']}"
+    return None
+
+
+def recurrent_refused(model, what):
+    """The refusal of the shared-prefix engines (--mode fast, fast-nocompile, fast-exit, fp8, nvfp4, mps) for a model
+    with recurrent-state layers. Their prefix tries, two passes, compact rows and caches hold attention keys and values
+    only: a Gated DeltaNet layer would restart from zero state below a shared prefix and run across the prompts of a
+    packed row, so the answers would be wrong without any error (v2.3.1 with the 0.8B pico, 21 Oct)."""
+    return (f"{model}: {what} (recurrent state: Gated DeltaNet / linear attention, as in Qwen3.5). The CUDA graph "
+            "engine (--mode fast, fast-nocompile, fast-exit, fp8, nvfp4) and --mode mps keep attention keys and values "
+            "only and would answer wrongly; serve it with --mode eager (exact) or --mode vllm (faster), or --mode gguf "
+            "with a GGUF file")
+
+
+def fp8_refused():
+    """Why torchao FP8 (--mode fp8, --quant fp8) cannot run here, None if it can: its FP8 matrix multiplies need a GPU
+    of compute capability 8.9 or newer (Ada, Hopper, Blackwell); on older GPUs torchao failed only after the model was
+    loaded (RTX 3090, #33)."""
+    if not torch.cuda.is_available():
+        return "--mode fp8 needs a CUDA GPU of compute capability 8.9 or newer (Ada, Hopper, Blackwell)"
+    cc = torch.cuda.get_device_capability()
+    if tuple(cc) < (8, 9):
+        return (f"--mode fp8 needs a GPU of compute capability 8.9 or newer (Ada, Hopper, Blackwell) for its FP8 "
+                f"matrix multiplies; {torch.cuda.get_device_name()} is sm_{cc[0]}{cc[1]}. Serve with --mode fast "
+                "(bf16) on this GPU")
+    return None
+
+
 def _varlen_attention(q, k, v, cu, scale, layer=0, impl="fa3"):
     """Causal attention of compact rows: [1, heads, T, d] in (prompts packed back to back, cu = their cumulative token
     counts, int32, empty prompts at the end), [1, T, heads, d] out. impl (the backend's compact_kernel): "fa3" =
@@ -671,6 +722,11 @@ class GraphBackend(EagerBackend):
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
                  readout_layer="off", template="off", gemma_attn="auto"):
+        what = recurrent_layers(model_dir)  # before anything is loaded
+        if what:
+            raise ValueError(recurrent_refused(model_dir, what))
+        if quant == "fp8" and fp8_refused():
+            raise ValueError(fp8_refused())
         torch.backends.cuda.enable_cudnn_sdp(False)  # before capture: a captured graph keeps its attention kernel
         from . import gemma4_graph
         # every captured graph keeps its own cuBLAS workspace (32 MB on an H100): basal-omni-1.1-max's ~400 graphs held
@@ -2040,6 +2096,9 @@ class MPSBackend(GraphBackend):
     streams, inflight = False, 1  # its own run_shared: no early readouts, one call at a time
 
     def __init__(self, model_dir, dtype="bfloat16", shared=True, device=None):
+        what = recurrent_layers(model_dir) if shared else None  # without sharing: EagerBackend's forwards (exact)
+        if what:
+            raise ValueError(recurrent_refused(model_dir, what))
         mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
         device = device or ("mps" if mps else "cpu")
         EagerBackend.__init__(self, model_dir, dtype, device)

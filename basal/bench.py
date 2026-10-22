@@ -70,12 +70,13 @@ def build(mode, md, vllm_model=None, gguf=None, ollama_model=None, ollama_url="h
     return GraphBackend(md, "bfloat16", quant, compile=comp, shared=True)
 
 
-def default_modes():
+def default_modes(model=None):
     """A reference that fits the device, then the serving default: eager-fp32 on CUDA and CPU, bf16 mps on Apple
-    Silicon (the fp32 4.5B needs about 18 GB)."""
-    mode = default_mode()
+    Silicon (the fp32 4.5B needs about 18 GB); a model with recurrent-state layers (Qwen3.5) gets eager alone there
+    (mps refuses it)."""
+    mode = default_mode(model)
     if not torch.cuda.is_available() and torch.backends.mps.is_available():
-        return [mode] if mode == "mps" else ["mps", mode]
+        return [mode] if mode in ("mps", "eager") else ["mps", mode]
     return ["eager-fp32", mode]
 
 
@@ -237,7 +238,7 @@ def main():
     ap.add_argument("--mlx-packed", dest="mlx_packed", action="store_true",
                     help="mlx modes: the packed forward of short Llama groups (basal-serve --mlx-packed)")
     a = ap.parse_args()
-    a.modes = a.modes or default_modes()
+    a.modes = a.modes or default_modes(a.model)
     md = resolve(a.model, metadata_only=all(MODES.get(m.split("@")[0], ("",))[0] in GGUF_KINDS for m in a.modes))
     vm = resolve(a.vllm_model) if a.vllm_model else None
     qs = load_questions(a.questions, a.n)
