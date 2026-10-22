@@ -119,14 +119,14 @@ class EagerBackend:
         cls = AutoModelForCausalLM
         if media:
             from .media import audio_window, kinds_of
-            self.media_kinds = kinds_of(json.loads((Path(model_dir) / "config.json").read_text()))
+            self.media_kinds = kinds_of(json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8")))
             if not self.media_kinds:
                 raise SystemExit("--media on: the model has no image or audio encoder (config.json: vision_config, "
                                  "audio_config)")
             from transformers import AutoModelForImageTextToText, AutoProcessor
             cls, self.proc = AutoModelForImageTextToText, AutoProcessor.from_pretrained(model_dir)
             pc = Path(model_dir) / "processor_config.json"
-            self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
+            self.max_audio_s = audio_window(json.loads(pc.read_text(encoding="utf-8"))) if pc.exists() else None
             _memo_media(self.proc)
         self.lock, self.media_lock = threading.Lock(), threading.Lock()
         self.model = cls.from_pretrained(model_dir, dtype=getattr(torch, dtype))
@@ -344,6 +344,9 @@ def attention_available(impl):
         return None
     if impl == "cudnn":
         return None if torch.backends.cudnn.is_available() else "cuDNN is not available"
+    if impl == "flex":  # Gemma 4's FlexAttention: Inductor generates its kernel with Triton (not in Windows wheels)
+        import importlib.util
+        return None if importlib.util.find_spec("triton") else "FlexAttention needs Triton (the triton package)"
     return f"unknown attention {impl!r} (one of {', '.join(ATTN)})"
 
 
@@ -364,6 +367,8 @@ def gemma_fast_kernels():
     (the math kernel, uncompiled; eager without --mode): fa3 where FlashAttention 3 runs (Hopper; E3, 20 Oct), flex on
     Blackwell workstation GPUs (sm_120: FlexAttention with the smaller tiles of 99 KB of shared memory per block; RTX
     PRO 6000, 20 Oct)."""
+    if attention_available("flex"):  # both run FlexAttention (fa3: in the 512-wide global layers)
+        return None
     if attention_available("fa3") is None:
         return "fa3"
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
@@ -422,6 +427,8 @@ def torch_varlen_available(dtype):
         return "needs an sm80+ GPU"
     if dtype not in (torch.bfloat16, torch.float16):
         return "needs bf16 / fp16 activations"
+    if not torch.backends.cuda.is_flash_attention_available():  # Windows wheels: built without USE_FLASH_ATTENTION
+        return "this torch is built without FlashAttention"
     try:
         from torch.nn.attention.varlen import varlen_attn
     except ImportError:
@@ -449,7 +456,7 @@ def recurrent_layers(model_dir):
     its config.json before any weights are -> e.g. "18 linear_attention layers" or "model_type qwen3_5_text"; None for
     an attention-only decoder or without a readable config.json."""
     try:
-        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+        cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     cfgs = (cfg, cfg.get("text_config") or {})  # multimodal models: the decoder's settings in text_config
@@ -517,16 +524,23 @@ def _varlen_attention(q, k, v, cu, scale, layer=0, impl="fa3"):
 
 
 def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None,
-                    basal_kv=None, basal_prefix=None, basal_cu=None, basal_varlen="fa3", **kwargs):
+                    basal_kv=None, basal_prefix=None, basal_cu=None, basal_varlen="fa3", basal_tree=None, **kwargs):
     """torch SDPA with additions for the two-pass forward of branched units and for compact rows (the kwargs pass
     through the transformers model forward): basal_kv[layer] = (K, V) buffers that receive this layer's keys and
     values (the root pass), basal_prefix[layer] = (K, V) of a computed prefix that the queries also attend to (the
     branch pass), basal_cu = cumulative token counts of prompts packed into one row (each attends to itself only),
-    basal_varlen = the kernel of those rows (_varlen_attention's impl).
+    basal_varlen = the kernel of those rows (_varlen_attention's impl), basal_tree = _block_plan's batches (the branch
+    pass on the CPU): the queries attend to the prefix and, per trie block, to their own ancestors separately, merged by
+    log-sum-exp (no concatenated keys, no [N, P + N] mask).
     A causal forward without a mask uses the kernel chosen by set_attention (--attn)."""
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
     if basal_cu is not None:
         return _varlen_attention(query, key, value, basal_cu, scaling, module.layer_idx, basal_varlen), None
+    if basal_tree is not None:
+        k, v = basal_prefix[module.layer_idx]
+        o_p, l_p = _attention_lse(query, k, v, scaling)
+        o_b, l_b = _branch_attention(query, key, value, scaling, basal_tree)
+        return _merge_attention(o_p, l_p, o_b, l_b).transpose(1, 2).contiguous(), None
     if basal_kv is not None:
         k, v = basal_kv[module.layer_idx]
         k.copy_(key); v.copy_(value)
@@ -548,6 +562,103 @@ def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scal
         module = SimpleNamespace(num_key_value_groups=1, is_causal=getattr(module, "is_causal", True))
     return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
                                   is_causal=is_causal, **kwargs)
+
+
+def _attention_lse(q, k, v, scale, mask=None):
+    """Attention and its log-sum-exp on the CPU (SDPA's CPU flash kernel, the one SDPA picks there): q [B, H, S, d],
+    k / v [B, Hkv, L, d], mask bool broadcastable to [B, 1, S, L] or None -> (o [B, H, S, d], lse [B, H, S] fp32).
+    Without a mask the H / Hkv query heads of each key / value head are folded into the query length (grouped-query
+    attention without copying keys)."""
+    flash = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu
+    B, H, S, d = q.shape
+    r = H // k.shape[1]
+    if mask is None:
+        o, lse = flash(q.reshape(B, k.shape[1], r * S, d), k, v, scale=scale)
+        return o.reshape(B, H, S, d), lse.reshape(B, H, S)
+    # finfo.min, not -inf: on a row of -inf only the kernel returns lse 0 instead of -inf (_block_plan gives every row
+    # a key, so this is a guard)
+    add = torch.zeros(mask.shape, dtype=q.dtype, device=q.device).masked_fill(~mask, torch.finfo(q.dtype).min)
+    if r > 1:
+        k, v = k.repeat_interleave(r, 1), v.repeat_interleave(r, 1)
+    return flash(q, k, v, attn_mask=add, scale=scale)
+
+
+def _merge_attention(o1, l1, o2, l2):
+    """Two attentions over disjoint key sets with their log-sum-exp -> the attention over the union: the softmax over
+    all the keys, summed in another order. Weights in fp32; a part that saw no key weighs 0."""
+    lse = torch.logaddexp(l1, l2)
+    w1, w2 = torch.exp(l1 - lse)[..., None], torch.exp(l2 - lse)[..., None]
+    return (torch.where(w1 > 0, o1.float() * w1, 0.0) + torch.where(w2 > 0, o2.float() * w2, 0.0)).to(o1.dtype)
+
+
+def _block_plan(seg, parents, waste=1.5):
+    """The branch pass per trie block, without a trie mask: block b's queries see the tokens of its ancestor blocks
+    below the root and its own earlier tokens, i.e. keys = (ancestors' tokens, b's tokens) with a causal mask aligned at
+    the end. seg: block of every token below the root (0..; each block contiguous, flattened depth first), parents: the
+    parent block of every block (-1 = the root); a slice of whole top-level subtrees works as well. -> [(queries
+    [n, m], keys [n, k], mask bool [n, 1, m, k])]: token indices (len(seg) = padding) of blocks of similar shape
+    batched, padded to the batch's longest, at most `waste` x the real query-key pairs per batch (one block alone may
+    exceed it)."""
+    N = len(seg)
+    span = {}
+    for i, s in enumerate(seg):
+        span[s] = (span.get(s, (i,))[0], i + 1)
+    items = []
+    for blk, (a, b) in span.items():
+        anc, p = [], parents[blk]
+        while p >= 0:
+            anc = list(range(*span[p])) + anc
+            p = parents[p]
+        items.append((list(range(a, b)), anc))
+    items.sort(key=lambda x: (len(x[0]), len(x[1])))
+    plan, cur = [], []
+    for it in items + [None]:
+        if it is not None:
+            nxt = cur + [it]
+            m, k = max(len(q) for q, _ in nxt), max(len(q) + len(an) for q, an in nxt)
+            if not cur or len(nxt) * m * k <= waste * sum(len(q) * (len(q) + len(an)) for q, an in nxt):
+                cur = nxt
+                continue
+        m = max(len(q) for q, _ in cur)
+        k = max(len(q) + len(an) for q, an in cur)
+        qi = torch.full((len(cur), m), N, dtype=torch.long)
+        ki = torch.full((len(cur), k), N, dtype=torch.long)
+        mask = torch.zeros((len(cur), 1, m, k), dtype=torch.bool)
+        i, j = torch.arange(m)[:, None], torch.arange(k)[None]
+        for r, (q, an) in enumerate(cur):
+            qi[r, : len(q)] = torch.tensor(q)
+            ki[r, : len(an) + len(q)] = torch.tensor(an + q)
+            mask[r, 0] = (j <= len(an) + i) & (j < len(an) + len(q))
+            mask[r, 0, len(q):, 0] = True  # padding queries see one key (no row without keys)
+        plan.append((qi, ki, mask))
+        cur = [it] if it is not None else []
+    return plan
+
+
+def cascade_ok(cfg):
+    """The CPU branch pass of _cascade covers attention-only models without a sliding window (the Llama-based basal
+    models): every key a branch token sees is in the root or in its block's ancestors. Models with sliding-window or
+    linear-attention layers keep the dense pass over the transformers cache, as does a torch without the CPU flash
+    kernel _attention_lse calls (a private aten op; basal pins only torch>=2.11)."""
+    cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
+    return set(getattr(cfg, "layer_types", None) or ["full_attention"]) == {"full_attention"} \
+        and not getattr(cfg, "sliding_window", None) \
+        and hasattr(torch.ops.aten, "_scaled_dot_product_flash_attention_for_cpu")
+
+
+def _branch_attention(q, k, v, scale, plan):
+    """The branch part of the branch pass: q [1, H, N, d], k / v [1, Hkv, N, d] (the tokens below the root) and
+    _block_plan's batches -> (o [1, H, N, d], lse [1, H, N] fp32)."""
+    _, H, N, d = q.shape
+    o = q.new_empty(H, N + 1, d)
+    lse = torch.empty(H, N + 1, dtype=torch.float32, device=q.device)
+    qp, kp, vp = (torch.cat([x[0], x.new_zeros(x.shape[1], 1, d)], 1) for x in (q, k, v))  # [heads, N + 1, d]
+    for qi, ki, mask in plan:
+        ob, lb = _attention_lse(qp[:, qi].transpose(0, 1), kp[:, ki].transpose(0, 1), vp[:, ki].transpose(0, 1),
+                                scale, mask)
+        o[:, qi] = ob.transpose(0, 1)
+        lse[:, qi] = lb.transpose(0, 1)
+    return o[None, :, :N], lse[None, :, :N]
 
 
 def causal_sdpa(model):
@@ -744,6 +855,8 @@ class GraphBackend(EagerBackend):
                    else torch_varlen_available(getattr(torch, dtype)))
             if why:
                 raise ValueError(compact_refused(why))
+        if gemma_attn in ("flex", "fa3") and attention_available("flex") and gemma4_graph.is_gemma4_dir(model_dir):
+            raise ValueError(f"--gemma-attn {gemma_attn}: {attention_available('flex')}")  # fa3: flex in global layers
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.tok.pad_token = self.tok.pad_token or self.tok.eos_token
         if self.fp8_checkpoint:
@@ -1729,7 +1842,8 @@ class GraphBackend(EagerBackend):
     def _tree_cache(self, pack):
         """A branched unit in two eager passes over a transformers KV cache (the MPS and early-exit backends, whose
         attention has no key / value buffers): the root with causal attention, then every other block as one packed
-        row over that cache with the trie mask. -> hidden states at the readout positions."""
+        row over that cache with the trie mask; on the CPU the branch pass of _cascade instead. -> hidden states at the
+        readout positions."""
         t, pp, sg, last, par = pack
         P = sg.index(1) if 1 in sg else len(t)  # block 0 (the root) comes first and is contiguous
         out = self.model.model(input_ids=self._to_dev(torch.tensor([t[:P]])), use_cache=True)
@@ -1738,7 +1852,10 @@ class GraphBackend(EagerBackend):
             if i < P:  # a prompt that ends inside the root (a duplicate of the shared prefix)
                 h[m] = out.last_hidden_state[0, i]
         rest = [m for m, i in enumerate(last) if i >= P]
-        if rest:
+        if rest and self.dev.type == "cpu" and cascade_ok(self.model.config):
+            h2 = self._cascade(t[P:], pp[P:], [s - 1 for s in sg[P:]], [-1 if q <= 0 else q - 1 for q in par[1:]],
+                               out.past_key_values)
+        elif rest:
             N = len(t) - P
             seg2 = torch.tensor([[s - 1 for s in sg[P:]]])  # blocks 1.. -> 0..; their trie without the root
             par2 = [[-1 if q <= 0 else q - 1 for q in par[1:]]]
@@ -1747,9 +1864,43 @@ class GraphBackend(EagerBackend):
             h2 = self.model.model(input_ids=self._to_dev(torch.tensor([t[P:]])), attention_mask=m2,
                                   position_ids=self._to_dev(torch.tensor([pp[P:]])), past_key_values=out.past_key_values,
                                   use_cache=True).last_hidden_state[0]
-            for m in rest:
-                h[m] = h2[last[m] - P]
+        for m in rest:
+            h[m] = h2[last[m] - P]
         return torch.stack(h)
+
+    def _cascade(self, toks, pos, seg, parents, cache):
+        """The branch pass of _tree_cache on the CPU: the tokens below the root (toks, their positions pos, their blocks
+        seg 0.., the blocks' parents with -1 = the root) attend to the root's keys / values in the KV cache as they are
+        and, per trie block, to their own ancestors (basal_attention's basal_tree), merged by log-sum-exp: no copied
+        keys and no [N, P + N] mask, so a unit need not be split (_oversize) and the root runs once. Parts of whole
+        top-level subtrees (each sees only the root and itself) of at most BRANCH_TOKENS tokens (one larger subtree:
+        a part of its own) bound the activations. -> hidden states of the tokens below the root [N, D]."""
+        from transformers import AttentionInterface
+        AttentionInterface.register("basal_sdpa", basal_attention)
+        prefix = [(layer.keys, layer.values) for layer in cache.layers]
+        top = []  # the top-level subtree of every block (a block comes after its parent)
+        for b, p in enumerate(parents):
+            top.append(b if p < 0 else top[p])
+        runs, a = [], 0  # top-level subtrees: contiguous runs of tokens (the trie is flattened depth first)
+        for i in range(1, len(seg) + 1):
+            if i == len(seg) or top[seg[i]] != top[seg[i - 1]]:
+                runs.append((a, i))
+                a = i
+        parts = [list(runs[0])]
+        for a, b in runs[1:]:
+            if b - parts[-1][0] > self.BRANCH_TOKENS:
+                parts.append([a, b])
+            else:
+                parts[-1][1] = b
+        cfg = self.model.config  # basal_attention for this pass only (the MPS backend runs one call at a time)
+        impl, cfg._attn_implementation = cfg._attn_implementation, "basal_sdpa"
+        try:
+            return torch.cat([self.model.model(input_ids=self._to_dev(torch.tensor([toks[a:b]])),
+                                               position_ids=self._to_dev(torch.tensor([pos[a:b]])), use_cache=False,
+                                               basal_prefix=prefix, basal_tree=_block_plan(seg[a:b], parents)
+                                               ).last_hidden_state[0] for a, b in parts])
+        finally:
+            cfg._attn_implementation = impl
 
     def _long(self, pack, lids):
         """Readout of a unit longer than the largest graph: one forward without a mask (a single prompt) or the two
@@ -1979,7 +2130,7 @@ class ExitGraphBackend(GraphBackend):
         super().__init__(model_dir, dtype, quant, compile=False, shared=True, warm=False, attn=attn, merge=merge)
         hd = Path(heads_dir) if heads_dir else Path(model_dir) / "exit_heads"
         ck = torch.load(hd / "heads.pt", map_location="cpu")
-        th = json.loads((hd / "thresholds.json").read_text())
+        th = json.loads((hd / "thresholds.json").read_text(encoding="utf-8"))
         self.policies = {k: {int(L): t for L, t in v["taus"].items() if t <= 1.0} for k, v in th["levels"].items()}
         self.policies["off"] = {}
         self.default_policy = default_policy
@@ -2106,6 +2257,21 @@ class MPSBackend(GraphBackend):
         self.shared = shared
         self._wrows = {}
 
+    def _oversize(self, pack, n):
+        """On the CPU (cascade_ok models) the branch pass runs in parts of whole top-level subtrees over one root
+        (_cascade): a unit is split only when its prompts have no common root or one top-level subtree (a question with
+        its option orders, ...) holds more than BRANCH_TOKENS tokens; splitting then moves its shared block into the
+        root of the smaller units."""
+        if self.dev.type != "cpu" or not cascade_ok(self.model.config):
+            return GraphBackend._oversize(self, pack, n)
+        top, size = [], {}  # the top-level subtree of every block (block 0 = the root); its tokens
+        for b, p in enumerate(pack[4]):
+            top.append(b if p <= 0 else top[p])
+        for s in pack[2]:
+            if s > 0:
+                size[top[s]] = size.get(top[s], 0) + 1
+        return pack[4].count(-1) > 1 or max(size.values(), default=0) > self.BRANCH_TOKENS
+
     @torch.no_grad()
     def run(self, prompts, ids_list):
         if not self.shared:
@@ -2191,7 +2357,7 @@ class VLLMBackend:
     def __init__(self, model_dir, dtype="bfloat16", mem=0.6, max_len=4096, max_options=10, preset="default",
                  fast_prefill=True, media=False):
         cfg_file = Path(model_dir) / "config.json"
-        cfg = json.loads(cfg_file.read_text()) if cfg_file.exists() else {}
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
         kw, env = vllm_args(cfg, preset, media=media, fast_prefill=fast_prefill)
         if media:  # --media on: the media the model takes (basal/media.py), as EagerBackend
             from .media import audio_window, kinds_of
@@ -2206,7 +2372,7 @@ class VLLMBackend:
                                  "vLLM 0.31 reads their images and audio differently from the model's processor; use "
                                  "--mode eager --media on")
             pc = Path(model_dir) / "processor_config.json"
-            self.max_audio_s = audio_window(json.loads(pc.read_text())) if pc.exists() else None
+            self.max_audio_s = audio_window(json.loads(pc.read_text(encoding="utf-8"))) if pc.exists() else None
         os.environ.update(env)  # before vLLM starts its engine process, which reads it
         self.tok = AutoTokenizer.from_pretrained(model_dir)
         self.prefill = PREFILL
@@ -2391,7 +2557,7 @@ class MLXBackend:
         import mlx.core as mx
         from mlx_lm.utils import load_model
         self.mx = mx
-        cfg = json.loads((md / "config.json").read_text())
+        cfg = json.loads((md / "config.json").read_text(encoding="utf-8"))
         if quant not in (None, "q8"):
             raise ValueError(f"unknown MLX quantisation {quant!r} (q8)")
         # lazy for q8: the weights are materialised once, after quantisation (never the full bf16 copy)
@@ -2660,7 +2826,7 @@ class GGUFBackend(GraphBackend):
         # a full model directory: its architecture must match the GGUF file; the -GGUF repositories carry tokenizer and
         # calibration without config.json (their .gguf files belong to them)
         cp = Path(model_dir) / "config.json"
-        cfg = json.loads(cp.read_text()) if cp.exists() else {}
+        cfg = json.loads(cp.read_text(encoding="utf-8")) if cp.exists() else {}
         cfg = cfg.get("text_config") or cfg  # Gemma 4 (basal-omni): the decoder's settings are in text_config
         for name, llama_name in (("num_hidden_layers", "llama_model_n_layer"), ("hidden_size", "llama_model_n_embd")):
             if not cfg:
@@ -2922,7 +3088,7 @@ def modelopt_fp8(model_dir):
     """True for a ModelOpt FP8 checkpoint (the -FP8 repositories): FP8 linear weights with static per-tensor weight and
     input scales."""
     p = Path(model_dir) / "config.json"
-    q = (json.loads(p.read_text()).get("quantization_config") or {}) if p.exists() else {}
+    q = (json.loads(p.read_text(encoding="utf-8")).get("quantization_config") or {}) if p.exists() else {}
     return q.get("quant_method") == "modelopt" and q.get("quant_algo") == "FP8"
 
 
