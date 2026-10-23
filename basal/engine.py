@@ -744,10 +744,12 @@ def _varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale, causal=False, used=None):
     """torch's varlen attention (FlashAttention 2 on packed sequences, grouped-query) with its log-sum-exp: q [Tq, H,
     d], k / v [Tk, Hkv, d], cu_q / cu_k cumulative lengths (int32), used: the keys each sequence uses (seqused_k) or
     None, causal: aligned at the end of each sequence -> (o [Tq, H, d], lse [Tq, H] fp32). The log-sum-exp comes as
-    [H, Tq] (torch 2.13, RTX 4090)."""
-    from torch.nn.attention.varlen import AuxRequest, varlen_attn
-    o, lse = varlen_attn(q, k, v, cu_q, cu_k, max_q, max_k, scale=scale, window_size=(-1, 0) if causal else (-1, -1),
-                         enable_gqa=True, seqused_k=used, return_aux=AuxRequest(lse=True))
+    [H, Tq] (torch 2.13, RTX 4090). The op varlen_attn (torch.nn.attention.varlen) runs, with the arguments it passes,
+    called directly: varlen_attn wraps it in a Python custom op and allocates a random-number state per call, host
+    time that an uncompiled pass 2 paid twice per layer (_cascade_varlen), more than the kernels took on a fast GPU."""
+    o, lse, *_ = torch.ops.aten._flash_attention_forward(
+        q, k, v, cu_q, cu_k, max_q, max_k, 0.0, causal, False, scale=scale, window_size_left=-1,
+        window_size_right=0 if causal else -1, seqused_k=used)
     return o, (lse.transpose(0, 1) if lse.shape == (q.shape[1], q.shape[0]) else lse).float()
 
 
