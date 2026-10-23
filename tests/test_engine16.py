@@ -1,6 +1,7 @@
 """Fast path routing on CPU (graphs replaced by eager replays of the same static buffers): single prompts in plain
 graphs or a plain long forward, branched units in masked graphs or the two passes over the root's KV cache, all units
 of all groups batched together and read out at once. Every readout equals a separate forward of its own prompt."""
+import contextlib
 import random
 
 import pytest
@@ -34,7 +35,7 @@ class Stub(GraphBackend):
         self._alloc_kv()
         self.replays = []
 
-    def _capture(self, key, fn, *static, warmup=3):
+    def _capture(self, key, fn, *static):
         r = Replay(fn, static)
         self.graphs[key] = (r, *static, r.out)
         return self.graphs[key]
@@ -252,6 +253,28 @@ def test_shared_graph_outputs_keep_every_readout():
     assert len({g[2].untyped_storage().data_ptr() for k, g in be.graphs.items() if k[0] == "x"}) == 1
 
 
+def test_each_graph_warmed_up_once_before_its_capture(monkeypatch):
+    """The engine's _capture / _warm_up (torch.cuda's stream calls as no-ops on the CPU): a graph's function runs once
+    before its capture, the first call that compiles and sets up what the capture cannot. 3 calls per plain graph
+    (2 per pass-2 graph) cost 414 s of basal-2.0-4.5B's 1,094 s warm-up on an RTX 4060 Ti."""
+    class Stream:
+        def wait_stream(self, other):
+            pass
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: Stream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    calls, recorded = [], []
+    be = GraphBackend.__new__(GraphBackend)
+    be._side, be._deferred = None, {}
+    be._record = lambda key, fn, static: recorded.append(key)
+    for key in (("p", 2, 16), ("x", 1, 8, 16), ("p", 2, 16)):  # the last one waits already: not warmed up again
+        GraphBackend._capture(be, key, lambda *s, k=key: calls.append((k, s)), "static")
+    assert calls == [(("p", 2, 16), ("static",)), (("x", 1, 8, 16), ("static",))] and not recorded
+    be._deferred = None  # outside warm(): warmed up once, then captured
+    GraphBackend._capture(be, ("c", 64), lambda *s: calls.append((("c", 64), s)), "static")
+    assert calls[2:] == [(("c", 64), ("static",))] and recorded == [("c", 64)]
+
+
 @pytest.mark.parametrize("prefix", [False, True])
 def test_warm_captures_largest_first_after_every_warm_up(prefix):
     """warm() (Llama) runs every graph's warm-up calls first, in the grid's order (torch.compile compiles there, so
@@ -265,11 +288,11 @@ def test_warm_captures_largest_first_after_every_warm_up(prefix):
         SUFFIX_LENS = PREFIX_SFX = [8, 16]
         PREFIX_ROWS = [1, 2, 4]
 
-        def _capture(self, key, fn, *static, warmup=3):  # the engine's _capture, its two steps observed
+        def _capture(self, key, fn, *static):  # the engine's _capture, its two steps observed
             self.events.append(("request", key))
-            return GraphBackend._capture(self, key, fn, *static, warmup=warmup)
+            return GraphBackend._capture(self, key, fn, *static)
 
-        def _warm_up(self, fn, static, n):
+        def _warm_up(self, fn, static):
             self.events.append(("warm", None))
             fn(*static)
 
@@ -308,7 +331,7 @@ def test_pass2_graphs_captured_while_memory_stays_free(card):
         SUFFIX_LENS, PASS2_RESERVE = [8, 16], 10
         _capture = GraphBackend._capture
 
-        def _warm_up(self, fn, static, n):
+        def _warm_up(self, fn, static):
             fn(*static)
 
         def _record(self, key, fn, static):
@@ -350,7 +373,7 @@ def test_gemma_long_root_graphs_keep_the_reserve():
     be.model, be.graphs = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), {}
     be._graph = lambda b, L: be._capture(("p", b, L), lambda: None)
     be._graph_sfx = lambda b, S, L: be._capture(("x", b, S, L), lambda: None)
-    be._warm_up = lambda fn, static, n: None
+    be._warm_up = lambda fn, static: None
     be._record = lambda key, fn, static: be.graphs.setdefault(key, key)
     grid = len(be.grid(be.PLAIN_LENS)) + 2 * 2 * 2  # plain (b <= 4) + pass 2 within LENS: all fit on this card
     be._free_memory = lambda: grid + 2 + be.PASS2_RESERVE - len(be.graphs)  # room for two more graphs
@@ -380,7 +403,7 @@ def test_gemma_warm_captures_largest_first_then_the_long_roots():
     be._graph_c = lambda T: be._capture(("c", T), lambda: None)
     be._graph = lambda b, L: be._capture(("p", b, L), lambda: None)
     be._graph_sfx = lambda b, S, L: be._capture(("x", b, S, L), lambda: None)
-    be._warm_up = lambda fn, static, n: ev.append(("warm", None))
+    be._warm_up = lambda fn, static: ev.append(("warm", None))
     be._record = lambda key, fn, static: ev.append(("capture", key))
     be.warm()
     first = next(i for i, (kind, k) in enumerate(ev) if kind == "capture" and k[0] == "x" and k[3] > be.LENS[-1])

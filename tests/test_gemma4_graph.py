@@ -312,11 +312,11 @@ def test_warm_captures_largest_first_then_long_pass2():
             self.fwd, self.fwd_sfx = self._forward, self._forward_suffix
             self.events = []
 
-        def _capture(self, key, fn, *static, warmup=3):
+        def _capture(self, key, fn, *static):
             self.events.append(("request", key))
-            return GraphBackend._capture(self, key, fn, *static, warmup=warmup)
+            return GraphBackend._capture(self, key, fn, *static)
 
-        def _warm_up(self, fn, static, n):
+        def _warm_up(self, fn, static):
             self.events.append(("warm", None))
             fn(*static)
 

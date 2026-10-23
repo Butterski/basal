@@ -74,6 +74,14 @@ benchmarking a GPU.
   kernels (2.3.4, tested, not shipped) made basal-omni's batched answers bit-identical, but were slower than one
   request per forward (H100, basal-omni-1.0-mini: 154 instead of 163 decisions/s), so `--deterministic` keeps one
   request per forward; a faster batch-invariant GEMM is future work.
+- **`--layout canonical | state_twice | qfirst`** (2.4.1; prompt-format-2 models trained on the layouts):
+  `canonical` (the default) puts the state first, so a request's questions share it and
+  `--state-cache-gb` / `--prefix-cache` can keep it. `state_twice` reads the state twice. `qfirst` also puts the
+  question before the state, so the state is read knowing the question: one pass per question, slower for requests
+  with several questions, without the state caches. Each layout loads `CALIBRATION.<layout>.json` when the model ships
+  one; with only the canonical file its temperatures are kept, its thresholds are not applied, and the answers are
+  marked unvalidated. Without `--layout` a model is served in its basal.json `"layout"` (canonical when absent), and
+  `/v1/models` reports a non-canonical layout. Images and audio are read in the canonical layout only.
 - **Long states**: `--context-overflow truncate` (the default) cuts the middle of a state that does not fit the
   context (the first 1/3 and the last 2/3 of the kept tokens, `--truncate-head`; the question and options stay whole)
   and says what was cut in `usage.truncated`; `--context-overflow refuse` returns HTTP 422 instead. The context is

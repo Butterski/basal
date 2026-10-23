@@ -1581,25 +1581,28 @@ class GraphBackend(EagerBackend):
                       use_cache=False, basal_kv=kv)
         return m.norm(h)
 
-    def _capture(self, key, fn, *static, warmup=3):
-        """Warm fn up (torch.compile compiles here, at its first call) and capture it as graph `key`; in warm() the
-        capture waits for _capture_deferred, and a key already waiting is not warmed up again (with --prefix-cache
-        the two pass-2 families share some shapes)."""
+    def _capture(self, key, fn, *static):
+        """Warm fn up and capture it as graph `key`; in warm() the capture waits for _capture_deferred, and a key
+        already waiting is not warmed up again (with --prefix-cache the two pass-2 families share some shapes)."""
         if self._deferred is not None:
             if key not in self._deferred:
-                self._warm_up(fn, static, warmup)
+                self._warm_up(fn, static)
                 self._deferred[key] = (fn, static)
             return None
-        self._warm_up(fn, static, warmup)
+        self._warm_up(fn, static)
         return self._record(key, fn, static)
 
-    def _warm_up(self, fn, static, n):
+    def _warm_up(self, fn, static):
+        """One call of fn on the side stream before its capture: what a capture cannot do happens at a forward's first
+        call (torch.compile compiles, or recompiles for a shape its guards reject; cuBLAS sets up its handle and
+        workspace; Triton loads its kernels). The second and third calls (plain graphs 3, pass-2 graphs 2 before) ran
+        the same kernels again and only took start-up time: RTX 4060 Ti, 22 Oct, warm() 468 -> 323 s on basal-2.0-mini
+        and 1,094 -> 680 s on basal-2.0-4.5B, the probabilities bit-identical (420 readouts each)."""
         if self._side is None:
             self._side = torch.cuda.Stream()
         st = self._side; st.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(st):
-            for _ in range(n):
-                fn(*static)
+            fn(*static)
         torch.cuda.current_stream().wait_stream(st)
 
     def _record(self, key, fn, static):
@@ -1726,14 +1729,14 @@ class GraphBackend(EagerBackend):
             mask = self._shared_out("pass2 mask", self._pass2_max(lambda b, S, L: b * S * (L + S)), dt)[
                 : b * S * (L + S)].view(b, 1, S, L + S)
         if self.gemma is not None or self.flex:
-            return self._capture(key, self.fwd_sfx, ids, mask, pos, self._kv_views(b, L), warmup=2)
+            return self._capture(key, self.fwd_sfx, ids, mask, pos, self._kv_views(b, L))
         out = self._shared_out("pass2", self._pass2_max(lambda b, S, L: b * S) * self._hidden_size, dt)[
             : b * S * self._hidden_size].view(b, S, -1)
         fwd = self.fwd_sfx
 
         def suffix(i, m, p, kv):
             return _copy_same(out, fwd(i, m, p, kv))
-        return self._capture(key, suffix, ids, mask, pos, self._kv_views(b, L), warmup=2)
+        return self._capture(key, suffix, ids, mask, pos, self._kv_views(b, L))
 
     @property
     def _hidden_size(self):
