@@ -1,6 +1,8 @@
 """The branch pass as a cascade on CUDA (basal.engine._varlen, _varlen_tree, _cascade_varlen): torch's varlen attention
 against the attention written out (its log-sum-exp layout, causal aligned at the end, per-sequence key counts), and the
 cascade against the dense masked attention of today's pass 2. Need CUDA sm80+ and torch's varlen attention."""
+import importlib.util
+
 import numpy as np
 import pytest
 import torch
@@ -17,6 +19,8 @@ if why is None:  # the cascade also needs seqused_k (_cascade_why), which torch_
         why = "this torch's varlen_attn has no seqused_k"
 cuda = pytest.mark.skipif(why is not None, reason=f"torch varlen attention: {why}")
 H, HKV, D = 16, 2, 128  # basal-2.0-4.5B: 8 query heads per key / value head, head size 128
+triton = pytest.mark.skipif(importlib.util.find_spec("triton") is None,
+                            reason="the fused merge is torch.compile's (Triton); without it GraphBackend does not fuse")
 
 
 def to_dev(x):
@@ -75,6 +79,7 @@ def test_cascade_equals_dense_masked_attention():
 
 
 @cuda
+@triton
 def test_fused_merge_gives_the_merge_bit_for_bit():
     """The merge compiled into one kernel (_merge_fused: a GraphBackend that compiles) against _merge_attention op by
     op: the cascade's output bit for bit, for rows without padding (both log-sum-exps as the kernel returns them) and
