@@ -331,7 +331,7 @@ def test_pass2_graphs_captured_while_memory_stays_free(card):
         SUFFIX_LENS, PASS2_RESERVE = [8, 16], 10
         _capture = GraphBackend._capture
 
-        def _warm_up(self, fn, static, n):
+        def _warm_up(self, fn, static):
             fn(*static)
 
         def _record(self, key, fn, static):
@@ -373,7 +373,7 @@ def test_gemma_long_root_graphs_keep_the_reserve():
     be.model, be.graphs = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=0)), {}
     be._graph = lambda b, L: be._capture(("p", b, L), lambda: None)
     be._graph_sfx = lambda b, S, L: be._capture(("x", b, S, L), lambda: None)
-    be._warm_up = lambda fn, static, n: None
+    be._warm_up = lambda fn, static: None
     be._record = lambda key, fn, static: be.graphs.setdefault(key, key)
     grid = len(be.grid(be.PLAIN_LENS)) + 2 * 2 * 2  # plain (b <= 4) + pass 2 within LENS: all fit on this card
     be._free_memory = lambda: grid + 2 + be.PASS2_RESERVE - len(be.graphs)  # room for two more graphs
@@ -403,7 +403,7 @@ def test_gemma_warm_captures_largest_first_then_the_long_roots():
     be._graph_c = lambda T: be._capture(("c", T), lambda: None)
     be._graph = lambda b, L: be._capture(("p", b, L), lambda: None)
     be._graph_sfx = lambda b, S, L: be._capture(("x", b, S, L), lambda: None)
-    be._warm_up = lambda fn, static, n: ev.append(("warm", None))
+    be._warm_up = lambda fn, static: ev.append(("warm", None))
     be._record = lambda key, fn, static: ev.append(("capture", key))
     be.warm()
     first = next(i for i, (kind, k) in enumerate(ev) if kind == "capture" and k[0] == "x" and k[3] > be.LENS[-1])
