@@ -519,7 +519,7 @@ class GDNGraphBackend(GraphBackend):
 
         def suffix(i, p, u, n):
             return _copy_same(out, sfx(i, p, u, n, kv, st))
-        return self._capture(key, suffix, ids, pos, unit, plen, warmup=2)
+        return self._capture(key, suffix, ids, pos, unit, plen)
 
     def warm(self):
         """Capture every plain graph of the grid and, with `shared`, the pass-2 graphs; warmed up in grid order and
