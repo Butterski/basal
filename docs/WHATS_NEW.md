@@ -1,4 +1,4 @@
-# What is new in basal 2.4 (draft)
+# What is new in basal 2.4
 
 - **Qwen3.5 models in the fast engine** (`--mode fast`, `fast-nocompile`), such as basal-omni-pico (0.8B: 18 Gated
   DeltaNet layers and 6 attention layers). 2.3.2 refused them there: the engine shared a request's state between its

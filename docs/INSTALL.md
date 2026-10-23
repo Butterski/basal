@@ -82,6 +82,9 @@ basal-serve --model Remek/basal-2.0-4.5B --mode fast --template-prefix off --por
   6 GB more GPU memory for mini and 7 GB for the 4.5B where the card has room, 2.4 GB on a full 16 GB card;
   [SERVING.md](SERVING.md#serving-modes)).
 - Other models: `--model Remek/basal-2.0-max` or `--model Remek/basal-2.0-mini`.
+- **basal-omni-pico (Qwen3.5) needs flash-linear-attention** for its Gated DeltaNet layers in `--mode fast` (2.4+):
+  `uv pip install "flash-linear-attention==0.5.2"`, then `basal-serve --model Remek/basal-omni-pico`. Without it,
+  `--mode fast` refuses the model and says so, and without `--mode` the model runs in `eager` (3-10x slower).
 - From a clone instead: `git clone https://github.com/rkinas/basal && cd basal && uv pip install -e ".[fp8]"`
   (after the torch line above).
 
