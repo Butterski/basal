@@ -13,7 +13,7 @@ import basal.server as server_module
 from basal.engine import (EagerBackend, ExitGraphBackend, GraphBackend, MPSBackend, fp8_refused, recurrent_layers)
 from basal.server import Server, default_mode, parser
 
-PICO08_LAYERS = (["linear_attention"] * 3 + ["full_attention"]) * 6  # Qwen3.5-0.8B: 18 Gated DeltaNet, 6 attention
+PICO_LAYERS = (["linear_attention"] * 3 + ["full_attention"]) * 6  # Qwen3.5-0.8B: 18 Gated DeltaNet, 6 attention
 
 
 def write_config(d, cfg):
@@ -24,8 +24,8 @@ def write_config(d, cfg):
 
 @pytest.fixture
 def qwen35(tmp_path):
-    return write_config(tmp_path / "pico08", {"architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",
-                                              "layer_types": PICO08_LAYERS, "num_hidden_layers": 24})
+    return write_config(tmp_path / "pico", {"architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",
+                                              "layer_types": PICO_LAYERS, "num_hidden_layers": 24})
 
 
 @pytest.fixture
@@ -42,7 +42,7 @@ def test_recurrent_layers_from_config(tmp_path, qwen35, llama):
     assert recurrent_layers(omni) is None
     # the multimodal Qwen3.5 wrapper: its decoder in text_config; a config without layer_types: by model_type
     vl = write_config(tmp_path / "vl", {"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text",
-                                                                                 "layer_types": PICO08_LAYERS}})
+                                                                                 "layer_types": PICO_LAYERS}})
     assert recurrent_layers(vl) == "18 linear_attention layers"
     bare = write_config(tmp_path / "bare", {"model_type": "qwen3_5_text"})
     assert recurrent_layers(bare) == "model_type qwen3_5_text"
@@ -70,7 +70,7 @@ def test_server_refuses_graph_modes_before_download(monkeypatch, qwen35, mode):
         return str(qwen35)
     monkeypatch.setattr(server_module, "resolve", resolve)
     with pytest.raises(SystemExit, match="--mode eager"):
-        Server(parser().parse_args(["--model", "Remek/pico08", "--mode", mode]))
+        Server(parser().parse_args(["--model", "Remek/basal-omni-pico", "--mode", mode]))
 
 
 def test_default_mode_is_eager_for_recurrent_models(monkeypatch, qwen35, llama):
@@ -93,7 +93,7 @@ def test_default_mode_keeps_fast_when_the_config_cannot_be_read(monkeypatch):
     monkeypatch.setattr(server_module, "resolve", offline)
     monkeypatch.setattr(server_module, "gemma_fast_kernels", lambda: "fa3")
     monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: True)
-    assert default_mode("Remek/basal-2.0-pico") == "fast"  # the model load then reports it
+    assert default_mode("Remek/basal-omni-pico") == "fast"  # the model load then reports it
 
 
 def tiny_qwen35(d):
