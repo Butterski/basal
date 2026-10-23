@@ -23,6 +23,7 @@ Backends:
   LlamaCppBackend   llama.cpp server with the GGUF exports (1.5): token-id prompt, `n_probs` log-probabilities
   TPUBackend        (basal/tpu.py, extra basal[tpu]; experimental) the same SOAM packing in JAX / XLA on Google TPU
 """
+import functools
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import threading
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -547,15 +549,17 @@ def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scal
     through the transformers model forward): basal_kv[layer] = (K, V) buffers that receive this layer's keys and
     values (the root pass), basal_prefix[layer] = (K, V) of a computed prefix that the queries also attend to (the
     branch pass), basal_cu = cumulative token counts of prompts packed into one row (each attends to itself only),
-    basal_varlen = the kernel of those rows (_varlen_attention's impl), basal_tree = _block_plan's batches (the branch
-    pass on the CPU): the queries attend to the prefix and, per trie block, to their own ancestors separately, merged by
-    log-sum-exp (no concatenated keys, no [N, P + N] mask).
+    basal_varlen = the kernel of those rows (_varlen_attention's impl), basal_tree = the branch pass without dense
+    masks: the queries attend to the prefix and, per trie block, to their own ancestors separately, merged by
+    log-sum-exp (no concatenated keys, no [N, P + N] mask); _block_plan's batches on the CPU, a _VarlenTree on CUDA.
     A causal forward without a mask uses the kernel chosen by set_attention (--attn)."""
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
     if basal_cu is not None:
         return _varlen_attention(query, key, value, basal_cu, scaling, module.layer_idx, basal_varlen), None
     if basal_tree is not None:
         k, v = basal_prefix[module.layer_idx]
+        if isinstance(basal_tree, _VarlenTree):
+            return _cascade_varlen(query, key, value, k, v, basal_tree, scaling), None
         o_p, l_p = _attention_lse(query, k, v, scaling)
         o_b, l_b = _branch_attention(query, key, value, scaling, basal_tree)
         return _merge_attention(o_p, l_p, o_b, l_b).transpose(1, 2).contiguous(), None
@@ -653,15 +657,20 @@ def _block_plan(seg, parents, waste=1.5):
     return plan
 
 
-def cascade_ok(cfg):
-    """The CPU branch pass of _cascade covers attention-only models without a sliding window (the Llama-based basal
-    models): every key a branch token sees is in the root or in its block's ancestors. Models with sliding-window or
-    linear-attention layers keep the dense pass over the transformers cache, as does a torch without the CPU flash
-    kernel _attention_lse calls (a private aten op; basal pins only torch>=2.11)."""
+def attention_only(cfg):
+    """A model whose layers all attend to every earlier key (the Llama-based basal models): no sliding-window or
+    linear-attention layers, so every key a branch token sees is in the root or in its block's ancestors and the branch
+    pass can run as a cascade (_cascade on the CPU, _cascade_varlen on CUDA)."""
     cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
     return set(getattr(cfg, "layer_types", None) or ["full_attention"]) == {"full_attention"} \
-        and not getattr(cfg, "sliding_window", None) \
-        and hasattr(torch.ops.aten, "_scaled_dot_product_flash_attention_for_cpu")
+        and not getattr(cfg, "sliding_window", None)
+
+
+def cascade_ok(cfg):
+    """The CPU branch pass of _cascade: attention-only models (attention_only); models with sliding-window or
+    linear-attention layers keep the dense pass over the transformers cache, as does a torch without the CPU flash
+    kernel _attention_lse calls (a private aten op; basal pins only torch>=2.11)."""
+    return attention_only(cfg) and hasattr(torch.ops.aten, "_scaled_dot_product_flash_attention_for_cpu")
 
 
 def _branch_attention(q, k, v, scale, plan):
@@ -677,6 +686,80 @@ def _branch_attention(q, k, v, scale, plan):
         o[:, qi] = ob.transpose(0, 1)
         lse[:, qi] = lb.transpose(0, 1)
     return o[None, :, :N], lse[None, :, :N]
+
+
+class _VarlenTree(NamedTuple):
+    """The branch pass of B rows of S tokens on CUDA (_cascade_varlen), built by _varlen_tree. Root part: every token
+    of row r over the first used[r] keys of its root buffer (cu_qr / cu_kr: S / Lk tokens per row). Branch part: per
+    trie block, its queries (flat indices qi, cu_q) over its ancestors' and own tokens (flat indices ki, cu_k), causal
+    at the end; full: no padding tokens (qi is every token in order)."""
+    cu_qr: torch.Tensor
+    cu_kr: torch.Tensor
+    used: torch.Tensor
+    qi: torch.Tensor
+    ki: torch.Tensor
+    cu_q: torch.Tensor
+    cu_k: torch.Tensor
+    max_q: int
+    max_k: int
+    full: bool
+
+
+def _varlen_tree(seg, parents, roots, Lk, to_dev):
+    """seg [B, S] numpy: the block of every token below the root (0..; contiguous, flattened depth first; -1 =
+    padding), parents: per row the parent block of every block (-1 = the root), roots: the root's tokens per row, Lk:
+    the length of the root key / value buffers -> _VarlenTree on the device (to_dev: host array -> device)."""
+    B, S = seg.shape
+    qi, ki, cq, ck = [], [], [0], [0]
+    for r in range(B):
+        s = seg[r]
+        n = int((s >= 0).sum())
+        starts = np.flatnonzero(np.r_[True, s[1:n] != s[: n - 1]]) if n else np.zeros(0, dtype=np.int64)
+        runs = list(zip(starts.tolist(), np.r_[starts[1:], n].tolist()))
+        span = {int(s[a]): (a, b) for a, b in runs}
+        for a, b in runs:
+            keys, p = [np.arange(a, b)], parents[r][int(s[a])]
+            while p >= 0:
+                keys.insert(0, np.arange(*span[p]))
+                p = parents[r][p]
+            ki.append(r * S + np.concatenate(keys))
+            qi.append(r * S + np.arange(a, b))
+            cq.append(cq[-1] + b - a)
+            ck.append(ck[-1] + len(ki[-1]))
+    qi, ki = np.concatenate(qi), np.concatenate(ki)
+    i32 = lambda x: to_dev(np.asarray(x, dtype=np.int32))  # noqa: E731
+    return _VarlenTree(i32(np.arange(B + 1) * S), i32(np.arange(B + 1) * Lk), i32(roots), to_dev(qi), to_dev(ki),
+                       i32(cq), i32(ck), int(np.diff(cq).max()), int(np.diff(ck).max()), len(qi) == B * S)
+
+
+def _varlen(q, k, v, cu_q, cu_k, max_q, max_k, scale, causal=False, used=None):
+    """torch's varlen attention (FlashAttention 2 on packed sequences, grouped-query) with its log-sum-exp: q [Tq, H,
+    d], k / v [Tk, Hkv, d], cu_q / cu_k cumulative lengths (int32), used: the keys each sequence uses (seqused_k) or
+    None, causal: aligned at the end of each sequence -> (o [Tq, H, d], lse [Tq, H] fp32). The log-sum-exp comes as
+    [H, Tq] (torch 2.13, RTX 4090)."""
+    from torch.nn.attention.varlen import AuxRequest, varlen_attn
+    o, lse = varlen_attn(q, k, v, cu_q, cu_k, max_q, max_k, scale=scale, window_size=(-1, 0) if causal else (-1, -1),
+                         enable_gqa=True, seqused_k=used, return_aux=AuxRequest(lse=True))
+    return o, (lse.transpose(0, 1) if lse.shape == (q.shape[1], q.shape[0]) else lse).float()
+
+
+def _cascade_varlen(q, k, v, kp, vp, tree, scale):
+    """The branch pass on CUDA: q [B, H, S, d], k / v [B, Hkv, S, d] (the rows' own tokens), kp / vp [B, Hkv, Lk, d]
+    (the roots' key / value buffers, row r's root in its first tree.used[r] keys) -> [B, S, H, d]. The root part reads
+    the buffers with no mask and no repeated heads, the branch part only each block's ancestors and own tokens; a
+    padding token sees the root only, as in the dense mask."""
+    B, H, S, d = q.shape
+    Hkv, Lk = kp.shape[1], kp.shape[2]
+    qf = q.transpose(1, 2).reshape(B * S, H, d)
+    o_r, l_r = _varlen(qf, kp.transpose(1, 2).reshape(B * Lk, Hkv, d), vp.transpose(1, 2).reshape(B * Lk, Hkv, d),
+                       tree.cu_qr, tree.cu_kr, S, Lk, scale, used=tree.used)
+    kf, vf = (x.transpose(1, 2).reshape(B * S, Hkv, d) for x in (k, v))
+    o_b, l_b = _varlen(qf if tree.full else qf[tree.qi], kf[tree.ki], vf[tree.ki], tree.cu_q, tree.cu_k, tree.max_q,
+                       tree.max_k, scale, causal=True)
+    if not tree.full:
+        o_b = qf.new_zeros(B * S, H, d).index_copy_(0, tree.qi, o_b)
+        l_b = torch.full((B * S, H), float("-inf"), device=q.device).index_copy_(0, tree.qi, l_b)
+    return _merge_attention(o_r, l_r, o_b, l_b).view(B, S, H, d)
 
 
 def causal_sdpa(model):
@@ -808,7 +891,10 @@ class GraphBackend(EagerBackend):
       from the root, and a block mask lets each branch see the root, its ancestors and itself only. Exactly equivalent
       to separate forwards, the state (usually most of the tokens) is computed once, and the long part runs with the
       flash kernel; pass 2 is short and replays a graph of the normal forward (up to 8 rows x 64 / 128 / 256 branch
-      tokens over roots up to the largest of LENS), or runs as a normal forward for other shapes.
+      tokens over roots up to the largest of LENS), or runs as a normal forward for other shapes. Llama on CUDA, where
+      such a forward's rows hold CASCADE_TOKENS or more tokens (compress, many questions) and torch's varlen attention
+      runs (sm80+, bf16 / fp16, seqused_k; _cascade_why): a cascade instead of the block mask, the roots' keys and
+      values and each block's ancestors in two varlen calls merged by log-sum-exp (_cascade_varlen).
 
     All forwards of a call are launched back to back; host buffers are pinned and copied asynchronously, and each
     forward's readout is copied back behind it, so a group is reported as soon as its forwards are done while later
@@ -821,6 +907,11 @@ class GraphBackend(EagerBackend):
     TOKEN_BUDGET = 12288  # max rows x bucket length per forward
     SUFFIX = 32                   # pass-2 rows without a graph are padded to a multiple of this
     BRANCH_TOKENS = 8192          # most tokens below the root of one packed row (more: split, the root once per part)
+    # Llama on CUDA: a pass 2 without a graph whose longest row has at least this many tokens runs as a cascade
+    # (_cascades). Below it the dense masked call is faster: with the cascade 5-10 questions over 1.5k tokens took
+    # 0.83-0.98x, 40 questions 1.07-1.11x, compress requests 1.15-1.39x (basal-2.0-mini / 4.5B, RTX 4090 and A100,
+    # 22 Oct)
+    CASCADE_TOKENS = 1024
     SUFFIX_LENS = [64, 128, 256]  # pass-2 branch lengths with graphs, for roots up to the largest of LENS
     TREE_ROWS = [1, 2, 4, 8]      # pass-2 graph rows: branched units per forward with such roots
     # --batches fine: more row counts for the plain graphs (less padding of short batches, more graphs at start-up)
@@ -1021,6 +1112,9 @@ class GraphBackend(EagerBackend):
             if self.shared else None
 
     PASS2_POOL = 1 << 30  # Gemma 4: the most the pass-2 graphs over roots longer than LENS may add to the GPU memory
+    # pass-2 graphs are captured only while at least this much GPU memory stays free (_capture_deferred): the forwards
+    # without a graph (states beyond the grid, pass 2 of other shapes) need room at run time
+    PASS2_RESERVE = 3 << 29  # 1.5 GiB
     KV_SHARE = 0.15  # Gemma 4: the most of the free GPU memory (after the weights) its key / value buffers may take
 
     def _fit_grid(self):
@@ -1144,8 +1238,9 @@ class GraphBackend(EagerBackend):
     def warm(self):
         """Capture every plain graph of the grid, and with `shared` the pass-2 graphs for roots up to the largest of
         LENS (Gemma 4: of PLAIN_LENS, _warm_long_sfx). Every graph is warmed up here in this order and captured
-        afterwards, the largest first (_capture_deferred); Gemma 4's pass-2 graphs over roots beyond LENS after the
-        others, each as it is warmed up (_warm_long_sfx measures the pool as each of them is captured)."""
+        afterwards (_capture_deferred): the plain and compact graphs the largest first, then the pass-2 graphs the
+        smallest first while PASS2_RESERVE stays free; Gemma 4's pass-2 graphs over the longer roots after those, one at
+        a time, as _warm_long_sfx keeps the pool growth they add within PASS2_POOL and the reserve free."""
         self._deferred = {}  # key -> (function, static inputs), in warm-up order
         if self.compact:  # plain graphs only for pass 1 of branched units (at most TREE_ROWS[-1] roots)
             for T in self.COMPACT_LENS:
@@ -1190,9 +1285,10 @@ class GraphBackend(EagerBackend):
         for L in (x for x in self.PLAIN_LENS if x > self.LENS[-1]):
             for b in (x for x in self.TREE_ROWS if x * L <= self.TOKEN_BUDGET):
                 for S in self.SUFFIX_LENS:
-                    if self.dev.type == "cuda" and torch.cuda.memory_reserved(self.dev) - r0 > self.PASS2_POOL:
+                    if (self.dev.type == "cuda" and torch.cuda.memory_reserved(self.dev) - r0 > self.PASS2_POOL
+                            or not self._room()):
                         return
-                    self._graph_sfx(b, S, L)
+                    self._measured(self._graph_sfx, b, S, L)
 
     def _warm_pass2(self, n):
         """Gemma 4: pass 2 without a graph calls one compiled flex_attention, which compiles anew for each shape class
@@ -1296,6 +1392,36 @@ class GraphBackend(EagerBackend):
             return self.gemma.forward_suffix(ids, mask, pos, prefix, ro, compiled=False, kv=kv)
         return self.model.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=False,
                                 basal_prefix=prefix, basal_kv=kv).last_hidden_state
+
+    @torch.no_grad()
+    def _forward_cascade(self, ids, pos, prefix, tree):
+        """Pass 2 as a cascade (_cascade_varlen): ids / pos [rows, length] host arrays, prefix: the roots' per-layer
+        (K, V) [rows, kv heads, Lk, head dim], tree: _varlen_tree of the rows -> hidden states [rows, length, D]."""
+        return self.model.model(input_ids=self._to_dev(ids), position_ids=self._to_dev(pos), use_cache=False,
+                                basal_prefix=prefix, basal_tree=tree).last_hidden_state
+
+    def _cascades(self, n):
+        """Whether a pass 2 without a graph whose longest row has n tokens runs as a cascade (_cascade_varlen):
+        CASCADE_TOKENS or more, where _cascade_why has no objection."""
+        return n >= self.CASCADE_TOKENS and self._cascade_why is None
+
+    @functools.cached_property
+    def _cascade_why(self):
+        """None if pass 2 can run as a cascade here, else why not: CUDA, a Llama-style model with attention layers
+        only (attention_only; the CPU flash op that cascade_ok also asks for plays no part here), torch's varlen
+        attention with grouped-query heads and per-sequence key counts in this dtype, the transformers forward (not
+        --lean, which has its own pass 2)."""
+        if self.dev.type != "cuda" or self.gemma is not None or self.lean is not None:
+            return "CUDA graph engine, Llama, without --lean"
+        if not attention_only(self.model.config):
+            return "sliding-window or linear-attention layers"
+        why = torch_varlen_available(self._dtype)
+        if why is None:
+            import inspect
+            from torch.nn.attention.varlen import varlen_attn
+            if "seqused_k" not in inspect.signature(varlen_attn).parameters:
+                why = "this torch's varlen_attn has no seqused_k"
+        return why
 
     one_forward = 0  # tokens of the longest state run as one forward (_one_forward_tokens; 0: every one in chunks)
     # of the free memory after warm-up a state beyond the largest graph may take in one forward (else in chunks; one
@@ -1467,17 +1593,51 @@ class GraphBackend(EagerBackend):
         return self.graphs[key]
 
     def _capture_deferred(self):
-        """warm(): capture the graphs warmed up so far, the one with the most tokens first. Every graph's
-        memory stays in the shared pool; what a graph frees at the end of its capture, a later capture reuses, but only
-        in blocks no larger than the freed ones, so captured from the smallest up (the grid's order: compact graphs of
-        16, 32, ... 12,288 tokens) each larger graph allocated new blocks and the pool grew to many times the largest
-        graph's working set. torch.compile still sees the shapes in the grid's order (the warm-up calls in _capture),
-        so the compiled kernels are those of capturing in that order. RTX 4090, basal-2.0-mini, --batches compact,
-        21 Oct: graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical. Gemma 4
-        the same from 2.3.4 (before it, its graphs were captured in the grid's order)."""
+        """warm(): capture the graphs warmed up so far, the one with the most tokens first. Every graph's memory stays
+        in the shared pool; what a graph frees at the end of its capture, a later capture reuses, but only in blocks no
+        larger than the freed ones, so captured from the smallest up (the grid's order: compact graphs of 16, 32, ...
+        12,288 tokens) each larger graph allocated new blocks and the pool grew to many times the largest graph's
+        working set. torch.compile still sees the shapes in the grid's order (the warm-up calls in _capture), so the
+        compiled kernels are those of capturing in that order. RTX 4090, basal-2.0-mini, --batches compact, 21 Oct:
+        graph pool 9.0 -> 1.0 GiB, 17.6 -> 9.4 GB after warm-up, the probabilities bit-identical.
+
+        The pass-2 graphs come last, the smallest (the commonest shapes) first, and only while PASS2_RESERVE of GPU
+        memory stays free after the capture (_room: free memory less what the last capture took): each keeps 10-20 MB
+        outside the pool for its kernels (basal-2.0-mini / 4.5B, RTX 4090), 264 of them about 5 GB on basal-2.0-4.5B,
+        which therefore did not start on a 16 GB card. A pass 2 without its graph runs uncompiled, as one beyond the
+        grid does (_tree_hidden); the plain and compact graphs, which a forward cannot do without, are all captured."""
         deferred, self._deferred = self._deferred, None
-        for key in sorted(deferred, key=_graph_tokens, reverse=True):
-            self._record(key, *deferred[key])
+        keys = sorted(deferred, key=_graph_tokens, reverse=True)
+        for key in (k for k in keys if k[0] != "x"):
+            self._measured(self._record, key, *deferred[key])
+        pass2 = [k for k in reversed(keys) if k[0] == "x"]
+        if pass2 and self.dev.type == "cuda":
+            torch.cuda.empty_cache()  # (blocks the warm-up calls left cached are no graph's)
+        for n, key in enumerate(pass2):
+            if not self._room():
+                print(f"basal: {n} of {len(pass2)} pass-2 graphs captured, {self.PASS2_RESERVE >> 20} MiB of GPU "
+                      "memory kept free; the other shapes run pass 2 without a graph", flush=True)
+                break
+            self._measured(self._record, key, *deferred[key])
+
+    _capture_cost = 0  # the GPU memory the last measured capture took (_measured): the estimate for the next one
+
+    def _room(self):
+        """Whether one more pass-2 graph fits: the free GPU memory less what the last capture took stays at or above
+        PASS2_RESERVE (always off CUDA)."""
+        free = self._free_memory()
+        return free is None or free - self._capture_cost >= self.PASS2_RESERVE
+
+    def _measured(self, capture, *args):
+        """capture(*args), keeping the GPU memory it took as _capture_cost."""
+        before = self._free_memory()
+        capture(*args)
+        if before is not None:
+            self._capture_cost = max(before - self._free_memory(), 0)
+
+    def _free_memory(self):
+        """Free GPU memory in bytes (None off CUDA: no budget)."""
+        return torch.cuda.mem_get_info(self.dev)[0] if self.dev.type == "cuda" else None
 
     def _graph(self, b, L):
         """Plain graph (b rows, length L): (graph, ids, kv buffers or None, hidden states [b, L, D]); Gemma 4: (graph,
@@ -1918,6 +2078,8 @@ class GraphBackend(EagerBackend):
                 for dst, src in zip(s_mask, tm):
                     dst.copy_(src)
                 g2.replay()
+        elif graph is None and self._cascades(n2):
+            h2 = self._forward_cascade(ids2, pos2, kv, _varlen_tree(seg2, par2, P, kv[0][0].shape[2], self._to_dev))
         else:
             m2 = self._mask_from_seg(self._to_dev(seg2), par2)                             # [B, 1, S, S]
             Pr = self._to_dev(torch.tensor(P + [0] * (B - b)))
@@ -2210,11 +2372,15 @@ class GraphBackend(EagerBackend):
             if key is not None and self.state_cache is not None:
                 self.state_cache.put(key, [(k[0].clone(), v[0].clone()) for k, v in kv], tokens=t[:P])
         n = len(t) - P
-        m2 = self._mask_from_seg(self._to_dev(torch.tensor([[x - 1 for x in sg[P:]]])),
-                                 [[-1 if q <= 0 else q - 1 for q in par[1:]]])                 # [1, 1, n, n]
-        m2 = torch.cat([torch.zeros((1, 1, n, P), dtype=m2.dtype, device=self.dev), m2], -1)   # the root: visible
-        h2 = self._forward_suffix(self._to_dev(torch.tensor([t[P:]])), m2, self._to_dev(torch.tensor([pp[P:]])),
-                                  kv)[0]
+        seg2, par2 = np.array([[x - 1 for x in sg[P:]]]), [[-1 if q <= 0 else q - 1 for q in par[1:]]]
+        if self._cascades(n):
+            h2 = self._forward_cascade(np.array([t[P:]]), np.array([pp[P:]]), kv,
+                                       _varlen_tree(seg2, par2, [P], kv[0][0].shape[2], self._to_dev))[0]
+        else:
+            m2 = self._mask_from_seg(self._to_dev(torch.from_numpy(seg2)), par2)                # [1, 1, n, n]
+            m2 = torch.cat([torch.zeros((1, 1, n, P), dtype=m2.dtype, device=self.dev), m2], -1)  # the root: visible
+            h2 = self._forward_suffix(self._to_dev(torch.tensor([t[P:]])), m2, self._to_dev(torch.tensor([pp[P:]])),
+                                      kv)[0]
         assert h1 is not None or min(last) >= P, "a readout inside a cached root"
         return torch.stack([h1[i] if i < P else h2[i - P] for i in last])
 

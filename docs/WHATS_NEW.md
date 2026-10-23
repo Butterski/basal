@@ -1,3 +1,32 @@
+# What is new in basal 2.3.5
+
+- **Compress and many-question requests faster on CUDA** (`--mode fast`, the Llama-based basal-2.0 models, bf16 on
+  sm80+ GPUs where torch's varlen attention runs with per-sequence key counts): a pass 2 without a CUDA graph whose
+  rows hold 1,024 or more tokens (every `compress` request, dozens of questions over a state) attends to the state's
+  keys and values as pass 1 wrote them and, per trie block, to its own ancestors (torch's varlen attention), merged by
+  log-sum-exp, instead of one masked call over concatenated and repeated keys; elsewhere the dense pass runs as before.
+  Compress over 1.5k-6k-token documents 1.14-1.39x faster (basal-2.0-mini and basal-2.0-4.5B, RTX 4090 and A100), 40
+  questions 1.07-1.11x, 2.1-2.5 GB less GPU memory for the largest of them; smaller requests run as before,
+  bit-identical. Answers within bf16 rounding: against fp32, mean |Δp| 6.9e-3 (the dense bf16 pass: 7.0e-3).
+  Contributed by Milosz (@Butterski), [#39](https://github.com/rkinas/basal/pull/39).
+- **basal-2.0-4.5B on 16 GB cards** (`--mode fast`; RTX 4060 Ti 16 GB, 4080, 5060 Ti): the graph engine captures its
+  pass-2 graphs (the questions over a state) only while 1.5 GiB of GPU memory stays free after each capture, the
+  smallest (commonest) shapes first; every plain graph is captured as before, and a pass 2 without its graph runs
+  uncompiled, as for shapes beyond the grid. Each captured graph keeps device memory for its kernels (about 19.5 MB
+  per pass-2 graph on the 4.5B), so the 264 of them kept 2.3.3 from starting on 16 GB. RTX 4060 Ti 16 GB: 80 of 264
+  pass-2 graphs, 14.4 GB after start-up, 22.6 single questions per second, 9.7 questions per second five at a time
+  over 1.5k-token states, no errors; very large `compress` requests (6k-token documents) can still run out of memory
+  there without the CUDA cascade. On 24 GB and larger cards every graph is captured as before, the probabilities
+  bit-identical (420 of 420, RTX 4090); where graphs are left out, the requests that would have used them change by
+  bf16 rounding only (same top answer on 200 of 200, max |Δp| 0.04). Contributed by Miłosz Kucharski (@Butterski),
+  [#41](https://github.com/rkinas/basal/pull/41).
+- **Checked on one H100** (basal v2.3.4 against 2.3.5, `--mode fast`): every probability bit-identical on the usual
+  paths (basal-2.0-mini and 4.5B, default and compact rows, basal-omni-1.0-mini; 5,800 identity readouts), the same
+  graphs, GPU memory and start-up time. With torch 2.13 (#39 needs its varlen attention; torch 2.11 keeps the dense
+  pass): compress 1.18-1.30x faster on mini and 1.27-1.49x on the 4.5B, 40 questions 0.90x / 1.11x, the same top
+  answer on 240 of 240 decisions per model (max |Δp| 0.031). With a 16 GB budget simulated on the H100 the 4.5B kept
+  200 of 264 pass-2 graphs (compact rows) and 2.0 GB free, its identity readouts the same as with every graph.
+
 # What is new in basal 2.3.4
 
 - **Less GPU memory for basal-omni in the graph engine** (`--mode fast`): basal-omni's CUDA graphs are now warmed up in
@@ -7,7 +36,10 @@
   10.6 -> 1.7 GiB), basal-omni-1.0-max 45.3 -> 31.3 GB (16.2 -> 2.3 GiB); the same 520 graphs, every probability
   bit-identical (840 identity readouts per model), the same start-up time and throughput (mini: 197-198 against 2.3.3's 201-216 single questions per second
   at 32 clients, which moves this much between runs, 185-189 against 186-187 questions per second five at a time;
-  max: 183 against 186, 52.5 against 52.8).
+  max: 183 against 186, 52.5 against 52.8). Milosz (@Butterski) wrote the same change in
+  [#40](https://github.com/rkinas/basal/pull/40), in parallel with ours and 17 minutes earlier, following his own #37;
+  his A100 numbers (graph pool 4.5 -> 3.2 GiB with default rows, 420 readouts bit-identical) and his test of the exact
+  set of captured graphs add to ours.
 - **The same probabilities in every run** (basal-omni, `--mode fast`): Inductor timed some RMSNorm reduction kernels
   at their first launch and kept the faster reduction block (4,096 or 2,048 values per step, timings within 1% of
   each other). The block sets the order of the sum, so two processes could answer differently: on an H100, two runs

@@ -337,7 +337,10 @@ def test_warm_captures_largest_first_then_long_pass2():
     first = kinds.index("capture")
     caps = [k for kind, k in head if kind == "capture"]
     assert "warm" not in kinds[first:] and kinds.count("warm") == len(caps) == len(set(caps)) > 4
-    assert [_graph_tokens(k) for k in caps] == sorted(map(_graph_tokens, caps), reverse=True)
+    big = [k for k in caps if k[0] != "x"]  # (#41) plain / compact graphs the largest first, then pass 2 the smallest
+    assert [_graph_tokens(k) for k in big] == sorted(map(_graph_tokens, big), reverse=True)
+    p2 = [k for k in caps if k[0] == "x"]
+    assert caps == big + p2 and [_graph_tokens(k) for k in p2] == sorted(map(_graph_tokens, p2))
     for i in long:  # each long pass-2 graph: warmed up, then captured at once
         assert ev[i + 1] == ("warm", None) and ev[i + 2] == ("capture", ev[i][1])
     state = [1, 5, 9, 11, 3, 4, 6, 12, 13, 14, 15, 16]  # a root of 12 tokens: the pass-2 graphs over roots of 16
