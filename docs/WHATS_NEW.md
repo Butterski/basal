@@ -6,7 +6,8 @@
   custom op that also allocated a random-number state per call). A100, basal-2.0-mini, one client, against the dense
   pass: 40 questions over a 1.5k-token state 1.07x -> 1.11x, compress 1.15-1.37x -> 1.19-1.44x; pass 2 alone for 40
   questions 62.4 -> 48.6 ms (basal-2.0-4.5B: 117 -> 99 ms); every probability bit-identical to 2.3.5.
-  `fast-nocompile` keeps the merge op by op. Contributed by Miłosz Kucharski (@Butterski).
+  `fast-nocompile` keeps the merge op by op. Contributed by Miłosz Kucharski (@Butterski),
+  [#44](https://github.com/rkinas/basal/pull/44).
 
 # What is new in basal 2.4.1
 
