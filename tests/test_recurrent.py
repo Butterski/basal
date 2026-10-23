@@ -40,7 +40,7 @@ def llama(tmp_path):
 @pytest.fixture
 def qwen3_next(tmp_path):
     """Gated DeltaNet too, but another layer code (merged projections, MoE): not ported, stays refused."""
-    return write_config(tmp_path / "next", {"model_type": "qwen3_next", "layer_types": PICO08_LAYERS})
+    return write_config(tmp_path / "next", {"model_type": "qwen3_next", "layer_types": PICO_LAYERS})
 
 
 def test_recurrent_layers_from_config(tmp_path, qwen35, llama):
@@ -63,9 +63,9 @@ def test_is_gdn(tmp_path, qwen35, llama, qwen3_next):
     assert is_gdn(qwen35)
     assert not is_gdn(llama) and not is_gdn(qwen3_next) and not is_gdn(tmp_path / "missing")
     vl = write_config(tmp_path / "vl", {"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text",
-                                                                                 "layer_types": PICO08_LAYERS}})
+                                                                                 "layer_types": PICO_LAYERS}})
     assert is_gdn(vl)
-    moe = write_config(tmp_path / "moe", {"model_type": "qwen3_5_moe_text", "layer_types": PICO08_LAYERS})
+    moe = write_config(tmp_path / "moe", {"model_type": "qwen3_5_moe_text", "layer_types": PICO_LAYERS})
     assert not is_gdn(moe)
 
 
