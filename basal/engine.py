@@ -451,8 +451,12 @@ def persist_compile_cache():
     ~/.cache/basal/torchinductor unless TORCHINDUCTOR_CACHE_DIR is set, as --mode tpu keeps JAX's in ~/.cache/basal/jax.
     Inductor's default, /tmp/torchinductor_<user>, is emptied by a reboot on most systems (/tmp a tmpfs or cleaned at
     boot), so the first start after one compiled every forward again. A cached graph is the compiled code itself: the
-    same kernels, the same answers. Left as it is when the directory cannot be created."""
-    if os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+    same kernels, the same answers. Inductor writes its default into TORCHINDUCTOR_CACHE_DIR the first time it is asked
+    (importing transformers' models already asks), so that value counts as not set; the paths Inductor memoised are
+    cleared after the switch, as its temporary_cache_dir does. Left as it is when the directory cannot be created."""
+    from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+    set_to = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if set_to and os.path.abspath(set_to) != os.path.abspath(default_cache_dir()):
         return
     path = Path.home() / ".cache" / "basal" / "torchinductor"
     try:
@@ -460,6 +464,8 @@ def persist_compile_cache():
     except OSError:
         return
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(path)
+    from torch._inductor.utils import clear_caches
+    clear_caches()
 
 
 # config.json "layer_types" of attention layers; any other kind (Qwen3.5's linear_attention: Gated DeltaNet, Mamba,

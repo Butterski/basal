@@ -247,15 +247,16 @@ def test_graph_engine_sets_the_small_cublas_workspace_unless_set(monkeypatch, tm
 
 def test_graph_engine_keeps_the_compile_cache_across_reboots_unless_set(monkeypatch, tmp_path):
     """torch.compile's cache goes to ~/.cache/basal/torchinductor, where Inductor then reads and writes it (its default
-    under /tmp is emptied by a reboot), before anything compiles; a TORCHINDUCTOR_CACHE_DIR already set is kept."""
+    under /tmp is emptied by a reboot), before anything compiles: also when TORCHINDUCTOR_CACHE_DIR holds Inductor's
+    default, which Inductor writes there itself on import (basal-serve's case); a directory the user set is kept."""
     import os
 
-    from torch._inductor.runtime.cache_dir_utils import cache_dir
+    from torch._inductor.runtime.cache_dir_utils import cache_dir, default_cache_dir
 
     from basal.engine import GraphBackend
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     default = tmp_path / "home" / ".cache" / "basal" / "torchinductor"
-    for preset, want in ((None, default), (tmp_path / "mine", tmp_path / "mine")):
+    for preset, want in ((None, default), (default_cache_dir(), default), (tmp_path / "mine", tmp_path / "mine")):
         if preset is None:
             monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
         else:
