@@ -132,22 +132,31 @@ def _conv(qkv, w, c0, sizes):
     return F.silu(y).to(qkv.dtype).transpose(1, 2).split(sizes, -1)
 
 
-def _conv_fused(qkv, w, c0, sizes, n):
-    """_conv as n + 1 shifted multiply-adds over the tokens, for torch.compile: q, k and v each in one fused kernel,
-    written contiguous for fla. cuDNN's generic depthwise kernel and the transposes of q / k / v into fla's layout took
-    about a third of a forward's GPU time on an H100 (kernel profile, 1.5k-token state, 22 Oct). Summed in fp32 and
-    rounded once, as the convolution does."""
-    T = qkv.shape[1]
-    x = F.pad(qkv, (0, 0, n, 0)) if c0 is None else torch.cat([c0, qkv], 1)
+def _conv_fla(qkv, w, c0, sizes, conv):
+    """_conv with fla's causal_conv1d kernel (token-major tiles, SiLU applied in fp32 before the rounding): one call
+    per q / k / v over its channels, each output contiguous for fla's Gated DeltaNet kernel. cuDNN's generic depthwise
+    kernel and the transposes of q / k / v into fla's layout took about a third of a forward's GPU time on an H100
+    (kernel profile, 1.5k-token state, 22 Oct). c0 goes in as fla's initial state [b, channels, kernel] (the newest
+    input last; the first slot is not read by a kernel of that size)."""
+    init = None
+    if c0 is not None:
+        init = F.pad(c0.transpose(1, 2), (1, 0))
     out, a = [], 0
-    for m in sizes:  # per output: no shared fp32 buffer of all channels between kernels
-        xs, ws = x[..., a: a + m], w[a: a + m, 0].float()
-        y = xs[:, :T].float() * ws[:, 0]
-        for j in range(1, n + 1):
-            y = y + xs[:, j: j + T].float() * ws[:, j]
-        out.append(F.silu(y.to(qkv.dtype)))
+    for m in sizes:
+        y, _ = conv(qkv[..., a: a + m], w[a: a + m, 0], initial_state=None if init is None else
+                    init[:, a: a + m].contiguous(), activation="silu")
+        out.append(y)
         a += m
     return out
+
+
+def fla_conv1d():
+    """fla's causal_conv1d, None when it is not there."""
+    try:
+        from fla.modules.conv.causal_conv1d import causal_conv1d
+    except Exception:
+        return None
+    return causal_conv1d
 
 
 def _gdn_out(h, o, z, gw, out_w, eps):
@@ -207,7 +216,8 @@ class Qwen35Graph:
                                                         keys / values and recurrent state
 
     compile (--mode fast): the parts between the Gated DeltaNet kernels and the attention (norms, projections, gates,
-    convolution, rotary embedding, MLP) as torch.compile functions of dynamic shapes, one per kind for every layer.
+    rotary embedding, MLP) as torch.compile functions of dynamic shapes, one per kind for every layer. On CUDA the
+    convolution is fla's kernel in both modes.
     """
 
     def __init__(self, model, compile=False):
@@ -251,14 +261,14 @@ class Qwen35Graph:
         gs = self.args[self.kinds.index("linear_attention")]["sizes"]
         qs = self.args[self.kinds.index("full_attention")]["sizes"]
         rd = self.m.rotary_emb.inv_freq.shape[0] * 2  # rotated dims of a head (partial_rotary_factor)
-        cs, kn = [g.key_dim, g.key_dim, g.value_dim], g.conv_kernel_size - 1
+        cs = [g.key_dim, g.key_dim, g.value_dim]
         fns = dict(mlp=lambda h, nw, gu, down: _mlp(h, nw, gu, down, eps),
                    gdn_in=lambda h, nw, w, A_log, dt_bias, mask: _gdn_in(h, nw, w, A_log, dt_bias, mask, eps, gs),
-                   conv=(lambda qkv, w, c0: _conv_fused(qkv, w, c0, cs, kn)) if compile else
-                   (lambda qkv, w, c0: _conv(qkv, w, c0, cs)),
+                   conv=lambda qkv, w, c0: _conv(qkv, w, c0, cs),
                    gdn_out=lambda h, o, z, gw, out_w: _gdn_out(h, o, z, gw, out_w, geps),
                    att_in=lambda h, nw, w, qn, kn, cos, sin: _att_in(h, nw, w, qn, kn, cos, sin, eps, qs, d, rd),
                    att_out=_att_out, rms=lambda h, w: _rms(h, w, eps))
+        conv = fla_conv1d() if cuda else None  # on CUDA fla's kernel, uncompiled (Triton), in both modes
         if compile:
             import torch._dynamo as dynamo
             import torch._inductor.config as inductor
@@ -269,6 +279,8 @@ class Qwen35Graph:
             # requests on an H100: 99.3% against 99.6% for fast-nocompile)
             inductor.emulate_precision_casts = True
             fns = {k: torch.compile(f, dynamic=True) for k, f in fns.items()}
+        if conv is not None:
+            fns["conv"] = lambda qkv, w, c0: _conv_fla(qkv, w, c0, cs, conv)
         self.f = fns
 
     def _rope(self, h, pos):
