@@ -23,6 +23,12 @@
   five questions over a 3k-10k-token state 91 ms (926), 94 questions/s (6.4). One question over a long state is
   slower than `--mode vllm` (46 against 39 ms). Details in
   [HARDWARE.md](HARDWARE.md#basal-omni-pico-qwen35-gated-deltanet-on-one-h100).
+- **The same probabilities in every start**, for basal-omni-pico too: its compiled layer code runs in Inductor's
+  deterministic mode, as basal-omni's since 2.3.4, so a start no longer depends on what the compile cache holds. On
+  one H100, three starts (empty caches, warm caches, empty again) gave bit-identical probabilities on 300 single
+  questions and 100 five-question requests with both option orders; the speed is the same within run-to-run noise.
+  Before, the same code on long-used caches gave other probabilities than a clean start: 282 of the 300 single
+  questions (no top answer changed) and all 1,000 rows of the five-question requests (9 top answers changed).
 - **Without `--mode`** a Qwen3.5 model now runs `fast` on Hopper (H100, where the port passed its gates) when fla is
   installed (`pip install flash-linear-attention`), and `eager` elsewhere.
 - **Still refused for Qwen3.5 models** (before loading, each with what to use instead): `fp8`, `nvfp4`, `fast-exit`,
