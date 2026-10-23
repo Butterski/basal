@@ -393,6 +393,7 @@ class GDNGraphBackend(GraphBackend):
     SUFFIX_EAGER = 128  # longer leaf rows (no graph) are padded to a multiple of this
     PASS2_KEYS = 65536  # pass-2 rows x root bucket per forward: the root keys / values each row gathers
     ONE_FORWARD = 1 << 30  # a prompt beyond the largest graph runs as one uncaptured forward
+    _warmed = False  # warm() ran: the pass-2 graphs it did not capture (GPU memory) stay uncaptured
 
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
@@ -530,6 +531,7 @@ class GDNGraphBackend(GraphBackend):
                         if self._sfx_ok(b, S, L2):
                             self._graph_sfx(b, S, L2)
         self._capture_deferred()
+        self._warmed = True
         pad = self.tok.pad_token_id
         for n in (self.PLAIN_LENS[-1] + 64, self.PLAIN_LENS[-1] + 65):  # Triton specialises lengths divisible by 16
             if self.model.config.max_position_embeddings < n + 8:
@@ -643,9 +645,9 @@ class GDNGraphBackend(GraphBackend):
             n = len(rows[part[-1]][1])
             S = next((x for x in self.LEAF_LENS if n <= x), None)
             Bp = self._bucket(len(part), self.LEAF_ROWS)
-            graph = None  # (captured at start-up; without warm(), as first used)
+            graph = None  # captured at start-up while memory allowed (_capture_deferred); without warm(), as first used
             if captured and S is not None and self._sfx_ok(Bp, S, L2):
-                graph = self._graph_sfx(Bp, S, L2)
+                graph = self.graphs.get(("x", Bp, S, L2)) if self._warmed else self._graph_sfx(Bp, S, L2)
             self._count("pass2", graph is not None, (len(part), n, L2))
             if graph is None:  # bucketed rows and lengths: the shapes fla's kernels were tuned and compiled for
                 S = -(-n // self.SUFFIX_EAGER) * self.SUFFIX_EAGER
