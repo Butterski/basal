@@ -36,7 +36,10 @@
   10.6 -> 1.7 GiB), basal-omni-1.0-max 45.3 -> 31.3 GB (16.2 -> 2.3 GiB); the same 520 graphs, every probability
   bit-identical (840 identity readouts per model), the same start-up time and throughput (mini: 197-198 against 2.3.3's 201-216 single questions per second
   at 32 clients, which moves this much between runs, 185-189 against 186-187 questions per second five at a time;
-  max: 183 against 186, 52.5 against 52.8).
+  max: 183 against 186, 52.5 against 52.8). Milosz (@Butterski) wrote the same change in
+  [#40](https://github.com/rkinas/basal/pull/40), in parallel with ours and 17 minutes earlier, following his own #37;
+  his A100 numbers (graph pool 4.5 -> 3.2 GiB with default rows, 420 readouts bit-identical) and his test of the exact
+  set of captured graphs add to ours.
 - **The same probabilities in every run** (basal-omni, `--mode fast`): Inductor timed some RMSNorm reduction kernels
   at their first launch and kept the faster reduction block (4,096 or 2,048 values per step, timings within 1% of
   each other). The block sets the order of the sum, so two processes could answer differently: on an H100, two runs
