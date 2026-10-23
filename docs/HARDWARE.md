@@ -159,6 +159,30 @@ machine; `o1` / `o2` = one option order or both (`--orders`).
   runs FP8 GEMMs with full accumulation: 0.6958, the same decisions batched and alone (max |dp| 0.1), 39.6 instead of
   41.2 decisions/s at 16 clients (H100).
 
+## basal-omni-pico (Qwen3.5, Gated DeltaNet) on one H100
+
+basal-omni-pico (0.8B: 18 Gated DeltaNet layers, 6 attention layers) through `basal-serve --no-calibration`, HTTP,
+one connection per request (the profiles of the pico's model card): states of about 1,500 tokens ("short") and of
+3,000-10,000 tokens ("long"), one question or five per request; p50 latency of single requests and throughput at 16
+clients (decisions/s; questions/s with five per request). fla 0.5.2 for the Gated DeltaNet layers.
+
+| path | short, 1 q: p50 / 16 clients | short, 5 q: p50 / 16 clients | long, 1 q: p50 / 16 clients | long, 5 q: p50 / 16 clients |
+|---|---|---|---|---|
+| `fast` (2.4) | 13.5 ms / 134.6 dec/s | 26.6 ms / 400.4 q/s | 45.9 ms / 34.4 dec/s | 90.6 ms / 94.4 q/s |
+| `fast-nocompile` (2.4) | 17.4 ms / 89.3 | 33.5 ms / 328.2 | 64.0 ms / 22.9 | 110.5 ms / 80.1 |
+| `eager` | 47.0 ms / 31.7 | 111.4 ms / 41.1 | 187.7 ms / 6.4 | 925.7 ms / 6.4 |
+| `vllm` (vLLM 0.31.0; the model card's run) | 54.3 ms / 93.9 | 67 ms / 188.7 | 39 ms / 43.7 | 109 ms / 90.6 |
+
+- `fast` against `eager`: 3.5x lower latency and 4.2x the throughput on one question over a short state, 4.2x /
+  9.7x with five questions, 10.2x / 14.8x with five questions over a long state (the state is computed once, not
+  once per question). Against vLLM: faster on short states and on five questions over a long state; slower on one
+  question over a long state (46 against 39 ms, 34 against 44 decisions/s).
+- Start-up: 109 s for `fast` (404 CUDA graphs, compiled), 76 s for `fast-nocompile`; at most 9.2 GB of GPU memory
+  in use under these loads (nvidia-smi; `eager` 14.6 GB).
+- Where the time goes (in process): one question over a 1.5k-token state takes 10.1 ms, 7.6 ms of it GPU kernels
+  (GEMMs ~3 ms, fla's Gated DeltaNet and convolution kernels ~2.3 ms); a five-question request about 27 ms, of which
+  8.5 ms is the tokenizer (with `TOKENIZERS_PARALLELISM=false`, as in these runs).
+
 ## Kernels of the CUDA graph engine (one H100)
 
 The engine options of the kernel study, measured served over HTTP. The model is a 4.5B development checkpoint of

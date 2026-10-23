@@ -472,15 +472,21 @@ def recurrent_layers(model_dir):
     return None
 
 
-def recurrent_refused(model, what):
-    """The refusal of the shared-prefix engines (--mode fast, fast-nocompile, fast-exit, fp8, nvfp4, mps) for a model
-    with recurrent-state layers. Their prefix tries, two passes, compact rows and caches hold attention keys and values
-    only: a Gated DeltaNet layer would restart from zero state below a shared prefix and run across the prompts of a
-    packed row, so the answers would be wrong without any error (v2.3.1 with the 0.8B pico, 21 Oct)."""
+def recurrent_refused(model, what, gdn=False):
+    """The refusal of the shared-prefix engines for a model with recurrent-state layers. Their prefix tries, two passes,
+    compact rows and caches hold attention keys and values only: a Gated DeltaNet layer would restart from zero state
+    below a shared prefix and run across the prompts of a packed row, so the answers would be wrong without any error
+    (v2.3.1 with the 0.8B pico, 21 Oct). Since 2.4 the CUDA graph engine carries the recurrent state of Qwen3.5 decoders
+    (gdn: basal/gdn_graph.py, --mode fast and fast-nocompile); fast-exit and mps still refuse them, and every other
+    recurrent model stays refused by all of them."""
+    if gdn:
+        return (f"{model}: {what} (recurrent state: Gated DeltaNet, Qwen3.5). --mode fast-exit and --mode mps keep "
+                "attention keys and values only and would answer wrongly; serve it with --mode fast (CUDA), --mode "
+                "eager (exact) or --mode vllm")
     return (f"{model}: {what} (recurrent state: Gated DeltaNet / linear attention, as in Qwen3.5). The CUDA graph "
-            "engine (--mode fast, fast-nocompile, fast-exit, fp8, nvfp4) and --mode mps keep attention keys and values "
-            "only and would answer wrongly; serve it with --mode eager (exact) or --mode vllm (faster), or --mode gguf "
-            "with a GGUF file")
+            "engine (--mode fast, fast-nocompile, fast-exit, fp8, nvfp4) carries the recurrent state of Qwen3.5 "
+            "decoders only, and --mode mps of none: they would answer wrongly; serve it with --mode eager (exact) or "
+            "--mode vllm (faster), or --mode gguf with a GGUF file")
 
 
 def fp8_refused():
@@ -942,12 +948,23 @@ class GraphBackend(EagerBackend):
     _side = None                  # the stream the captures warm up on (one: each new stream pins a cuBLAS workspace)
     _deferred = None              # warm(): graphs warmed up, captured the largest first (_capture_deferred)
 
+    def __new__(cls, model_dir=None, *args, **kwargs):
+        """GraphBackend(model_dir, ...) of a Qwen3.5 model (Gated DeltaNet and attention layers, from its config.json)
+        builds GDNGraphBackend (basal/gdn_graph.py, basal 2.4), which carries the recurrent state through both passes;
+        the subclasses (fast-exit, mps, gguf) keep their own class."""
+        if cls is GraphBackend and model_dir is not None:
+            from .gdn_graph import GDNGraphBackend, is_gdn
+            if is_gdn(model_dir):
+                return super().__new__(GDNGraphBackend)
+        return super().__new__(cls)
+
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
                  readout_layer="off", template="off", gemma_attn="auto"):
         what = recurrent_layers(model_dir)  # before anything is loaded
         if what:
-            raise ValueError(recurrent_refused(model_dir, what))
+            from .gdn_graph import is_gdn
+            raise ValueError(recurrent_refused(model_dir, what, is_gdn(model_dir)))
         if quant == "fp8" and fp8_refused():
             raise ValueError(fp8_refused())
         torch.backends.cuda.enable_cudnn_sdp(False)  # before capture: a captured graph keeps its attention kernel
@@ -2548,7 +2565,8 @@ class MPSBackend(GraphBackend):
     def __init__(self, model_dir, dtype="bfloat16", shared=True, device=None):
         what = recurrent_layers(model_dir) if shared else None  # without sharing: EagerBackend's forwards (exact)
         if what:
-            raise ValueError(recurrent_refused(model_dir, what))
+            from .gdn_graph import is_gdn
+            raise ValueError(recurrent_refused(model_dir, what, is_gdn(model_dir)))
         mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
         device = device or ("mps" if mps else "cpu")
         EagerBackend.__init__(self, model_dir, dtype, device)
