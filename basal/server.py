@@ -847,8 +847,8 @@ class Server:
                   "(refit with basal-calibrate, or --strict-calibration to refuse such a file)", flush=True)
         if self.cal_unvalidated:
             print(f"basal: warning: {self.cal_unvalidated}; its answers are marked \"calibration\": \"unvalidated\" "
-                  "and max_error defers (fit a file for these orders with basal-calibrate, or serve with the file's "
-                  "orders)", flush=True)
+                  "and max_error defers (fit a file for this serving with basal-calibrate, or serve with the file's "
+                  "orders and layout)", flush=True)
         self.temps = self.cal.get("temperature_per_prim", {})
         self.soam = a.soam == "on"
         self.log = open(a.log_decisions, "a", buffering=1, encoding="utf-8") if a.log_decisions else None
