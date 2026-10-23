@@ -6,6 +6,12 @@
   323 s, basal-2.0-4.5B 1,094 -> 680 s (with the pass-2 graph budget it needs there); the same GPU memory and speed,
   every probability bit-identical (420 readouts per model). Contributed by Miłosz Kucharski (@Butterski),
   [#43](https://github.com/rkinas/basal/pull/43).
+- **Prompt layouts** (`--layout`, prompt-format-2 models trained on them): besides the
+  canonical layout (the state first, shared by a request's questions), `state_twice` reads the state twice and
+  `qfirst` puts the question before the state too, one pass per question, for clients who want the state read knowing
+  the question rather than the shared state cache. The codes, the prefill and the readout tokens are the same; the
+  canonical prompt is bit-identical to 2.3.5. Each layout loads its own `CALIBRATION.<layout>.json` (basal-calibrate
+  `--layout` fits one); `--state-cache-gb` and `--prefix-cache` need the canonical layout.
 
 # What is new in basal 2.4
 
