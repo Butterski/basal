@@ -402,7 +402,8 @@ class GDNGraphBackend(GraphBackend):
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
                  readout_layer="off", template="off", gemma_attn="auto"):
-        persist_compile_cache()  # before anything compiles (GraphBackend.__init__)
+        if compile:
+            persist_compile_cache()  # before anything compiles (GraphBackend.__init__)
         why = refused(quant, state_cache_gb, prefix, batches, lean, tree, readout_layer, template)  # before loading
         if why:
             raise ValueError(f"{model_dir}: {why}")
