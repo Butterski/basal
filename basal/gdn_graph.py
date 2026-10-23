@@ -278,7 +278,11 @@ class Qwen35Graph:
             # without). Without it the pico's top answers moved away from eager's (300 five-question x two-order
             # requests on an H100: 99.3% against 99.6% for fast-nocompile)
             inductor.emulate_precision_casts = True
-            fns = {k: torch.compile(f, dynamic=True) for k, f in fns.items()}
+            # Inductor's deterministic mode (TORCHINDUCTOR_DETERMINISTIC=0: without it), as basal-omni's forward since
+            # 2.3.4: otherwise Inductor times some reduction kernels at their first launch and keeps the faster config,
+            # and what its cache holds then depends on its history, so two starts could round differently
+            det = os.environ.get("TORCHINDUCTOR_DETERMINISTIC", "1") == "1"
+            fns = {k: torch.compile(f, dynamic=True, options={"deterministic": det}) for k, f in fns.items()}
         if conv is not None:
             fns["conv"] = lambda qkv, w, c0: _conv_fla(qkv, w, c0, cs, conv)
         self.f = fns
