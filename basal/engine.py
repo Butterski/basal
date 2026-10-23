@@ -446,6 +446,22 @@ def compact_refused(why):
             f"torch's varlen attention ({why})")
 
 
+def persist_compile_cache():
+    """torch.compile's cache (Inductor's compiled graphs, and the Triton kernels it keeps under them) in
+    ~/.cache/basal/torchinductor unless TORCHINDUCTOR_CACHE_DIR is set, as --mode tpu keeps JAX's in ~/.cache/basal/jax.
+    Inductor's default, /tmp/torchinductor_<user>, is emptied by a reboot on most systems (/tmp a tmpfs or cleaned at
+    boot), so the first start after one compiled every forward again. A cached graph is the compiled code itself: the
+    same kernels, the same answers. Left as it is when the directory cannot be created."""
+    if os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+        return
+    path = Path.home() / ".cache" / "basal" / "torchinductor"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(path)
+
+
 # config.json "layer_types" of attention layers; any other kind (Qwen3.5's linear_attention: Gated DeltaNet, Mamba,
 # conv) carries a recurrent state from token to token
 ATTENTION_LAYERS = {"full_attention", "sliding_attention", "chunked_attention"}
@@ -961,6 +977,7 @@ class GraphBackend(EagerBackend):
     def __init__(self, model_dir, dtype="bfloat16", quant=None, compile=False, shared=True, warm=True, attn="auto",
                  merge="auto", lean=False, tree="dense", state_cache_gb=0, prefix=False, batches="default",
                  readout_layer="off", template="off", gemma_attn="auto"):
+        persist_compile_cache()  # before anything compiles
         what = recurrent_layers(model_dir)  # before anything is loaded
         if what:
             from .gdn_graph import is_gdn

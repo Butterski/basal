@@ -243,3 +243,26 @@ def test_graph_engine_sets_the_small_cublas_workspace_unless_set(monkeypatch, tm
         except Exception:
             pass
         assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == want
+
+
+def test_graph_engine_keeps_the_compile_cache_across_reboots_unless_set(monkeypatch, tmp_path):
+    """torch.compile's cache goes to ~/.cache/basal/torchinductor, where Inductor then reads and writes it (its default
+    under /tmp is emptied by a reboot), before anything compiles; a TORCHINDUCTOR_CACHE_DIR already set is kept."""
+    import os
+
+    from torch._inductor.runtime.cache_dir_utils import cache_dir
+
+    from basal.engine import GraphBackend
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    default = tmp_path / "home" / ".cache" / "basal" / "torchinductor"
+    for preset, want in ((None, default), (tmp_path / "mine", tmp_path / "mine")):
+        if preset is None:
+            monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+        else:
+            monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(preset))
+        try:
+            GraphBackend(str(tmp_path))  # no model there: it stops after the environment is set
+        except Exception:
+            pass
+        assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(want) and cache_dir() == str(want)
+    assert default.is_dir()
