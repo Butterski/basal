@@ -5,7 +5,7 @@
   (`TORCHINDUCTOR_CACHE_DIR` still takes precedence), as `--mode tpu` keeps JAX's in `~/.cache/basal/jax`. RTX 4060 Ti,
   the first start after a reboot: basal-2.0-mini 417 -> 238 s, basal-2.0-4.5B 823 -> 519 s; every probability
   bit-identical to a cold start; the cache takes about 55 MB for both models. Contributed by Miłosz Kucharski
-  (@Butterski).
+  (@Butterski), [#47](https://github.com/rkinas/basal/pull/47).
 
 # What is new in basal 2.4.1
 
