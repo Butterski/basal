@@ -10,18 +10,18 @@
   - the question pass runs one row per question and option order, each from that state and over the state's keys and
     values: a question's text under its two option orders runs once per order, since one recurrent state cannot
     continue into two branches of one packed row;
-  - the Gated DeltaNet layers run fla's kernels (flash-linear-attention, as in the eager reference) at fixed shapes
-    inside the CUDA graphs; `--mode fast` compiles the layer code between them (norms, projections, gates,
-    convolution, rotary embedding, MLP), and the projections that read one input are one GEMM.
+  - the Gated DeltaNet layers run fla's kernels (flash-linear-attention, as in the eager reference), their short
+    convolution included, at fixed shapes inside the CUDA graphs; `--mode fast` compiles the layer code between them
+    (norms, projections, gates, rotary embedding, MLP), and the projections that read one input are one GEMM.
   Checked on one H100 with basal-omni-pico against `--mode eager`, on 1,700 held-out decisions as single questions,
   five questions over one state, two option orders, and both (17,000 prompts): in fp32 the top answer agrees on
-  99.94-99.99% (max |dp| 0.008), so the port computes what eager computes. In bf16, as served, `fast` is as close to
-  the fp32 answers as `eager` is (99.48-99.76% against 99.48-99.71%, by shape). `--deterministic` against batched
-  serving on the 10,606 decisions of the dev set: the same top answer on 99.71% (`eager`: 99.42%), accuracy as
-  `eager`'s (+0.01 points). Speed over HTTP (`eager` in brackets): one question over a 1.5k-token state 15.4 ms at
-  one client (47.2), 115 decisions/s at 16 clients (32.3); five questions 29.2 ms (112.0), 388 questions/s (41.3);
-  five questions over a 3k-10k-token state 98 ms (920), 93 questions/s (6.5). One question over a long state is
-  slower than `--mode vllm` (54 against 39 ms). Details in
+  99.94-99.99% (max |dp| 0.009), so the port computes what eager computes. In bf16, as served, `fast` is about as
+  close to the fp32 answers as `eager` is (99.44-99.65% against 99.48-99.71%, by shape). `--deterministic` against batched
+  serving on the 10,606 decisions of the dev set: the same top answer on 99.83% (`eager`: 99.42%), accuracy as
+  `eager`'s (+0.00 points). Speed over HTTP (`eager` in brackets): one question over a 1.5k-token state 13.5 ms at
+  one client (47.0), 135 decisions/s at 16 clients (31.7); five questions 26.6 ms (111.4), 400 questions/s (41.1);
+  five questions over a 3k-10k-token state 91 ms (926), 94 questions/s (6.4). One question over a long state is
+  slower than `--mode vllm` (46 against 39 ms). Details in
   [HARDWARE.md](HARDWARE.md#basal-omni-pico-qwen35-gated-deltanet-on-one-h100).
 - **Without `--mode`** a Qwen3.5 model now runs `fast` on Hopper (H100, where the port passed its gates) when fla is
   installed (`pip install flash-linear-attention`), and `eager` elsewhere.
