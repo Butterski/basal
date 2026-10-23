@@ -31,7 +31,7 @@
   shared-prefix engine and run `eager`.
 - **Other models are unchanged**: basal-2.0-mini (default and compact rows), basal-2.0-4.5B (compact rows) and
   basal-omni-1.0-mini in `--mode fast` give bit-identical probabilities to
-  2.3.4 (4,960 of 4,960 readouts on an H100).
+  2.3.5 (4,960 of 4,960 readouts on an H100).
 
 # What is new in basal 2.3.5
 
