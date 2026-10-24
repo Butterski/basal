@@ -125,7 +125,9 @@ benchmarking a GPU.
   - `--merge auto|on|off` merges the q/k/v and gate/up projections into one GEMM each (`auto`: on for bf16 weights,
     off for FP8 checkpoints).
   - `--fp8-accum fast|full`: FP8 GEMM accumulation in the default mode (`--deterministic` always uses `full`).
-  - Opt-in, off by default: `--lean on|pass2` (one compiled layer function: faster start-up, slower under load),
+  - Opt-in, off by default: `--compile-scope layer` (each decoder layer compiled instead of the whole model: about
+    half the start-up on basal-2.0, the same speed within run-to-run noise, probabilities within bf16 rounding;
+    Llama models, plain rows), `--lean on|pass2` (one compiled layer function: faster start-up, slower under load),
     `--tree flex` (a FlexAttention mask for the branches of a request), `--readout-layer on`, `--state-cache-gb N`
     (a state cache across requests; 2.3.1: also for states that begin with a cached one, e.g. agent traces, which then
     compute only their new tokens), `--prefix-cache`, `--long-lane`. Measurements:
