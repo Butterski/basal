@@ -557,10 +557,10 @@ def basal_attention(module, query, key, value, attention_mask, dropout=0.0, scal
     values (the root pass; basal_layer_kv = this layer's (K, V) alone, as the per-layer compiled forward passes them,
     so that a compiled layer does not depend on its index), basal_prefix[layer] = (K, V) of a computed prefix that the
     queries also attend to (the branch pass), basal_cu = cumulative token counts of prompts packed into one row (each
-    attends to itself only),
-    basal_varlen = the kernel of those rows (_varlen_attention's impl), basal_tree = the branch pass without dense
-    masks: the queries attend to the prefix and, per trie block, to their own ancestors separately, merged by
-    log-sum-exp (no concatenated keys, no [N, P + N] mask); _block_plan's batches on the CPU, a _VarlenTree on CUDA.
+    attends to itself only), basal_varlen = the kernel of those rows (_varlen_attention's impl), basal_tree = the
+    branch pass without dense masks: the queries attend to the prefix and, per trie block, to their own ancestors
+    separately, merged by log-sum-exp (no concatenated keys, no [N, P + N] mask); _block_plan's batches on the CPU, a
+    _VarlenTree on CUDA.
     A causal forward without a mask uses the kernel chosen by set_attention (--attn)."""
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
     if basal_cu is not None:
