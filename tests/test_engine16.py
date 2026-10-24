@@ -191,10 +191,11 @@ def test_cascade_pass2_equals_separate(monkeypatch):
 
 
 def test_per_layer_compiled_forward_equals_the_model_and_compiles_once():
-    """--compile-scope layer: the plain forward one decoder layer at a time through _layer_call, each layer's K / V
-    buffers passed alone, gives the transformers forward's hidden states and fills the same key / value buffers (pass 2
-    reads them). Compiled (backend eager: Dynamo's guards, no code generation), the layer function is traced once for
-    every layer and shape, one row apart (size 1 is specialised): start-up then compiles one layer, not the model."""
+    """--compile-scope layer: _forward_by_layer (the plain forward one decoder layer at a time through the compiled
+    _layer_call, each layer's K / V buffers passed alone) gives, at every shape, the transformers forward's hidden
+    states and fills the same key / value buffers (pass 2 reads them); backend eager: Dynamo's guards without code
+    generation, so exact. The layer function runs once per layer and is traced once for every layer and shape, one row
+    apart (size 1 is specialised): start-up then compiles one layer, not the model."""
     import torch._dynamo as dynamo
     from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -205,20 +206,28 @@ def test_per_layer_compiled_forward_equals_the_model_and_compiles_once():
     m = LlamaForCausalLM(cfg).eval()
     m.config._attn_implementation = "sdpa"
     be = Stub(m)
-    ids = torch.randint(3, 50, (2, 24))
-    ref = be._forward(ids, be._kv_views(2, 24))
-    want = [(k.clone(), v.clone()) for k, v in be._kv_views(2, 24)]
-    for k, v in be._kv_views(2, 24):
-        k.zero_(), v.zero_()
-    got = be._forward_layered(ids, be._kv_views(2, 24), step=_layer_call)
-    assert torch.equal(got, ref)
-    assert all(torch.equal(k, k0) and torch.equal(v, v0) for (k, v), (k0, v0) in zip(be._kv_views(2, 24), want))
     dynamo.reset()
     dynamo.utils.counters.clear()
-    step = torch.compile(_layer_call, dynamic=True, backend="eager")
-    for b, L in ((1, 16), (2, 16), (3, 32), (2, 64), (4, 24)):  # within the stub's 128-token key / value buffer
-        be._forward_layered(torch.randint(3, 50, (b, L)), be._kv_views(b, L), step=step)
-    assert dynamo.utils.counters["stats"]["unique_graphs"] <= 2 < len(m.model.layers)
+    compiled, calls = torch.compile(_layer_call, dynamic=True, backend="eager"), []
+    be._layer_step = lambda *a: calls.append(1) or compiled(*a)
+    shapes = ((1, 16), (2, 16), (3, 32), (2, 64), (4, 24))  # within the stub's 128-token key / value buffer
+    for b, L in shapes:
+        ids = torch.randint(3, 50, (b, L))
+        got = be._forward_by_layer(ids, be._kv_views(b, L))
+        kv = [(k.clone(), v.clone()) for k, v in be._kv_views(b, L)]
+        ref = be._forward(ids, be._kv_views(b, L))  # the transformers forward rewrites the buffers
+        assert torch.equal(got, ref)
+        assert all(torch.equal(k, k0) and torch.equal(v, v0) for (k, v), (k0, v0) in zip(kv, be._kv_views(b, L)))
+    assert len(calls) == len(shapes) * len(m.model.layers)
+    assert 1 <= dynamo.utils.counters["stats"]["unique_graphs"] <= 2 < len(m.model.layers)
+
+
+def test_per_layer_compile_refused_where_not_measured(tmp_path):
+    """--compile-scope layer is the bf16 Llama forward's: FP8 / NVFP4 weights and --lean are refused before anything
+    is loaded."""
+    for kw, what in ((dict(quant="nvfp4"), "NVFP4"), (dict(lean=True), "--lean")):
+        with pytest.raises(ValueError, match=f"compile-scope layer.*{what}"):
+            GraphBackend(str(tmp_path), compile="layer", **kw)
 
 
 def test_cascade_why(monkeypatch):

@@ -988,6 +988,11 @@ class GraphBackend(EagerBackend):
         # (deterministic cuBLAS needs it)
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:2")
         self.fp8_checkpoint = modelopt_fp8(model_dir)  # the -FP8 repositories: FP8 weights with static scales
+        if compile == "layer":  # measured on the bf16 Llama forward only (refused before the weights are loaded)
+            what = ("FP8 / NVFP4 weights" if quant or self.fp8_checkpoint else
+                    "Gemma 4" if gemma4_graph.is_gemma4_dir(model_dir) else "--lean" if lean else None)
+            if what:
+                raise ValueError(f"--compile-scope layer: the bf16 Llama forward only, not {what}")
         # likewise: the kernel of the causal forwards (--attn; auto keeps FlashAttention 2 for FP8 GEMMs)
         self.attn = set_attention(attn, fp8=self.fp8_checkpoint or quant == "fp8")
         if batches == "compact" and self.attn != "fa3":  # refused before the weights are loaded

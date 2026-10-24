@@ -720,6 +720,9 @@ class Server:
     def __init__(self, a):
         validate_quant(a.mode, a.quant)
         kind, quant, comp = MODES[a.mode]
+        if getattr(a, "compile_scope", "model") == "layer" and (kind != "graph" or not comp):
+            raise SystemExit(f"--compile-scope layer: the CUDA graph engine's compiled modes (--mode fast), not "
+                             f"--mode {a.mode}")
         if kind == "gguf" and not a.gguf:
             raise SystemExit("--mode gguf needs --gguf <file.gguf> (--model gives tokenizer and calibration)")
         if a.calibration and not a.no_calibration and not Path(a.calibration).exists():
