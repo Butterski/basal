@@ -6,7 +6,8 @@
   bf16 rounding. RTX 4060 Ti, graph warm-up from cold compile caches: basal-2.0-mini 235 -> 95 s, basal-2.0-4.5B 515
   -> 251 s; the same decisions per second within run-to-run noise; identity readouts: the same top answer on 416 / 420
   (mini) and 418 / 420 (4.5B), the changed ones near-ties (margins under 0.08), mean |dp| 0.005, as far from fp32 as
-  the whole-model compile (mini: 4.7e-3 against 4.8e-3). Contributed by Miłosz Kucharski (@Butterski).
+  the whole-model compile (mini: 4.7e-3 against 4.8e-3). Contributed by Miłosz Kucharski (@Butterski),
+  [#49](https://github.com/rkinas/basal/pull/49).
 
 # What is new in basal 2.4.1
 
